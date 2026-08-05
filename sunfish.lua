@@ -4,12 +4,9 @@
 -- Localize global functions for massive performance gains in Luaj interpreter mode
 local math_floor = math.floor
 local math_abs = math.abs
-local table_insert = table.insert
 local table_sort = table.sort
 local string_sub = string.sub
 local string_byte = string.byte
-local string_reverse = string.reverse
-local string_gsub = string.gsub
 local string_format = string.format
 
 local TABLE_SIZE = 1e6
@@ -29,6 +26,62 @@ local initial = '         \n' .. --   0 -  9
         ' RNBQKBNR\n' .. --  90 - 99
         '         \n' .. -- 100 -109
         '          '     -- 110 -119
+
+-------------------------------------------------------------------------------
+-- Integer board representation
+--
+-- The engine's public API exposes `Position.board` as a 120-char string (as
+-- documented and used by the tests), but under LuaJ every string_sub/byte is a
+-- Java call. The hot path therefore uses a 120-element Lua array `_b` of
+-- integer piece codes, and the string is materialized lazily only at public
+-- API boundaries:
+--
+--   0     empty square ('.')
+--   1..6  our pieces P,N,B,R,Q,K  (side to move, uppercase)
+--  -1..-6 enemy pieces p,n,b,r,q,k (lowercase)
+--   98    padding row '\n'
+--   99    padding ' '
+--
+-- Indexing is unchanged (A1=91, H1=98, A8=21, H8=28, 0..119), so all public
+-- coordinate helpers and tests keep working.
+-------------------------------------------------------------------------------
+
+-- Piece codes. NOTE: `N` (knight) is named KN to avoid colliding with the
+-- direction constant N=-10 used throughout the engine.
+local EMPTY, P, KN, B, R, Q, K = 0, 1, 2, 3, 4, 5, 6
+local NL, SP = 98, 99
+local OUT_OR_BAD = { [98]=true, [99]=true }
+
+-- ASCII byte -> piece code (for lazy string -> array conversion).
+local byte_to_code = {}
+for _i = 0, 255 do byte_to_code[_i] = EMPTY end
+byte_to_code[string.byte('.')] = EMPTY
+byte_to_code[string.byte('P')] = P
+byte_to_code[string.byte('N')] = KN
+byte_to_code[string.byte('B')] = B
+byte_to_code[string.byte('R')] = R
+byte_to_code[string.byte('Q')] = Q
+byte_to_code[string.byte('K')] = K
+byte_to_code[string.byte('p')] = -P
+byte_to_code[string.byte('n')] = -KN
+byte_to_code[string.byte('b')] = -B
+byte_to_code[string.byte('r')] = -R
+byte_to_code[string.byte('q')] = -Q
+byte_to_code[string.byte('k')] = -K
+byte_to_code[string.byte(' ')] = SP
+byte_to_code[string.byte('\n')] = NL
+
+-- Piece code -> single-char string (for array -> string materialization).
+local code_to_char = {}
+code_to_char[EMPTY] = '.'
+code_to_char[P] = 'P'; code_to_char[-P] = 'p'
+code_to_char[KN] = 'N'; code_to_char[-KN] = 'n'
+code_to_char[B] = 'B'; code_to_char[-B] = 'b'
+code_to_char[R] = 'R'; code_to_char[-R] = 'r'
+code_to_char[Q] = 'Q'; code_to_char[-Q] = 'q'
+code_to_char[K] = 'K'; code_to_char[-K] = 'k'
+code_to_char[SP] = ' '
+code_to_char[NL] = '\n'
 
 -------------------------------------------------------------------------------
 -- Move and evaluation tables
@@ -122,17 +175,28 @@ local pst = {
 -- Chess logic
 -------------------------------------------------------------------------------
 
--- Extremely fast O(1) piece checking and swapping dictionaries mapping strings.
-local is_upper_map = { ['P']=true, ['N']=true, ['B']=true, ['R']=true, ['Q']=true, ['K']=true }
-local is_lower_map = { ['p']=true, ['n']=true, ['b']=true, ['r']=true, ['q']=true, ['k']=true }
-local swap_map = {
-    ['P']='p', ['N']='n', ['B']='b', ['R']='r', ['Q']='q', ['K']='k',
-    ['p']='P', ['n']='N', ['b']='B', ['r']='R', ['q']='Q', ['k']='K'
-}
+-- Integer aliases so the hot path indexes by piece code (P=1..K=6).
+directions[P] = directions['P']
+directions[KN] = directions['N']
+directions[B] = directions['B']
+directions[R] = directions['R']
+directions[Q] = directions['Q']
+directions[K] = directions['K']
+pst[P] = pst['P']
+pst[KN] = pst['N']
+pst[B] = pst['B']
+pst[R] = pst['R']
+pst[Q] = pst['Q']
+pst[K] = pst['K']
+
+-- The old string-keyed maps (is_upper_map/is_lower_map/swap_map) are replaced
+-- by the integer codes: p >= 1 means our piece, p < 0 means enemy, -p is the
+-- enemy's piece type.
 
 local Position = {}
 Position.__index = Position -- Using a Metatable is ~5x faster in luaj than loop-copying methods!
 
+-- Public constructor: accepts a string board (backward compatible).
 function Position.new(board, score, wc, bc, ep, kp)
     local self = setmetatable({}, Position)
     self.board = board
@@ -144,42 +208,83 @@ function Position.new(board, score, wc, bc, ep, kp)
     return self
 end
 
+-- Internal constructor: position with an integer array board (_b).
+function Position.from_array(b, score, wc, bc, ep, kp)
+    local self = setmetatable({}, Position)
+    self._b = b
+    self.score = score
+    self.wc = wc
+    self.bc = bc
+    self.ep = ep
+    self.kp = kp
+    return self
+end
+
+-- Build the integer array from the string board (lazy, once).
+function Position:ensure_arr()
+    local b = self._b
+    if not b then
+        b = {}
+        local board = self.board
+        local b2c = byte_to_code
+        for i = 0, 119 do
+            b[i] = b2c[string.byte(board, i + 1)]
+        end
+        self._b = b
+    end
+    return b
+end
+
+-- Materialize the string board from the integer array (lazy, once).
+function Position:ensure_board()
+    if not self.board then
+        local b = self._b
+        local c2c = code_to_char
+        local parts = {}
+        for i = 0, 119 do
+            parts[i + 1] = c2c[b[i]]
+        end
+        self.board = table.concat(parts)
+    end
+    return self.board
+end
+
 function Position:genMoves()
     local moves = {}
     local move_idx = 1
-    local board = self.board
+    local b = self:ensure_arr()
 
     for i = 0, 119 do
-        local p = string_sub(board, i + 1, i + 1)
-        if is_upper_map[p] and directions[p] then
+        local p = b[i]
+        if p >= P and p <= K and directions[p] then
             for _, d in ipairs(directions[p]) do
                 local j = i + d
                 -- Inline sliding check avoiding `limit` math and `isspace` function call
                 while true do
-                    local q = string_sub(board, j + 1, j + 1)
-                    if q == ' ' or q == '\n' then break end
+                    local q = b[j]
+                    if q == SP or q == NL then break end
 
                     -- Castling
-                    if i == A1 and q == 'K' and self.wc[1] then
+                    if i == A1 and q == K and self.wc[1] then
                         moves[move_idx] = { j, j - 2, 0 }; move_idx = move_idx + 1
                     end
-                    if i == H1 and q == 'K' and self.wc[2] then
+                    if i == H1 and q == K and self.wc[2] then
                         moves[move_idx] = { j, j + 2, 0 }; move_idx = move_idx + 1
                     end
 
-                    if is_upper_map[q] then break end
+                    if q >= P and q <= K then break end
 
                     -- Special pawn stuff
-                    if p == 'P' then
-                        if (d == N + W or d == N + E) and q == '.' and j ~= self.ep and j ~= self.kp then break end
-                        if (d == N or d == 2 * N) and q ~= '.' then break end
-                        if d == 2 * N and (i < A1 + N or string_sub(board, i + N + 1, i + N + 1) ~= '.') then break end
+                    if p == P then
+                        if (d == N + W or d == N + E) and q == EMPTY and j ~= self.ep and j ~= self.kp then break end
+                        if (d == N or d == 2 * N) and q ~= EMPTY then break end
+                        if d == 2 * N and (i < A1 + N or b[i + N] ~= EMPTY) then break end
                     end
 
                     moves[move_idx] = { i, j, 0 }; move_idx = move_idx + 1
 
-                    if p == 'P' or p == 'N' or p == 'K' then break end
-                    if is_lower_map[q] then break end
+                    if p == P or p == KN or p == K then break end
+                    if q < 0 then break end
 
                     j = j + d
                 end
@@ -198,37 +303,30 @@ end
 -- filters it. Search and public move validation use legal_moves().
 -------------------------------------------------------------------------------
 
--- Replace the character at 1-based position i in board string.
-local function put(board, i, p)
-    return string_sub(board, 1, i - 1) .. p .. string_sub(board, i + 1)
-end
-
 local knight_dirs = directions['N']
 local king_dirs = directions['K']
 local pawn_cap_dirs = { N + W, N + E }
--- Sliding attack directions: {delta, rook_piece, bishop_piece}
+-- Sliding attack directions: {delta, rook_code, bishop_code}
 local slider_dirs = {
-    { N, 'r', 'q' }, { E, 'r', 'q' }, { S, 'r', 'q' }, { W, 'r', 'q' },
-    { N + E, 'b', 'q' }, { S + E, 'b', 'q' }, { S + W, 'b', 'q' }, { N + W, 'b', 'q' }
+    { N, -R, -Q }, { E, -R, -Q }, { S, -R, -Q }, { W, -R, -Q },
+    { N + E, -B, -Q }, { S + E, -B, -Q }, { S + W, -B, -Q }, { N + W, -B, -Q }
 }
 
 -- Is square `i` attacked by any opponent (lowercase) piece?
--- `i` is 0-indexed as in genMoves.
+-- `i` is 0-indexed as in genMoves. Works on the integer array `_b`.
 function Position:attacked(i)
-    local board = self.board
+    local b = self:ensure_arr()
 
-    -- King attacks (opponent kings, lowercase)
+    -- King attacks (opponent kings)
     for _, d in ipairs(king_dirs) do
         local j = i + d
-        local q = string_sub(board, j + 1, j + 1)
-        if q == 'k' then return true end
+        if b[j] == -K then return true end
     end
 
     -- Knight attacks
     for _, d in ipairs(knight_dirs) do
         local j = i + d
-        local q = string_sub(board, j + 1, j + 1)
-        if q == 'n' then return true end
+        if b[j] == -KN then return true end
     end
 
     -- Pawn attacks: an enemy pawn attacks square i along one diagonal. The
@@ -239,21 +337,22 @@ function Position:attacked(i)
     -- pawn (it would be behind the pawn).
     for _, d in ipairs(pawn_cap_dirs) do
         local j = i - d
-        if string_sub(board, j + 1, j + 1) == 'p' then return true end
+        if b[j] == -P then return true end
         j = i + d
-        if string_sub(board, j + 1, j + 1) == 'p' then return true end
+        if b[j] == -P then return true end
     end
 
     -- Sliding pieces (rook, bishop, queen)
     for k = 1, 8 do
         local s = slider_dirs[k]
-        local d, r, b = s[1], s[2], s[3]
+        local d = s[1]
+        local r, bb = s[2], s[3]
         local j = i + d
         while true do
-            local q = string_sub(board, j + 1, j + 1)
-            if q == ' ' or q == '\n' then break end
-            if q == r or q == b then return true end
-            if q ~= '.' then break end
+            local q = b[j]
+            if q == SP or q == NL then break end
+            if q == r or q == bb then return true end
+            if q ~= EMPTY then break end
             j = j + d
         end
     end
@@ -261,11 +360,11 @@ function Position:attacked(i)
     return false
 end
 
--- Is the side to move in check? (own king is uppercase 'K')
+-- Is the side to move in check? (own king is code K)
 function Position:in_check()
-    local board = self.board
+    local b = self:ensure_arr()
     for i = 0, 119 do
-        if string_sub(board, i + 1, i + 1) == 'K' then
+        if b[i] == K then
             return self:attacked(i)
         end
     end
@@ -274,28 +373,26 @@ end
 
 -- Find the index of the side-to-move's king, or nil.
 function Position:king_index()
-    local board = self.board
+    local b = self:ensure_arr()
     for i = 0, 119 do
-        if string_sub(board, i + 1, i + 1) == 'K' then
+        if b[i] == K then
             return i
         end
     end
     return nil
 end
 
--- Is the given pseudo-legal move legal? Applies the move to a copy, then
--- checks the own king is not attacked in the resulting (un-rotated) board.
--- We must apply the move *before* rotate() to see the un-rotated board, so
--- we replicate move()'s board edits on a local string.
+-- Is the given pseudo-legal move legal? Applies the move in place on the
+-- integer array, tests the own king, then undoes it.
 -- `king` (optional) is the precomputed index of the own king.
 function Position:is_legal(move, king)
     local i, j = move[1], move[2]
-    local board = self.board
-    local p = string_sub(board, i + 1, i + 1)
-    local q = string_sub(board, j + 1, j + 1)
+    local b = self:ensure_arr()
+    local p = b[i]
+    local q = b[j]
 
     -- Standard chess has no king captures.
-    if q == 'k' then
+    if q == -K then
         return false
     end
 
@@ -303,38 +400,56 @@ function Position:is_legal(move, king)
         king = self:king_index()
     end
 
-    -- If we are not moving the king, the king stays at `king`; check whether
-    -- the moved piece leaves it exposed. En passant and castling do not apply
-    -- here (a pawn capture of a king is already excluded; the king only moves
-    -- when it is the moving piece).
-    if p ~= 'K' then
-        -- The king stays at `king`; rebuild the board with the move applied
-        -- and test whether the king is attacked.
-        local moved = put(board, i + 1, '.')
-        moved = put(moved, j + 1, p)
-        -- en passant: the captured pawn sits behind the destination
-        if p == 'P' and ((j - i) == N + W or (j - i) == N + E) and q == '.' then
-            moved = put(moved, j + S + 1, '.')
+    if p ~= K then
+        -- Non-king move: the king stays at `king`.
+        b[i] = EMPTY
+        b[j] = p
+        local ep_undo = false
+        if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
+            -- en passant: capture the pawn behind the destination
+            b[j + S] = EMPTY
+            ep_undo = true
         end
-        local tmp = setmetatable({ board = moved }, Position)
-        return not tmp:attacked(king)
+        local legal = not self:attacked(king)
+        -- undo
+        b[i] = p
+        b[j] = q
+        if ep_undo then
+            b[j + S] = -P
+        end
+        return legal
     end
 
-    -- King move: the destination (and castling intermediate square) must not
-    -- be attacked.
-    local moved = put(board, i + 1, '.')
-    moved = put(moved, j + 1, 'K')
+    -- King move: destination (and castling intermediate square) must not be
+    -- attacked.
     if math_abs(j - i) == 2 then
-        -- castling: move the rook and check the intermediate square
+        -- Castling. Replicate the original construction exactly: i emptied,
+        -- between holds the KING, j holds the ROOK (the original put K at j
+        -- then overwrote j with R), and the rook's origin square is left
+        -- untouched. Attack-tests between and j.
         local between = j < i and i - 1 or i + 1
-        moved = put(moved, between + 1, 'K')
-        moved = put(moved, j + 1, 'R')
-        local tmp = setmetatable({ board = moved }, Position)
-        if tmp:attacked(between) then return false end
-        return not tmp:attacked(j)
+        b[i] = EMPTY
+        b[between] = K
+        b[j] = R
+        local legal
+        if self:attacked(between) then
+            legal = false
+        else
+            legal = not self:attacked(j)
+        end
+        -- undo
+        b[i] = K
+        b[between] = EMPTY
+        b[j] = q
+        return legal
     end
-    local tmp = setmetatable({ board = moved }, Position)
-    return not tmp:attacked(j)
+
+    b[i] = EMPTY
+    b[j] = K
+    local legal = not self:attacked(j)
+    b[i] = K
+    b[j] = q
+    return legal
 end
 
 -- All legal moves (filtered from pseudo-legal genMoves).
@@ -365,78 +480,105 @@ function Position:is_stalemate()
 end
 
 function Position:rotate()
-    -- string.gsub scales massively better than iterating string chars in luaj.
-    local rev = string_reverse(self.board)
-    local swp = string_gsub(rev, ".", swap_map)
-    return Position.new(swp, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp)
+    -- One pass over the integer array: reverse (k -> 119-k) and negate the
+    -- piece codes (case swap). Padding codes are untouched.
+    local b = self:ensure_arr()
+    local nb = {}
+    for k = 0, 119 do
+        local v = b[119 - k]
+        if v < 0 then
+            nb[k] = -v
+        elseif v > 6 then
+            nb[k] = v
+        else
+            nb[k] = -v
+        end
+    end
+    return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp)
 end
 
 function Position:move(move)
     local i, j = move[1], move[2]
-    local p = string_sub(self.board, i + 1, i + 1)
-    local q = string_sub(self.board, j + 1, j + 1)
+    local b = self:ensure_arr()
+    local p = b[i]
+    local q = b[j]
 
     local score = self.score + self:value(move)
-    local board = self.board
     local wc, bc, ep, kp = self.wc, self.bc, 0, 0
 
-    board = put(board, j + 1, p)
-    board = put(board, i + 1, '.')
+    -- Build the moved (un-rotated) board by copying the array and editing.
+    local mb = {}
+    for k = 0, 119 do mb[k] = b[k] end
+    mb[j] = p
+    mb[i] = EMPTY
 
     if i == A1 then wc = { false, wc[2] } end
     if i == H1 then wc = { wc[1], false } end
     if j == A8 then bc = { bc[1], false } end
     if j == H8 then bc = { false, bc[2] } end
 
-    if p == 'K' then
+    if p == K then
         wc = { false, false }
         if math_abs(j - i) == 2 then
             kp = math_floor((i + j) / 2)
-            board = put(board, j < i and A1 + 1 or H1 + 1, '.')
-            board = put(board, kp + 1, 'R')
+            mb[j < i and A1 or H1] = EMPTY
+            mb[kp] = R
         end
     end
 
-    if p == 'P' then
+    if p == P then
         if A8 <= j and j <= H8 then
-            board = put(board, j + 1, 'Q')
+            mb[j] = Q -- promotion
         end
         if j - i == 2 * N then
             ep = i + N
         end
-        if ((j - i) == N + W or (j - i) == N + E) and q == '.' then
-            board = put(board, j + S + 1, '.')
+        if ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
+            mb[j + S] = EMPTY -- en passant
         end
     end
 
-    return Position.new(board, score, wc, bc, ep, kp):rotate()
+    -- Rotate the moved board into the new frame in one pass.
+    local nb = {}
+    for k = 0, 119 do
+        local v = mb[119 - k]
+        if v < 0 then
+            nb[k] = -v
+        elseif v > 6 then
+            nb[k] = v
+        else
+            nb[k] = -v
+        end
+    end
+    return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp)
 end
 
 function Position:value(move)
     local i, j = move[1], move[2]
-    local p = string_sub(self.board, i + 1, i + 1)
-    local q = string_sub(self.board, j + 1, j + 1)
+    local b = self:ensure_arr()
+    local p = b[i]
+    local q = b[j]
 
     local score = pst[p][j + 1] - pst[p][i + 1]
-    if is_lower_map[q] then
-        score = score + pst[swap_map[q]][j + 1] -- Fast string swapping logic without O(N) allocation
+    if q < 0 then
+        score = score + pst[-q][j + 1] -- captured piece's PST value
     end
 
     if math_abs(j - self.kp) < 2 then
-        score = score + pst['K'][j + 1]
+        score = score + pst[K][j + 1]
     end
 
-    if p == 'K' and math_abs(i - j) == 2 then
-        score = score + pst['R'][math_floor((i + j) / 2) + 1]
-        score = score - pst['R'][j < i and A1 + 1 or H1 + 1]
+    if p == K and math_abs(i - j) == 2 then
+        score = score + pst[R][math_floor((i + j) / 2) + 1]
+        score = score - pst[R][j < i and A1 + 1 or H1 + 1]
     end
 
-    if p == 'P' then
+    if p == P then
         if A8 <= j and j <= H8 then
-            score = score + pst['Q'][j + 1] - pst['P'][j + 1]
+            score = score + pst[Q][j + 1] - pst[P][j + 1]
         end
         if j == self.ep then
-            score = score + pst['P'][j + S + 1]
+            score = score + pst[P][j + S + 1]
         end
     end
     return score
@@ -454,7 +596,7 @@ local function tp_set(pos, val)
     local b2 = pos.bc[2] and 1 or 0
     local w1 = pos.wc[1] and 1 or 0
     local w2 = pos.wc[2] and 1 or 0
-    local hash = pos.board .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
+    local hash = pos:ensure_board() .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
 
     tp[hash] = val
     tp_count = tp_count + 1
@@ -466,7 +608,7 @@ local function tp_get(pos)
     local b2 = pos.bc[2] and 1 or 0
     local w1 = pos.wc[1] and 1 or 0
     local w2 = pos.wc[2] and 1 or 0
-    local hash = pos.board .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
+    local hash = pos:ensure_board() .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
     return tp[hash]
 end
 
@@ -651,9 +793,12 @@ function sunfish.new()
 end
 
 function sunfish.store_data(game)
+    -- Materialize the string board and skip internal `_`-prefixed fields so
+    -- the serialized shape stays board/score/wc/bc/ep/kp.
+    game:ensure_board()
     local dta = {}
     for k, v in pairs(game) do
-        if type(v) ~= 'function' then
+        if type(v) ~= 'function' and not (type(k) == 'string' and k:sub(1, 1) == '_') then
             dta[k] = v
         end
     end
@@ -671,7 +816,9 @@ end
 function sunfish.move(game, mv)
     local move = { parse(string_sub(mv, 1, 2)), parse(string_sub(mv, 3, 4)) }
     if move[1] and move[2] and ttfind(game:legal_moves(), move) then
-        return game:move(move)
+        local ng = game:move(move)
+        ng:ensure_board()
+        return ng
     else
         return false
     end
@@ -684,10 +831,12 @@ function sunfish.ai_move(game)
     if not move then
         -- Search converged to a mate/stalemate without a move (the root is
         -- already decided). Return the position unchanged and the score.
+        game:ensure_board()
         return game, nil, score
     end
 
     game = game:move(move)
+    game:ensure_board()
 
     return game, render(119 - move[1]) .. render(119 - move[2]), score
 end
