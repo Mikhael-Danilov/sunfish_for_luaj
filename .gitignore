@@ -1,0 +1,7 @@
+# Reference engine binaries (Stockfish) and generated caches - not part of the repo.
+.reference/
+__pycache__/
+*.pyc
+
+# Local test scratch state
+/tmp/

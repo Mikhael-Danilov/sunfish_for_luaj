@@ -189,15 +189,186 @@ function Position:genMoves()
     return moves
 end
 
+-------------------------------------------------------------------------------
+-- Legality: the engine is a *chess* engine, so we enforce real chess rules.
+-- A move is legal only if it does not leave the side-to-move's own king in
+-- check, and captures of a protected enemy king are rejected (a king may
+-- only be captured when the game has already been decided by checkmate).
+-- genMoves() stays pseudo-legal for backward compatibility; legal_moves()
+-- filters it. Search and public move validation use legal_moves().
+-------------------------------------------------------------------------------
+
+-- Replace the character at 1-based position i in board string.
+local function put(board, i, p)
+    return string_sub(board, 1, i - 1) .. p .. string_sub(board, i + 1)
+end
+
+local knight_dirs = directions['N']
+local king_dirs = directions['K']
+local pawn_cap_dirs = { N + W, N + E }
+-- Sliding attack directions: {delta, rook_piece, bishop_piece}
+local slider_dirs = {
+    { N, 'r', 'q' }, { E, 'r', 'q' }, { S, 'r', 'q' }, { W, 'r', 'q' },
+    { N + E, 'b', 'q' }, { S + E, 'b', 'q' }, { S + W, 'b', 'q' }, { N + W, 'b', 'q' }
+}
+
+-- Is square `i` attacked by any opponent (lowercase) piece?
+-- `i` is 0-indexed as in genMoves.
+function Position:attacked(i)
+    local board = self.board
+
+    -- King attacks (opponent kings, lowercase)
+    for _, d in ipairs(king_dirs) do
+        local j = i + d
+        local q = string_sub(board, j + 1, j + 1)
+        if q == 'k' then return true end
+    end
+
+    -- Knight attacks
+    for _, d in ipairs(knight_dirs) do
+        local j = i + d
+        local q = string_sub(board, j + 1, j + 1)
+        if q == 'n' then return true end
+    end
+
+    -- Pawn attacks: an enemy pawn attacks square i along one diagonal. The
+    -- engine rotates the board after every move, so the enemy pawn's "forward"
+    -- can point toward index 0 (white frame) or index 119 (black frame).
+    -- Checking both diagonals is safe: in a legal position an enemy pawn can
+    -- only be on one diagonal from i, and the other can't be occupied by a
+    -- pawn (it would be behind the pawn).
+    for _, d in ipairs(pawn_cap_dirs) do
+        local j = i - d
+        if string_sub(board, j + 1, j + 1) == 'p' then return true end
+        j = i + d
+        if string_sub(board, j + 1, j + 1) == 'p' then return true end
+    end
+
+    -- Sliding pieces (rook, bishop, queen)
+    for k = 1, 8 do
+        local s = slider_dirs[k]
+        local d, r, b = s[1], s[2], s[3]
+        local j = i + d
+        while true do
+            local q = string_sub(board, j + 1, j + 1)
+            if q == ' ' or q == '\n' then break end
+            if q == r or q == b then return true end
+            if q ~= '.' then break end
+            j = j + d
+        end
+    end
+
+    return false
+end
+
+-- Is the side to move in check? (own king is uppercase 'K')
+function Position:in_check()
+    local board = self.board
+    for i = 0, 119 do
+        if string_sub(board, i + 1, i + 1) == 'K' then
+            return self:attacked(i)
+        end
+    end
+    return false
+end
+
+-- Find the index of the side-to-move's king, or nil.
+function Position:king_index()
+    local board = self.board
+    for i = 0, 119 do
+        if string_sub(board, i + 1, i + 1) == 'K' then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Is the given pseudo-legal move legal? Applies the move to a copy, then
+-- checks the own king is not attacked in the resulting (un-rotated) board.
+-- We must apply the move *before* rotate() to see the un-rotated board, so
+-- we replicate move()'s board edits on a local string.
+-- `king` (optional) is the precomputed index of the own king.
+function Position:is_legal(move, king)
+    local i, j = move[1], move[2]
+    local board = self.board
+    local p = string_sub(board, i + 1, i + 1)
+    local q = string_sub(board, j + 1, j + 1)
+
+    -- Standard chess has no king captures.
+    if q == 'k' then
+        return false
+    end
+
+    if not king then
+        king = self:king_index()
+    end
+
+    -- If we are not moving the king, the king stays at `king`; check whether
+    -- the moved piece leaves it exposed. En passant and castling do not apply
+    -- here (a pawn capture of a king is already excluded; the king only moves
+    -- when it is the moving piece).
+    if p ~= 'K' then
+        -- The king stays at `king`; rebuild the board with the move applied
+        -- and test whether the king is attacked.
+        local moved = put(board, i + 1, '.')
+        moved = put(moved, j + 1, p)
+        -- en passant: the captured pawn sits behind the destination
+        if p == 'P' and ((j - i) == N + W or (j - i) == N + E) and q == '.' then
+            moved = put(moved, j + S + 1, '.')
+        end
+        local tmp = setmetatable({ board = moved }, Position)
+        return not tmp:attacked(king)
+    end
+
+    -- King move: the destination (and castling intermediate square) must not
+    -- be attacked.
+    local moved = put(board, i + 1, '.')
+    moved = put(moved, j + 1, 'K')
+    if math_abs(j - i) == 2 then
+        -- castling: move the rook and check the intermediate square
+        local between = j < i and i - 1 or i + 1
+        moved = put(moved, between + 1, 'K')
+        moved = put(moved, j + 1, 'R')
+        local tmp = setmetatable({ board = moved }, Position)
+        if tmp:attacked(between) then return false end
+        return not tmp:attacked(j)
+    end
+    local tmp = setmetatable({ board = moved }, Position)
+    return not tmp:attacked(j)
+end
+
+-- All legal moves (filtered from pseudo-legal genMoves).
+function Position:legal_moves()
+    local pseudo = self:genMoves()
+    local legal = {}
+    local n = 0
+    local king = self:king_index()
+    for _, m in ipairs(pseudo) do
+        if self:is_legal(m, king) then
+            n = n + 1
+            legal[n] = m
+        end
+    end
+    return legal
+end
+
+-- Checkmate: in check and no legal moves. Stalemate: not in check and no
+-- legal moves.
+function Position:is_checkmate()
+    if not self:in_check() then return false end
+    return #self:legal_moves() == 0
+end
+
+function Position:is_stalemate()
+    if self:in_check() then return false end
+    return #self:legal_moves() == 0
+end
+
 function Position:rotate()
     -- string.gsub scales massively better than iterating string chars in luaj.
     local rev = string_reverse(self.board)
     local swp = string_gsub(rev, ".", swap_map)
     return Position.new(swp, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp)
-end
-
-local function put(board, i, p)
-    return string_sub(board, 1, i - 1) .. p .. string_sub(board, i + 1)
 end
 
 function Position:move(move)
@@ -315,15 +486,39 @@ local function bound(pos, gamma, depth)
     nodes = nodes + 1
     if nodes % 30 == 0 then coroutine.yield() end
 
+    if math_abs(pos.score) >= MATE_VALUE then
+        return pos.score
+    end
+
+    -- Generate pseudo-legal moves and filter out those that leave our own king
+    -- in check. If no legal move exists the position is checkmate or stalemate.
+    -- This must happen BEFORE the TT lookup so mated/stalemated positions
+    -- always evaluate to the terminal score (a stale TT entry could otherwise
+    -- mask the mate).
+    local pseudo = pos:genMoves()
+    local moves = {}
+    local nlegal = 0
+    local king = pos:king_index()
+    for k = 1, #pseudo do
+        local move = pseudo[k]
+        if pos:is_legal(move, king) then
+            nlegal = nlegal + 1
+            moves[nlegal] = move
+        end
+    end
+    if nlegal == 0 then
+        if pos:in_check() then
+            return -MATE_VALUE -- checkmate: side to move loses
+        else
+            return 0 -- stalemate
+        end
+    end
+
     local entry = tp_get(pos)
     if entry ~= nil and entry.depth >= depth and (
             entry.score < entry.gamma and entry.score < gamma or
                     entry.score >= entry.gamma and entry.score >= gamma) then
         return entry.score
-    end
-
-    if math_abs(pos.score) >= MATE_VALUE then
-        return pos.score
     end
 
     local nullscore = depth > 0 and -bound(pos:rotate(), 1 - gamma, depth - 3) or pos.score
@@ -332,10 +527,9 @@ local function bound(pos, gamma, depth)
     end
 
     local best, bmove = -3 * MATE_VALUE, nil
-    local moves = pos:genMoves()
 
     -- Cache calculated move values so table.sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
-    for k = 1, #moves do
+    for k = 1, nlegal do
         moves[k][3] = pos:value(moves[k])
     end
 
@@ -352,7 +546,8 @@ local function bound(pos, gamma, depth)
     end
     table_sort(moves, sorter)
 
-    for _, move in ipairs(moves) do
+    for k = 1, nlegal do
+        local move = moves[k]
         if depth <= 0 and move[3] < 150 then
             break
         end
@@ -368,10 +563,6 @@ local function bound(pos, gamma, depth)
 
     if depth <= 0 and best < nullscore then
         return nullscore
-    end
-
-    if depth > 0 and (best <= -MATE_VALUE) and nullscore > -MATE_VALUE then
-        best = 0
     end
 
     if entry == nil or depth >= entry.depth and best >= gamma then
@@ -479,7 +670,7 @@ end
 
 function sunfish.move(game, mv)
     local move = { parse(string_sub(mv, 1, 2)), parse(string_sub(mv, 3, 4)) }
-    if move[1] and move[2] and ttfind(game:genMoves(), move) then
+    if move[1] and move[2] and ttfind(game:legal_moves(), move) then
         return game:move(move)
     else
         return false
@@ -490,16 +681,32 @@ function sunfish.ai_move(game)
     local move, score = search(game)
 
     assert(score)
-    if score <= -MATE_VALUE then
-        return game, nil, score
-    end
-    if score >= MATE_VALUE then
+    if not move then
+        -- Search converged to a mate/stalemate without a move (the root is
+        -- already decided). Return the position unchanged and the score.
         return game, nil, score
     end
 
     game = game:move(move)
 
     return game, render(119 - move[1]) .. render(119 - move[2]), score
+end
+
+-- Position query helpers (backward-compatible additions).
+function sunfish.in_check(game)
+    return game:in_check()
+end
+
+function sunfish.is_checkmate(game)
+    return game:is_checkmate()
+end
+
+function sunfish.is_stalemate(game)
+    return game:is_stalemate()
+end
+
+function sunfish.legal_moves(game)
+    return game:legal_moves()
 end
 
 function sunfish.move_2_cell(cell)

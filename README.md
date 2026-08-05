@@ -13,16 +13,43 @@ covering its public API only:
 ## Requirements
 
 - Lua 5.1+ or LuaJIT (both tested). No external dependencies.
+- For the cross-validation test (`tests/compare_python_chess.py`): Python 3
+  with `python-chess` installed (`pip install python-chess`).
 
 ## Running
 
 ```sh
 # Tests
 lua tests/test_sunfish.lua        # or: lua5.1, luajit
+lua tests/test_endgames.lua       # endgame correctness tests
+
+# Cross-validate legal-move generation against python-chess
+python3 tests/compare_python_chess.py
 
 # Benchmarks
 luajit benchmarks/bench_sunfish.lua
 ```
+
+## Endgame correctness
+
+`tests/test_endgames.lua` verifies the engine handles common endgames correctly:
+
+- **Checkmate / stalemate / check detection** on classic positions
+  (back-rank mate, corner mate, stalemate traps).
+- **Legal move generation** matches python-chess on 40 positions
+  (`tests/compare_python_chess.py`), including KQK/KRK/KPK/KNK/KBK.
+- **Mate-in-1 delivery** — the engine finds and plays the mating move.
+- **Stalemate avoidance** — the engine avoids stalemating traps.
+- **Pawn promotion** — promotes correctly on reaching the last rank.
+
+The engine enforces real chess rules: moves that leave the king in check are
+rejected, kings are never captured, and checkmate/stalemate end the game.
+`genMoves()` remains pseudo-legal for backward compatibility; `legal_moves()`,
+`in_check()`, `is_checkmate()`, and `is_stalemate()` are the new public
+helpers used by search and move validation.
+
+Stockfish is used as a reference during development (see `.reference/`, not
+committed); it is not required to run the tests.
 
 ## Notes on the engine's API (verified by the tests)
 
