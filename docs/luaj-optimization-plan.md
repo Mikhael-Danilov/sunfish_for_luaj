@@ -135,11 +135,58 @@ over a 120-element integer array `_b` that the hot path uses:
   pseudo-legal move (`i*128 + j + (val+2^22)*2^14`) instead of a `{i, j, val}`
   table — one allocation per move becomes zero, and a packed int has value
   semantics so the Phase-4 recursion-corruption risk (aliased shared table)
-  can't recur. `move_from`/`move_to`/`move_val` are pure arithmetic (no
-  bit32/bitwise, per the LuaJ constraint). `Position:move`/`value` accept both
-  packed ints (internal search) and `{i, j}` tuples (public API). Measured
-  same-JVM LuaJ A/B: `move` 188→256/s (+36%), `ai_move` 18.5s→~12-14s
+  can't recur. `move_from`/`move_to`/`move_val` are pure arithmetic; LuaJ
+  **does** ship `bit32`, but a direct A/B on LuaJ 3.0.2 showed arithmetic
+  unpack (`math.floor`/`%`) is ~2x faster than `bit32.band`/`rshift` for the
+  dominant `i`/`j` decode (bit32 is heavier Java calls here), so the packing
+  stays arithmetic (also keeps luajit/lua5.1 compat). `Position:move`/`value`
+  accept both packed ints (internal search) and `{i, j}` tuples (public API).
+  Measured same-JVM LuaJ A/B: `move` 188→256/s (+36%), `ai_move` 18.5s→~12-14s
   (~1.3-1.5x). Tests stay green on luajit/lua5.1/LuaJ + oracle 40/40.
+
+### Tried and reverted: scratch-pooled move lists
+
+Reusing a per-depth scratch list for `genMoves`/`bound`'s filter (moves are
+packed ints now, so no aliasing risk) was tested to remove the per-node list
+allocation. It introduced a subtle stale-tail bug (`table_sort` sorts the
+whole reused table, pulling stale entries from a previous frame at the same
+depth into the legal list — caught by the KRK mate-in-1 endgame), and the fix
+(stale-tail clearing + `#moves`) added enough overhead that same-JVM LuaJ A/B
+showed it was *slower* than the fresh-list baseline (`move` 326/s baseline vs
+210/s pooled, `ai_move` 13.5s vs 14.5s). Reverted: per-node fresh lists stay.
+
+### Perft harness (`tests/test_perft.lua`)
+
+Added a perft suite (recursive legal-move counting vs reference counts) with a
+FEN -> engine-position builder that handles the engine's frame convention
+(side to move uppercase at the bottom; castling rights stored in `wc` for the
+side to move, `bc` for the opponent; ep square mirrored for black to move).
+21 checks: the start position (20/400/8902/197281), two castling positions
+(kiwipete d1-d2, r4rk1 d1-d3), pos5 (31/771/24204), pos3 d1-d3, pos4 d1, and
+8 documented-deviation checks. This confirmed the core move generation is
+correct and quantified the three known sunfish-faithful deviations from
+standard chess:
+  * **1st-rank double-push** (pos3 d5 over-counts: pawn on e1 can double-push).
+  * **auto-queen promotion** (pos4 under-counts: one move instead of 4 choices).
+  * **kiwipete d3 castling/ep interaction** (small -80 difference).
+Runs green on luajit/lua5.1/LuaJ (21/21). The FEN builder doubles as a
+correctness cross-check for future search changes.
+
+### Tried and reverted: flat attack tables
+
+Profiling showed `attacked()` (24µs/call on LuaJ, 290k calls/search) and
+`is_legal` (13.5µs, 937k calls) dominate search: `is_legal`+`attacked`+`genMoves`
+≈ 54% of LuaJ time. A flat-table redesign replaced the nested
+`ray_squares[i][di]` (two table gets per ray per square) with per-square flat
+arrays (`attack_rook`/`attack_bishop`/`attack_queen`) delimited by `RAIL_END`
+(per-rail stop) / `RAIL_STOP` (array end), plus an `on_board_squares` list for
+genMoves and a `pack_base` emission shortcut. Correctness held (14+15 tests +
+oracle 40/40 on luajit/lua5.1), but same-JVM LuaJ A/B showed it was *slower*:
+`ai_move` 17.2s vs 16.3s baseline, `move` 164/s vs 183/s. The per-square
+`RAIL_END`/`RAIL_STOP` branch adds a Java call per cell under LuaJ that offsets
+the saved table-get. Reverted: nested `ray_squares[i][di]` stays. The flat
+concept only wins if the walker can avoid a per-cell branch (e.g. sentinel-free
+or bitmask attack boards), which is a larger Phase-6-scale redesign.
 
 ## Phases
 
