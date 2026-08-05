@@ -188,6 +188,161 @@ the saved table-get. Reverted: nested `ray_squares[i][di]` stays. The flat
 concept only wins if the walker can avoid a per-cell branch (e.g. sentinel-free
 or bitmask attack boards), which is a larger Phase-6-scale redesign.
 
+### Tried and reverted: LMR (late move reduction)
+
+Implemented LMR in `bound()`: after value-sorting, moves past index 2 at
+depth >= 3 are searched at depth-2 first, re-searched at full depth on
+fail-high. This cut nodes ~3x (depth 5: 11,649 -> 4,112; search reached depth
+6 at ~10.6k nodes vs baseline depth 5 at 11.6k) and the `move` benchmark
+improved +67% (fewer move() calls per search). Tests/oracle/perft stayed green.
+But alternating same-JVM LuaJ A/B showed `ai_move` was *slower*: LMR averaged
+~18.4s vs baseline ~15.9s (runs: 27.9/15.6/11.8 vs 15.7/14.4/17.6). Root cause:
+the reduced node count lets the search go one level deeper (depth 6), and the
+larger depth-6 top tree + LMR's fail-high re-searches cost more under LuaJ's
+high per-node overhead than the node reduction saves. Reverted: the node-count
+win doesn't translate to LuaJ wall-clock.
+
+### Tried and reverted: move-list preallocation
+
+Pre-sized the per-call move lists (`genMoves`, `legal_moves`, `bound`'s filter)
+to a fixed 64-entry array (MOVE_LIST_CAP) to avoid LuaJ's incremental array
+growth. A microbenchmark showed preallocated list fill was ~33% faster than
+growing, but in the engine it was *slower* on both targets: luajit `move`
+46.3k/s -> 39.6k/s, LuaJ `move` 189/s -> 131/s, `ai_move` flat (~14.8s both).
+Root cause: the engine's lists are small (~10-40 moves) so realloc cost was
+already minor, while the 64-entry zero-fill + nil-clear tail adds fixed Java
+calls per call under LuaJ that outweigh the savings. Also required tracking
+`genMoves`'s count explicitly (the preallocated zero tail broke `#pseudo`).
+Reverted: natural `{}` growth stays.
+
+## Phase 6: post-Phase-5 review of 10 proposed optimizations
+
+A 10-item optimization list was reviewed against the code and A/B measured under
+LuaJ (same-JVM alternating harness, the reliable signal per the Phase-5 notes).
+Three items shipped; two more below; the rest were rejected or deferred with
+measured or reasoned justification.
+
+### Applied: hot-path method hoisting to upvalues (SHIPPED)
+
+Every `pos:method()` in `bound()` is a table read that misses into `__index` —
+a metamethod event + function lookup (a Java call under LuaJ) — firing ~10x per
+node. `bound()` now binds the nine hot methods once:
+
+```lua
+local m_genMoves = Position.genMoves
+local m_king_index = Position.king_index
+local m_king_sensitive = Position.king_sensitive
+local m_is_legal = Position.is_legal
+local m_in_check = Position.in_check
+local m_key = Position.key
+local m_rotate = Position.rotate
+local m_value = Position.value
+local m_move = Position.move
+```
+
+and calls them as plain functions (`m_genMoves(pos)`, `m_is_legal(pos, ...)`).
+Pure mechanical, zero behavior change. Same-JVM LuaJ A/B: `ai_move` **-32% to
+-41%** (runs: -41.5%, -3.1% noise outlier, -32.6%), identical move selection and
+node count. This is the single biggest per-effort win in the review.
+
+### Applied: 64-square iteration in genMoves (SHIPPED)
+
+`genMoves` walked `for i = 20, 99` with an `is_on_board[i]` guard: 80 iterations,
+16 of them padding. A `real_squares[1..64]` list built once at load replaced the
+guard with a straight 64-iteration loop. Drops 16 wasted iterations and 80
+`is_on_board` table reads per `genMoves` call. Small, safe, stacked on top of
+the method hoisting in the A/B below.
+
+### Applied: value() micro-hoists (SHIPPED)
+
+`value()` is called per legal move per node. Hoisted `pst[p]` to a local
+(`pp[j+1] - pp[i+1]`), read `self.kp` once, and replaced `math_abs(j-kp) < 2`
+and `math_abs(i-j) == 2` with integer comparisons (`j-kp < 2 and kp-j < 2`,
+`j-i == 2 or i-j == 2`) — verified exactly equivalent for all 0..119. Drops
+library calls (Java calls) from the hottest leaf function.
+
+### Combined A/B (items 02 + 08 + 10 vs baseline)
+
+Same-JVM LuaJ A/B on the start position, cold, alternating order:
+
+| Round | baseline ai_move | modified ai_move | delta |
+|-------|------------------|------------------|-------|
+| 1 | 15.3s | 10.4s | **-31.6%** |
+| 2 | 18.2s | 8.7s | **-52.2%** |
+| 3 | 17.9s | 7.6s | **-57.9%** |
+
+Same move (`b8c6`, score 41) in every round — the delta is pure overhead
+removal, not move-selection noise. Tests stay green on luajit/lua5.1 + oracle
+40/40 + perft 21/21.
+
+### Applied: king-index propagation through move()/rotate() (SHIPPED)
+
+`king_index()` scans up to 120 squares on the first call per position; since
+every search position is fresh, that's a full scan per node. But the child's
+kings are known when building the rotated frame: the child's own king is the
+mirror of the parent's *enemy* king (`119 - ek`), and the child's enemy king is
+the mirror of the parent's *own* king (`119 - ok`, or `119 - j` when the king
+moved). `move()`/`rotate()` now thread `_king`/`_eking` through the constructor,
+so the hot-path `king_index()` scan is eliminated (fallback scan stays for
+public positions built from strings). See "Phase 6b" notes below for the
+detailed derivation.
+
+### Applied: parallel-array transposition table (SHIPPED)
+
+`tp_set`/`tp_get` chased a 5-field slot table and the store site built a temp
+`{depth, score, gamma, move}` table per store. Replaced with five flat arrays
+`ttK/ttD/ttS/ttG/ttM` indexed by `key % TT_SIZE`; `tp_set` takes the five
+values directly (no temp table), `tp_get` returns nothing and the probe reads
+the flat arrays + a `ttK[s] == key` verification. Removes one temp-table alloc
+per store and several field chases per probe. The slots were already
+pre-allocated, so the original "alloc per store" claim was overstated — the win
+is the temp table + field chases, not slot allocation.
+
+### Reviewed and rejected: comparator-free sort (item 01)
+
+The premise was wrong: the `move_from`/`move_to` tie-decode in `sorter` fires
+only when two packed integers are *identical* (requires same `i` AND same `j` —
+astronomically rare). The sorter is already a raw `a > b` per comparison, so
+inverting the value bias (`VAL_BIAS - val`) produces a **numerically identical
+sort**. It does however *drop the `i desc, j asc` tie-break* (default sort would
+give `i asc`), which changed equal-score move selection (`b8c6` -> `g8f6`) and
+the node count (11649 -> 11770) in the A/B. Since the sort itself wasn't the
+bottleneck (the hoisting fix addressed the real dispatch cost), the tie-break
+behavior change wasn't worth it. Rejected.
+
+### Reviewed and rejected as O(1): incremental Zobrist key (item 04)
+
+The proposal claimed an O(1) delta from the parent's key to the child's. This is
+**impossible as stated**: the child is the *mirror* of the parent, which remaps
+all 120 squares (square `sq` in the child holds `-parent[119-sq]`), so the
+parent's 120-square hash cannot be updated with a few delta terms — every square
+contributes through a different Zobrist slot. The sound variant is to accumulate
+the hash *inside* the existing single-pass `move()` board build (one 120-pass,
+not two), which saves the second pass and the `key()` metatable dispatch, but it
+is O(120), not O(1). Deferred — modest win, touches the highest-risk function.
+
+### Reviewed and deferred: make/unmake + ply buffers (item 05)
+
+Highest ceiling: the immutable design allocates a 120-slot board + Position
+object per child, plus list tables per node, which dominates on a GC'd
+interpreter. But it's the structural redesign with the documented
+recursion-corruption risk (two prior scratch-pooling attempts were reverted).
+Keep the public immutable API as a thin wrapper; do this last, behind a rewrite.
+
+### Reviewed and deferred: yield countdown (item 07)
+
+`nodes % 30` is a cheap integer modulo; the real cost is ~330 coroutine switches
+per 10k search. A countdown with a bigger quantum removes both, BUT the 30-node
+quantum is a documented *Android responsiveness* mechanism (the RPD loop drives
+the search). Make the quantum tunable (128-256) rather than jumping to 1024 —
+this is a product-level trade-off, not a pure perf win.
+
+### Reviewed and deferred: TT replacement policy (item 09)
+
+Depth-preferred replacement (`depth + 2 >= ttD[s]`) would raise TT-hit quality
+at fixed 64k slots, but changes search behavior (which entries survive) and
+needs its own A/B against the same position. Deferred.
+
 ## Phases
 
 | # | Step | Est. LuaJ gain | Risk |
@@ -197,15 +352,17 @@ or bitmask attack boards), which is a larger Phase-6-scale redesign.
 | 3 | TT: cached key + fixed-size probe table | 1.2-1.5x + bounds memory | Med | **DONE** |
 | 4 | Search micro-opts (hoisted sorter, king-sensitive short-circuit) | 1.1-1.3x | Low | **DONE** |
 | 5 | Hot-path call elimination (board threading, cached king, single-pass move, generation-tagged sens, flat Zobrist, TT-before-movegen) | 1.15-1.3x | Med (signature churn, in-place mutation invariants) | **DONE** |
+| 6 | Phase-6 review: method hoisting, 64-square genMoves, value micro-hoists, king propagation, parallel-array TT | 1.3-2.0x cumulative on top of Phase 5 | Low-Med | **DONE** |
 
 Cumulative target: **~21s -> 3-5s** per `ai_move` under LuaJ.
-Current: **~15.9s (Phase 1) -> ~14.2s (Phases 2-4) -> ~12.5s (Phase 5)**. The
-move-gen and lifecycle paths are 2-3.4x faster; `ai_move` (search) gained ~27%
-cumulative (Phase 4 +12%, Phase 5 +15-25% in same-JVM A/B). The remaining
-search time is dominated by `is_legal`'s `attacked()` walks and per-node
-`move()` array construction, which are hard to reduce without deeper search
-restructuring (packed move arrays were considered but carry the documented
-recursion-corruption risk for modest gain).
+Current: **~15.9s (Phase 1) -> ~14.2s (Phases 2-4) -> ~12.5s (Phase 5) -> ~8-11s
+(Phase 6)**. The move-gen and lifecycle paths are 2-3.4x faster; `ai_move`
+(search) gained ~27% cumulative through Phase 5 and a further ~30-55% from the
+Phase-6 method hoisting + 64-square + value-hoist + king-propagation +
+parallel-TT batch (same-JVM A/B: 15.3->10.4s, 18.2->8.7s, 17.9->7.6s). The
+remaining search time is dominated by `is_legal`'s `attacked()` walks and
+per-node `move()` array construction, which are hard to reduce without deeper
+search restructuring (make/unmake is the known next step).
 
 ## Validation per phase
 

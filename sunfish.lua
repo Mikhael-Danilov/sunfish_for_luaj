@@ -223,8 +223,10 @@ pst[K] = pst['K']
 -- edge; the engine's while-loops stop at SP/NL, which is exactly this wall.
 -------------------------------------------------------------------------------
 local is_on_board = {}
+local real_squares = {} -- the 64 real board squares (20..99, col 1..8), built once
 for _i = 0, 119 do
     is_on_board[_i] = _i >= 20 and _i < 100 and (_i % 10) >= 1 and (_i % 10) <= 8
+    if is_on_board[_i] then real_squares[#real_squares + 1] = _i end
 end
 
 -- ray_squares[i][d]: squares along direction d (d in 1..8) from i.
@@ -353,7 +355,12 @@ function Position.new(board, score, wc, bc, ep, kp)
 end
 
 -- Internal constructor: position with an integer array board (_b).
-function Position.from_array(b, score, wc, bc, ep, kp)
+-- Optional trailing args thread the cached king indices through search:
+--   _king  = index of the side-to-move's king (code K)
+--   _eking = index of the enemy king (code -K)
+-- These avoid the up-to-120-square scan in king_index()/eking_index() on every
+-- fresh search position.
+function Position.from_array(b, score, wc, bc, ep, kp, nk, nek)
     local self = setmetatable({}, Position)
     self._b = b
     self.score = score
@@ -361,6 +368,8 @@ function Position.from_array(b, score, wc, bc, ep, kp)
     self.bc = bc
     self.ep = ep
     self.kp = kp
+    self._king = nk
+    self._eking = nek
     return self
 end
 
@@ -425,83 +434,82 @@ function Position:genMoves()
     local wc1, wc2 = self.wc[1], self.wc[2]
     local ep, kp = self.ep, self.kp
 
-    for i = 20, 99 do
-        if is_on_board[i] then
-            local p = b[i]
-            if p >= P and p <= K then
-                if p == P then
-                    -- Pawn: single push, double push, captures, ep.
-                    local j = i + N
-                    if is_on_board[j] and b[j] == EMPTY then
+    for si = 1, 64 do
+        local i = real_squares[si]
+        local p = b[i]
+        if p >= P and p <= K then
+            if p == P then
+                -- Pawn: single push, double push, captures, ep.
+                local j = i + N
+                if is_on_board[j] and b[j] == EMPTY then
+                    moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                    -- Double push: original allows it whenever i >= A1+N and
+                    -- the intermediate square is empty (the single push above
+                    -- already verified b[i+N]==EMPTY). The last-rank special
+                    -- case (e.g. a pawn on e1) is preserved.
+                    if i >= A1 + N then
+                        local j2 = i + 2 * N
+                        if is_on_board[j2] and b[j2] == EMPTY then
+                            moves[move_idx] = move_pack(i, j2, 0); move_idx = move_idx + 1
+                        end
+                    end
+                end
+                -- Captures (diagonals). En passant when the target is empty but is ep.
+                local pc = pawn_caps[i]
+                for c = 1, #pc do
+                    j = pc[c]
+                    local q = b[j]
+                    if q < 0 or (q == EMPTY and j == ep) then
                         moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                        -- Double push: original allows it whenever i >= A1+N and
-                        -- the intermediate square is empty (the single push above
-                        -- already verified b[i+N]==EMPTY). The last-rank special
-                        -- case (e.g. a pawn on e1) is preserved.
-                        if i >= A1 + N then
-                            local j2 = i + 2 * N
-                            if is_on_board[j2] and b[j2] == EMPTY then
-                                moves[move_idx] = move_pack(i, j2, 0); move_idx = move_idx + 1
-                            end
-                        end
                     end
-                    -- Captures (diagonals). En passant when the target is empty but is ep.
-                    local pc = pawn_caps[i]
-                    for c = 1, #pc do
-                        j = pc[c]
+                end
+            elseif p == KN then
+                local kt = knight_targets[i]
+                for c = 1, #kt do
+                    local j = kt[c]
+                    if b[j] <= EMPTY then
+                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                    end
+                end
+            elseif p == K then
+                local kg = king_targets[i]
+                for c = 1, #kg do
+                    local j = kg[c]
+                    if b[j] <= EMPTY then
+                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                    end
+                end
+            else
+                -- Sliders: bishop (di 5..8), rook (di 1..4), queen (di 1..8).
+                -- Castling (original semantics): when a ROOK at A1 slides E (or
+                -- H1 slides W) and the square beyond the current j holds the
+                -- king, emit the king's two-square move toward the rook:
+                --   rook at A1: king at j+E -> j+W  (queenside)
+                --   rook at H1: king at j+W -> j+E  (kingside)
+                local sd = slider_dirs_by_piece[p]
+                for s = 1, #sd do
+                    local di = sd[s]
+                    local ray = ray_squares[i][di]
+                    local castling = p == R and (di == 2 or di == 4) -- E or W
+                    for c = 1, #ray do
+                        local j = ray[c]
                         local q = b[j]
-                        if q < 0 or (q == EMPTY and j == ep) then
+                        if q == EMPTY then
                             moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                        end
-                    end
-                elseif p == KN then
-                    local kt = knight_targets[i]
-                    for c = 1, #kt do
-                        local j = kt[c]
-                        if b[j] <= EMPTY then
+                        elseif q < 0 then
                             moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                        end
-                    end
-                elseif p == K then
-                    local kg = king_targets[i]
-                    for c = 1, #kg do
-                        local j = kg[c]
-                        if b[j] <= EMPTY then
-                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                        end
-                    end
-                else
-                    -- Sliders: bishop (di 5..8), rook (di 1..4), queen (di 1..8).
-                    -- Castling (original semantics): when a ROOK at A1 slides E (or
-                    -- H1 slides W) and the square beyond the current j holds the
-                    -- king, emit the king's two-square move toward the rook:
-                    --   rook at A1: king at j+E -> j+W  (queenside)
-                    --   rook at H1: king at j+W -> j+E  (kingside)
-                    local sd = slider_dirs_by_piece[p]
-                    for s = 1, #sd do
-                        local di = sd[s]
-                        local ray = ray_squares[i][di]
-                        local castling = p == R and (di == 2 or di == 4) -- E or W
-                        for c = 1, #ray do
-                            local j = ray[c]
-                            local q = b[j]
-                            if q == EMPTY then
-                                moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                            elseif q < 0 then
-                                moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
-                                break
-                            else
-                                -- own piece blocks the ray, but if it's the king and
-                                -- the rook has castling rights, emit the castling move
-                                if castling then
-                                    if i == A1 and q == K and wc1 then
-                                        moves[move_idx] = move_pack(j, j - 2, 0); move_idx = move_idx + 1
-                                    elseif i == H1 and q == K and wc2 then
-                                        moves[move_idx] = move_pack(j, j + 2, 0); move_idx = move_idx + 1
-                                    end
+                            break
+                        else
+                            -- own piece blocks the ray, but if it's the king and
+                            -- the rook has castling rights, emit the castling move
+                            if castling then
+                                if i == A1 and q == K and wc1 then
+                                    moves[move_idx] = move_pack(j, j - 2, 0); move_idx = move_idx + 1
+                                elseif i == H1 and q == K and wc2 then
+                                    moves[move_idx] = move_pack(j, j + 2, 0); move_idx = move_idx + 1
                                 end
-                                break
                             end
+                            break
                         end
                     end
                 end
@@ -591,6 +599,24 @@ function Position:king_index()
             if b[i] == K then
                 k = i
                 self._king = i
+                return i
+            end
+        end
+    end
+    return k
+end
+
+-- Find the index of the enemy king (code -K), or nil. Cached on the position
+-- (`_eking`) for the same reason as `_king`. Only used to thread the child's
+-- king indices through move()/rotate(); public positions scan on first use.
+function Position:eking_index()
+    local k = self._eking
+    if not k then
+        local b = self:ensure_arr()
+        for i = 0, 119 do
+            if b[i] == -K then
+                k = i
+                self._eking = i
                 return i
             end
         end
@@ -759,7 +785,16 @@ function Position:rotate()
             nb[k] = -v
         end
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp)
+    -- Thread king indices: after rotation, own king = mirror of parent's enemy
+    -- king; enemy king = mirror of parent's own king. If either king is absent
+    -- (e.g. a test position with only one king), fall back to the lazy scan.
+    local ek = self._eking or self:eking_index()
+    local ok = self._king or self:king_index()
+    local nk, nek = nil, nil
+    if ok and ek then nk = 119 - ek end
+    if ek and ok then nek = 119 - ok end
+    return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp,
+        nk, nek)
 end
 
 function Position:move(move, val)
@@ -850,7 +885,16 @@ function Position:move(move, val)
             nb[119 - (j + S)] = EMPTY -- en passant
         end
     end
-    return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp)
+    -- Thread king indices: child own king = mirror of parent's enemy king;
+    -- child enemy king = mirror of parent's own king, or of the king's new
+    -- square when the king itself moved. If either king is absent, fall back
+    -- to the lazy scan.
+    local ek = self._eking or self:eking_index()
+    local ok = self._king or self:king_index()
+    local nk, nek = nil, nil
+    if ek then nk = 119 - ek end
+    if ok then nek = 119 - (p == K and j or ok) end
+    return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp, nk, nek)
 end
 
 function Position:value(move, b)
@@ -864,16 +908,18 @@ function Position:value(move, b)
     local p = b[i]
     local q = b[j]
 
-    local score = pst[p][j + 1] - pst[p][i + 1]
+    local pp = pst[p]
+    local score = pp[j + 1] - pp[i + 1]
     if q < 0 then
         score = score + pst[-q][j + 1] -- captured piece's PST value
     end
 
-    if math_abs(j - self.kp) < 2 then
+    local kp = self.kp
+    if j - kp < 2 and kp - j < 2 then
         score = score + pst[K][j + 1]
     end
 
-    if p == K and math_abs(i - j) == 2 then
+    if p == K and (j - i == 2 or i - j == 2) then
         score = score + pst[R][math_floor((i + j) / 2) + 1]
         score = score - pst[R][j < i and A1 + 1 or H1 + 1]
     end
@@ -889,25 +935,30 @@ function Position:value(move, b)
     return score
 end
 
--- Fixed-size transposition table. Each slot: {key, depth, score, gamma, move}.
--- Probing uses key % TT_SIZE and verifies slot.key == key (full 32-bit key), so
--- hash collisions only cause a missed entry, never a wrong result.
-local tp = {}
-for _i = 0, TT_SIZE - 1 do tp[_i] = {} end
+-- Fixed-size transposition table as five parallel arrays (no per-slot table
+-- chase, no temp table at the store site). Probing uses key % TT_SIZE and
+-- verifies ttK[s] == key (full 32-bit key), so hash collisions only cause a
+-- missed entry, never a wrong result.
+local ttK = {}
+local ttD = {}
+local ttS = {}
+local ttG = {}
+local ttM = {}
 
-local function tp_set(pos, key, val)
-    local slot = tp[key % TT_SIZE]
-    slot.key = key
-    slot.depth = val.depth
-    slot.score = val.score
-    slot.gamma = val.gamma
-    slot.move = val.move
+local function tp_set(key, depth, score, gamma, move)
+    local s = key % TT_SIZE
+    ttK[s] = key
+    ttD[s] = depth
+    ttS[s] = score
+    ttG[s] = gamma
+    ttM[s] = move
 end
 
-local function tp_get(pos, key)
-    local slot = tp[key % TT_SIZE]
-    if slot.key == key then
-        return slot
+-- Probe the TT. Returns (score, depth, move) when an entry exists, else nil.
+local function tp_get(key)
+    local s = key % TT_SIZE
+    if ttK[s] == key then
+        return ttS[s], ttD[s], ttM[s]
     end
     return nil
 end
@@ -917,6 +968,20 @@ end
 -------------------------------------------------------------------------------
 
 local nodes = 0
+
+-- Hoist hot Position methods to upvalues: each `pos:method()` is a table read
+-- that misses into __index (a metamethod event + function lookup). Binding
+-- once and calling as plain functions removes that indirection from the
+-- per-node hot path (~10 dispatches per node).
+local m_genMoves = Position.genMoves
+local m_king_index = Position.king_index
+local m_king_sensitive = Position.king_sensitive
+local m_is_legal = Position.is_legal
+local m_in_check = Position.in_check
+local m_key = Position.key
+local m_rotate = Position.rotate
+local m_value = Position.value
+local m_move = Position.move
 
 -- Hoisted sorter (created once, not per bound() call). Moves are packed
 -- integers: sort value in the high bits, i and j in the low bits. Same
@@ -951,38 +1016,44 @@ local function bound(pos, gamma, depth)
     -- with no legal moves never stores a TT entry with `move == nil` (we only
     -- store after a legal move is found), and the terminal-score check above
     -- catches already-decided positions.
-    local key = pos:key()
-    local entry = tp_get(pos, key)
-    if entry ~= nil and entry.depth >= depth and (
-            entry.score < entry.gamma and entry.score < gamma or
-                    entry.score >= entry.gamma and entry.score >= gamma) then
-        return entry.score
+    local key = m_key(pos)
+    local es, ed = tp_get(key)
+    local had_entry = es ~= nil
+    -- A usable entry (same depth, bound satisfied) returns immediately without
+    -- genMoves + the legality filter. Mate/stalemate is safe: a position with
+    -- no legal moves never stores a TT entry with `move == nil` (we only store
+    -- after a legal move is found), and the terminal-score check above catches
+    -- already-decided positions.
+    if had_entry and ed >= depth and (
+            es < ttG[key % TT_SIZE] and es < gamma or
+                    es >= ttG[key % TT_SIZE] and es >= gamma) then
+        return es
     end
 
     -- Generate pseudo-legal moves and filter out those that leave our own king
     -- in check. If no legal move exists the position is checkmate or stalemate.
-    local pseudo = pos:genMoves()
+    local pseudo = m_genMoves(pos)
     local moves = {}
     local nlegal = 0
-    local king = pos:king_index()
+    local king = m_king_index(pos)
     local b = pos._b
-    local sens, sens_g = pos:king_sensitive(king, b)
+    local sens, sens_g = m_king_sensitive(pos, king, b)
     for k = 1, #pseudo do
         local move = pseudo[k]
-        if pos:is_legal(move, king, sens, b, sens_g) then
+        if m_is_legal(pos, move, king, sens, b, sens_g) then
             nlegal = nlegal + 1
             moves[nlegal] = move
         end
     end
     if nlegal == 0 then
-        if pos:in_check() then
+        if m_in_check(pos) then
             return -MATE_VALUE -- checkmate: side to move loses
         else
             return 0 -- stalemate
         end
     end
 
-    local nullscore = depth > 0 and -bound(pos:rotate(), 1 - gamma, depth - 3) or pos.score
+    local nullscore = depth > 0 and -bound(m_rotate(pos), 1 - gamma, depth - 3) or pos.score
     if nullscore >= gamma then
         return nullscore
     end
@@ -991,7 +1062,7 @@ local function bound(pos, gamma, depth)
 
     -- Cache calculated move values so table.sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
     for k = 1, nlegal do
-        moves[k] = move_set_val(moves[k], pos:value(moves[k], b))
+        moves[k] = move_set_val(moves[k], m_value(pos, moves[k], b))
     end
 
     table_sort(moves, sorter)
@@ -1001,7 +1072,7 @@ local function bound(pos, gamma, depth)
         if depth <= 0 and move_val(move) < 150 then
             break
         end
-        local score = -bound(pos:move(move, move_val(move)), 1 - gamma, depth - 1)
+        local score = -bound(m_move(pos, move, move_val(move)), 1 - gamma, depth - 1)
         if score > best then
             best = score
             bmove = move
@@ -1015,8 +1086,8 @@ local function bound(pos, gamma, depth)
         return nullscore
     end
 
-    if entry == nil or depth >= entry.depth and best >= gamma then
-        tp_set(pos, key, { depth = depth, score = best, gamma = gamma, move = bmove })
+    if not had_entry or depth >= ed and best >= gamma then
+        tp_set(key, depth, best, gamma, bmove)
     end
     return best
 end
@@ -1048,9 +1119,9 @@ local function search(pos, maxn)
         end
     end
 
-    local entry = tp_get(pos, pos:key())
-    if entry ~= nil then
-        return entry.move, score
+    local _, _, rootmove = tp_get(m_key(pos))
+    if rootmove ~= nil then
+        return rootmove, score
     end
     return nil, score
 end
