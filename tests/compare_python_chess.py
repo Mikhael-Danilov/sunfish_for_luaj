@@ -51,7 +51,9 @@ local g = sunfish.restore_data({ board = build_board(placements), score = 0,
 local legal = sunfish.legal_moves(g)
 local out = {}
 for _, m in ipairs(legal) do
-  out[#out+1] = render(m[1]) .. render(m[2])
+  local mi = math.floor(m / 128) % 128
+  local mj = m % 128
+  out[#out+1] = render(mi) .. render(mj)
 end
 table.sort(out)
 io.write(table.concat(out, ","))

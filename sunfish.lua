@@ -9,9 +9,9 @@ local string_sub = string.sub
 local string_byte = string.byte
 local string_format = string.format
 
-local TABLE_SIZE = 1e6
 local NODES_SEARCHED = 10000
 local MATE_VALUE = 30000
+local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
 local A1, H1, A8, H8 = 91, 98, 21, 28
 local initial = '         \n' .. --   0 -  9
@@ -51,6 +51,31 @@ local initial = '         \n' .. --   0 -  9
 local EMPTY, P, KN, B, R, Q, K = 0, 1, 2, 3, 4, 5, 6
 local NL, SP = 98, 99
 local OUT_OR_BAD = { [98]=true, [99]=true }
+
+-- Packed move encoding. A move is a single integer instead of a {i, j, val}
+-- table: value semantics (no aliasing), and genMoves allocates one number per
+-- pseudo-legal move instead of one 3-cell table. Layout:
+--   low 14 bits  : from-square i * 128 + to-square j   (i,j in 0..119)
+--   high bits    : signed sort value, biased by VAL_BIAS (2^22)
+-- Pure arithmetic (no bit32/bitwise ops, per the LuaJ-interpreter constraint).
+local VAL_SHIFT = 14
+local VAL_BIAS = 2 ^ 22 -- half of the 23-bit value field
+local function move_pack(i, j, val)
+    return i * 128 + j + (val + VAL_BIAS) * 2 ^ VAL_SHIFT
+end
+local function move_from(v)
+    return math_floor(v / 128) % 128
+end
+local function move_to(v)
+    return v % 128
+end
+local function move_val(v)
+    return math_floor(v / 2 ^ VAL_SHIFT) - VAL_BIAS
+end
+-- Rewrite the value field of a packed move (sorting updates the cached value).
+local function move_set_val(v, val)
+    return (v % (128 * 128)) + (val + VAL_BIAS) * 2 ^ VAL_SHIFT
+end
 
 -- ASCII byte -> piece code (for lazy string -> array conversion).
 local byte_to_code = {}
@@ -189,6 +214,125 @@ pst[R] = pst['R']
 pst[Q] = pst['Q']
 pst[K] = pst['K']
 
+-------------------------------------------------------------------------------
+-- Precomputed attack/ray tables
+--
+-- The 0..119 index space is an 8x8 board padded to 10 columns: cols 0 and 9
+-- of each row are spaces (SP) and rows 0/1 and 8/9 are padding, so a square
+-- is "on the board" iff 20 <= i < 100 and i%10 is 1..8. Rays step until the
+-- edge; the engine's while-loops stop at SP/NL, which is exactly this wall.
+-------------------------------------------------------------------------------
+local is_on_board = {}
+for _i = 0, 119 do
+    is_on_board[_i] = _i >= 20 and _i < 100 and (_i % 10) >= 1 and (_i % 10) <= 8
+end
+
+-- ray_squares[i][d]: squares along direction d (d in 1..8) from i.
+-- knight_targets[i] / king_targets[i] / pawn_caps[i]: fixed move sets.
+local ray_squares, knight_targets, king_targets, pawn_caps = {}, {}, {}, {}
+local all_dirs = { N, E, S, W, N + E, S + E, S + W, N + W }
+local knight_offsets = { 2 * N + E, N + 2 * E, S + 2 * E, 2 * S + E, 2 * S + W, S + 2 * W, N + 2 * W, 2 * N + W }
+local king_offsets = { N, E, S, W, N + E, S + E, S + W, N + W }
+for i = 0, 119 do
+    if is_on_board[i] then
+        ray_squares[i] = {}
+        for di, d in ipairs(all_dirs) do
+            local j = i + d
+            local sqs = {}
+            local n = 0
+            while is_on_board[j] do
+                n = n + 1
+                sqs[n] = j
+                j = j + d
+            end
+            ray_squares[i][di] = sqs
+        end
+        local kt, kg, pc = {}, {}, {}
+        for oi, o in ipairs(knight_offsets) do
+            local j = i + o
+            if is_on_board[j] then kt[#kt + 1] = j end
+        end
+        for oi, o in ipairs(king_offsets) do
+            local j = i + o
+            if is_on_board[j] then kg[#kg + 1] = j end
+        end
+        for _, o in ipairs({ N + W, N + E }) do
+            local j = i + o
+            if is_on_board[j] then pc[#pc + 1] = j end
+        end
+        knight_targets[i] = kt
+        king_targets[i] = kg
+        pawn_caps[i] = pc
+    end
+end
+
+-- direction index for each piece: P=1 pawn, KN=2 knight, B=3, R=4, Q=5, K=6
+-- pawn: di 1 (N), 2 (2N), 3 (N+W), 4 (N+E) -- we handle pawns specially in genMoves
+-- knight: 8 fixed targets
+-- sliders: rook di 1..4, bishop di 5..8, queen di 1..8
+local slider_dirs_by_piece = {
+    [R] = { 1, 2, 3, 4 },
+    [B] = { 5, 6, 7, 8 },
+    [Q] = { 1, 2, 3, 4, 5, 6, 7, 8 }
+}
+-- attack-direction map for attacked(): direction index -> piece codes that attack along it
+local rook_dirs = { 1, 2, 3, 4 }
+local bishop_dirs = { 5, 6, 7, 8 }
+
+-------------------------------------------------------------------------------
+-- Transposition-table key (integer, cached per Position)
+--
+-- Pure Lua 5.1 (no bit32 on Android/LuaJ), so we use a Zobrist-style sum of
+-- precomputed pseudo-random values. XOR would be ideal, but sum works fine for
+-- a 64k-slot table: the stored full key is verified on every probe, so a
+-- collision only costs a missed lookup, never a wrong result.
+-- The key covers board + castling rights + ep + kp (NOT score: two move orders
+-- reaching the same position must share a TT entry).
+-------------------------------------------------------------------------------
+local zob = {}
+local zflat = {}
+local zob_wc = { 0, 0 }
+local zob_bc = { 0, 0 }
+local zob_ep = {}
+local zob_kp = {}
+do
+    -- Deterministic Multiply-With-Carry PRNG. Pure Lua 5.1 arithmetic (no
+    -- bit32/bitwise on Android/LuaJ). MWC gives well-distributed low bits,
+    -- which matters because the TT slot is key % TT_SIZE (low bits of key).
+    -- A bad low-bit PRNG (e.g. LCG) collapses the table into a few slots.
+    local x = 88172645463325252 % 65536
+    local c = math.floor(88172645463325252 / 65536) % 65536
+    local function rnd()
+        local t = x * 65539 + c
+        c = math.floor(t / 65536)
+        x = t % 65536
+        return x + c * 65536
+    end
+    for pc = -6, 6 do
+        zob[pc] = {}
+        for sq = 0, 119 do
+            zob[pc][sq] = rnd()
+        end
+    end
+    -- Flat 1D alias for the hash loop: zflat[(pc+6)*120 + sq] == zob[pc][sq].
+    -- A single table get instead of two saves a LuaJ Java call per square.
+    zflat = {}
+    for pc = -6, 6 do
+        for sq = 0, 119 do
+            zflat[(pc + 6) * 120 + sq] = zob[pc][sq]
+        end
+    end
+    zob_wc[1], zob_wc[2] = rnd(), rnd()
+    zob_bc[1], zob_bc[2] = rnd(), rnd()
+    for sq = 0, 119 do
+        zob_ep[sq] = rnd()
+    end
+    zob_kp[0] = 0
+    for sq = 1, 119 do
+        zob_kp[sq] = rnd()
+    end
+end
+
 -- The old string-keyed maps (is_upper_map/is_lower_map/swap_map) are replaced
 -- by the integer codes: p >= 1 means our piece, p < 0 means enemy, -p is the
 -- enemy's piece type.
@@ -218,6 +362,31 @@ function Position.from_array(b, score, wc, bc, ep, kp)
     self.ep = ep
     self.kp = kp
     return self
+end
+
+-- Compute (and cache) the integer key for a position. The key is stored on the
+-- position as `_key` so it is computed once per position, not per TT probe.
+function Position:key()
+    local k = self._key
+    if not k then
+        local b = self._b or self:ensure_arr()
+        local zf = zflat
+        local h = 0
+        for i = 0, 119 do
+            local pc = b[i]
+            -- Skip empty squares and the padding codes (98/99); only pieces hash.
+            if pc ~= EMPTY and pc ~= SP and pc ~= NL then h = h + zf[(pc + 6) * 120 + i] end
+        end
+        if self.wc[1] then h = h + zob_wc[1] end
+        if self.wc[2] then h = h + zob_wc[2] end
+        if self.bc[1] then h = h + zob_bc[1] end
+        if self.bc[2] then h = h + zob_bc[2] end
+        if self.ep ~= 0 then h = h + zob_ep[self.ep] end
+        if self.kp ~= 0 then h = h + zob_kp[self.kp] end
+        k = h % 4294967296 -- keep it a 32-bit-range integer for cheap math
+        self._key = k
+    end
+    return k
 end
 
 -- Build the integer array from the string board (lazy, once).
@@ -253,40 +422,88 @@ function Position:genMoves()
     local moves = {}
     local move_idx = 1
     local b = self:ensure_arr()
+    local wc1, wc2 = self.wc[1], self.wc[2]
+    local ep, kp = self.ep, self.kp
 
-    for i = 0, 119 do
-        local p = b[i]
-        if p >= P and p <= K and directions[p] then
-            for _, d in ipairs(directions[p]) do
-                local j = i + d
-                -- Inline sliding check avoiding `limit` math and `isspace` function call
-                while true do
-                    local q = b[j]
-                    if q == SP or q == NL then break end
-
-                    -- Castling
-                    if i == A1 and q == K and self.wc[1] then
-                        moves[move_idx] = { j, j - 2, 0 }; move_idx = move_idx + 1
+    for i = 20, 99 do
+        if is_on_board[i] then
+            local p = b[i]
+            if p >= P and p <= K then
+                if p == P then
+                    -- Pawn: single push, double push, captures, ep.
+                    local j = i + N
+                    if is_on_board[j] and b[j] == EMPTY then
+                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        -- Double push: original allows it whenever i >= A1+N and
+                        -- the intermediate square is empty (the single push above
+                        -- already verified b[i+N]==EMPTY). The last-rank special
+                        -- case (e.g. a pawn on e1) is preserved.
+                        if i >= A1 + N then
+                            local j2 = i + 2 * N
+                            if is_on_board[j2] and b[j2] == EMPTY then
+                                moves[move_idx] = move_pack(i, j2, 0); move_idx = move_idx + 1
+                            end
+                        end
                     end
-                    if i == H1 and q == K and self.wc[2] then
-                        moves[move_idx] = { j, j + 2, 0 }; move_idx = move_idx + 1
+                    -- Captures (diagonals). En passant when the target is empty but is ep.
+                    local pc = pawn_caps[i]
+                    for c = 1, #pc do
+                        j = pc[c]
+                        local q = b[j]
+                        if q < 0 or (q == EMPTY and j == ep) then
+                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        end
                     end
-
-                    if q >= P and q <= K then break end
-
-                    -- Special pawn stuff
-                    if p == P then
-                        if (d == N + W or d == N + E) and q == EMPTY and j ~= self.ep and j ~= self.kp then break end
-                        if (d == N or d == 2 * N) and q ~= EMPTY then break end
-                        if d == 2 * N and (i < A1 + N or b[i + N] ~= EMPTY) then break end
+                elseif p == KN then
+                    local kt = knight_targets[i]
+                    for c = 1, #kt do
+                        local j = kt[c]
+                        if b[j] <= EMPTY then
+                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        end
                     end
-
-                    moves[move_idx] = { i, j, 0 }; move_idx = move_idx + 1
-
-                    if p == P or p == KN or p == K then break end
-                    if q < 0 then break end
-
-                    j = j + d
+                elseif p == K then
+                    local kg = king_targets[i]
+                    for c = 1, #kg do
+                        local j = kg[c]
+                        if b[j] <= EMPTY then
+                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        end
+                    end
+                else
+                    -- Sliders: bishop (di 5..8), rook (di 1..4), queen (di 1..8).
+                    -- Castling (original semantics): when a ROOK at A1 slides E (or
+                    -- H1 slides W) and the square beyond the current j holds the
+                    -- king, emit the king's two-square move toward the rook:
+                    --   rook at A1: king at j+E -> j+W  (queenside)
+                    --   rook at H1: king at j+W -> j+E  (kingside)
+                    local sd = slider_dirs_by_piece[p]
+                    for s = 1, #sd do
+                        local di = sd[s]
+                        local ray = ray_squares[i][di]
+                        local castling = p == R and (di == 2 or di == 4) -- E or W
+                        for c = 1, #ray do
+                            local j = ray[c]
+                            local q = b[j]
+                            if q == EMPTY then
+                                moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                            elseif q < 0 then
+                                moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                                break
+                            else
+                                -- own piece blocks the ray, but if it's the king and
+                                -- the rook has castling rights, emit the castling move
+                                if castling then
+                                    if i == A1 and q == K and wc1 then
+                                        moves[move_idx] = move_pack(j, j - 2, 0); move_idx = move_idx + 1
+                                    elseif i == H1 and q == K and wc2 then
+                                        moves[move_idx] = move_pack(j, j + 2, 0); move_idx = move_idx + 1
+                                    end
+                                end
+                                break
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -303,30 +520,22 @@ end
 -- filters it. Search and public move validation use legal_moves().
 -------------------------------------------------------------------------------
 
-local knight_dirs = directions['N']
-local king_dirs = directions['K']
-local pawn_cap_dirs = { N + W, N + E }
--- Sliding attack directions: {delta, rook_code, bishop_code}
-local slider_dirs = {
-    { N, -R, -Q }, { E, -R, -Q }, { S, -R, -Q }, { W, -R, -Q },
-    { N + E, -B, -Q }, { S + E, -B, -Q }, { S + W, -B, -Q }, { N + W, -B, -Q }
-}
-
 -- Is square `i` attacked by any opponent (lowercase) piece?
 -- `i` is 0-indexed as in genMoves. Works on the integer array `_b`.
-function Position:attacked(i)
-    local b = self:ensure_arr()
+-- `b` is the board array; if nil it is fetched lazily (used by public paths).
+function Position:attacked(i, b)
+    b = b or self:ensure_arr()
 
     -- King attacks (opponent kings)
-    for _, d in ipairs(king_dirs) do
-        local j = i + d
-        if b[j] == -K then return true end
+    local kg = king_targets[i]
+    for c = 1, #kg do
+        if b[kg[c]] == -K then return true end
     end
 
     -- Knight attacks
-    for _, d in ipairs(knight_dirs) do
-        local j = i + d
-        if b[j] == -KN then return true end
+    local kt = knight_targets[i]
+    for c = 1, #kt do
+        if b[kt[c]] == -KN then return true end
     end
 
     -- Pawn attacks: an enemy pawn attacks square i along one diagonal. The
@@ -335,25 +544,27 @@ function Position:attacked(i)
     -- Checking both diagonals is safe: in a legal position an enemy pawn can
     -- only be on one diagonal from i, and the other can't be occupied by a
     -- pawn (it would be behind the pawn).
-    for _, d in ipairs(pawn_cap_dirs) do
-        local j = i - d
-        if b[j] == -P then return true end
-        j = i + d
-        if b[j] == -P then return true end
+    local pc = pawn_caps[i]
+    for c = 1, #pc do
+        if b[pc[c]] == -P then return true end
     end
 
-    -- Sliding pieces (rook, bishop, queen)
-    for k = 1, 8 do
-        local s = slider_dirs[k]
-        local d = s[1]
-        local r, bb = s[2], s[3]
-        local j = i + d
-        while true do
-            local q = b[j]
-            if q == SP or q == NL then break end
-            if q == r or q == bb then return true end
+    -- Sliding pieces (rook, bishop, queen): walk the 8 precomputed rays.
+    -- Rook rays (di 1..4) attack with -R/-Q; bishop rays (di 5..8) with -B/-Q.
+    for di = 1, 4 do
+        local ray = ray_squares[i][di]
+        for c = 1, #ray do
+            local q = b[ray[c]]
+            if q == -R or q == -Q then return true end
             if q ~= EMPTY then break end
-            j = j + d
+        end
+    end
+    for di = 5, 8 do
+        local ray = ray_squares[i][di]
+        for c = 1, #ray do
+            local q = b[ray[c]]
+            if q == -B or q == -Q then return true end
+            if q ~= EMPTY then break end
         end
     end
 
@@ -362,32 +573,72 @@ end
 
 -- Is the side to move in check? (own king is code K)
 function Position:in_check()
-    local b = self:ensure_arr()
-    for i = 0, 119 do
-        if b[i] == K then
-            return self:attacked(i)
-        end
+    local king = self:king_index()
+    if king then
+        return self:attacked(king, self._b)
     end
     return false
 end
 
--- Find the index of the side-to-move's king, or nil.
+-- Find the index of the side-to-move's king, or nil. Cached on the position
+-- (`_king`) because the king's square only changes on a king move and positions
+-- are immutable (is_legal's in-place board mutations always undo before return).
 function Position:king_index()
-    local b = self:ensure_arr()
-    for i = 0, 119 do
-        if b[i] == K then
-            return i
+    local k = self._king
+    if not k then
+        local b = self:ensure_arr()
+        for i = 0, 119 do
+            if b[i] == K then
+                k = i
+                self._king = i
+                return i
+            end
         end
     end
-    return nil
+    return k
+end
+
+-- Squares that could affect the safety of the king at `king`: the 8 adjacent
+-- squares plus all squares along the 8 rays from the king up to (and including)
+-- the first occupied square. A non-king move only changes the king's attack
+-- status if it touches one of these squares (or is en passant).
+-- Returns `sens` (a generation-tagged table, truthy) and `gen` (the generation),
+-- or nil if the king is currently attacked (no short-circuit is safe). Instead
+-- of clearing the reusable table every call, we bump a generation counter and
+-- store it per square; `is_legal` checks `sens[sq] == gen`.
+local sens_tmp = {}
+local sens_gen = 0
+function Position:king_sensitive(king, b)
+    b = b or self:ensure_arr()
+    sens_gen = sens_gen + 1
+    local g = sens_gen
+    -- Adjacent squares.
+    local kg = king_targets[king]
+    for c = 1, #kg do sens_tmp[kg[c]] = g end
+    -- Rays from the king.
+    for di = 1, 8 do
+        local ray = ray_squares[king][di]
+        for c = 1, #ray do
+            local sq = ray[c]
+            sens_tmp[sq] = g
+            if b[sq] ~= EMPTY then break end -- stop at first piece
+        end
+    end
+    -- If the king is currently attacked, fall back to no short-circuit.
+    if self:attacked(king, b) then return nil end
+    return sens_tmp, g
 end
 
 -- Is the given pseudo-legal move legal? Applies the move in place on the
 -- integer array, tests the own king, then undoes it.
 -- `king` (optional) is the precomputed index of the own king.
-function Position:is_legal(move, king)
-    local i, j = move[1], move[2]
-    local b = self:ensure_arr()
+-- `sens` (optional) is the king-sensitive square table from king_sensitive(),
+-- `sens_g` its generation tag, or nil. When sens ~= nil and the move does not
+-- touch a sensitive square, the king's safety is unchanged, so we can skip the
+-- attacked() re-check.
+function Position:is_legal(move, king, sens, b, sens_g)
+    local i, j = move_from(move), move_to(move)
+    b = b or self:ensure_arr()
     local p = b[i]
     local q = b[j]
 
@@ -402,6 +653,18 @@ function Position:is_legal(move, king)
 
     if p ~= K then
         -- Non-king move: the king stays at `king`.
+        if sens then
+            -- Short-circuit: if this move doesn't touch a sensitive square and
+            -- isn't en passant, the king's safety is unchanged. `sens` being
+            -- non-nil means the king is currently NOT attacked, so the move is
+            -- legal.
+            if i ~= king and sens[i] ~= sens_g and sens[j] ~= sens_g then
+                local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
+                if not is_ep or sens[j + S] ~= sens_g then
+                    return true
+                end
+            end
+        end
         b[i] = EMPTY
         b[j] = p
         local ep_undo = false
@@ -410,7 +673,7 @@ function Position:is_legal(move, king)
             b[j + S] = EMPTY
             ep_undo = true
         end
-        local legal = not self:attacked(king)
+        local legal = not self:attacked(king, b)
         -- undo
         b[i] = p
         b[j] = q
@@ -432,10 +695,10 @@ function Position:is_legal(move, king)
         b[between] = K
         b[j] = R
         local legal
-        if self:attacked(between) then
+        if self:attacked(between, b) then
             legal = false
         else
-            legal = not self:attacked(j)
+            legal = not self:attacked(j, b)
         end
         -- undo
         b[i] = K
@@ -446,7 +709,7 @@ function Position:is_legal(move, king)
 
     b[i] = EMPTY
     b[j] = K
-    local legal = not self:attacked(j)
+    local legal = not self:attacked(j, b)
     b[i] = K
     b[j] = q
     return legal
@@ -458,8 +721,10 @@ function Position:legal_moves()
     local legal = {}
     local n = 0
     local king = self:king_index()
-    for _, m in ipairs(pseudo) do
-        if self:is_legal(m, king) then
+    local b = self._b
+    for k = 1, #pseudo do
+        local m = pseudo[k]
+        if self:is_legal(m, king, nil, b) then
             n = n + 1
             legal[n] = m
         end
@@ -497,20 +762,20 @@ function Position:rotate()
     return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp)
 end
 
-function Position:move(move)
-    local i, j = move[1], move[2]
+function Position:move(move, val)
+    local i, j
+    if type(move) == 'table' then
+        i, j = move[1], move[2] -- public path: parsed UCI tuple
+        val = nil
+    else
+        i, j = move_from(move), move_to(move) -- internal: packed int
+    end
     local b = self:ensure_arr()
     local p = b[i]
     local q = b[j]
 
-    local score = self.score + self:value(move)
+    local score = self.score + (val or self:value(move, b))
     local wc, bc, ep, kp = self.wc, self.bc, 0, 0
-
-    -- Build the moved (un-rotated) board by copying the array and editing.
-    local mb = {}
-    for k = 0, 119 do mb[k] = b[k] end
-    mb[j] = p
-    mb[i] = EMPTY
 
     if i == A1 then wc = { false, wc[2] } end
     if i == H1 then wc = { wc[1], false } end
@@ -521,41 +786,81 @@ function Position:move(move)
         wc = { false, false }
         if math_abs(j - i) == 2 then
             kp = math_floor((i + j) / 2)
-            mb[j < i and A1 or H1] = EMPTY
-            mb[kp] = R
         end
     end
 
-    if p == P then
-        if A8 <= j and j <= H8 then
-            mb[j] = Q -- promotion
-        end
-        if j - i == 2 * N then
-            ep = i + N
-        end
-        if ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
-            mb[j + S] = EMPTY -- en passant
-        end
+    if p == P and j - i == 2 * N then
+        ep = i + N
     end
 
-    -- Rotate the moved board into the new frame in one pass.
+    -- Build the rotated board in a single pass (no copy-then-rotate). The
+    -- moved-to square (j) becomes 119-j in the new frame (negated piece code =
+    -- opposite color); the moved-from square (i) becomes 119-i and is emptied.
+    -- Castling: the rook origin (A1/H1) is emptied and the rook lands on
+    -- 119-kp. Promotion: the moved pawn becomes a negated queen. En passant:
+    -- the captured pawn at j+S is emptied (valid only when j was empty).
+    -- The common case (plain piece move, no castling/promotion) stays a tight
+    -- 2-branch loop; rare special cases take a slower branch.
     local nb = {}
-    for k = 0, 119 do
-        local v = mb[119 - k]
-        if v < 0 then
-            nb[k] = -v
-        elseif v > 6 then
-            nb[k] = v
-        else
-            nb[k] = -v
+    local r = 119 - j
+    local s = 119 - i
+    if p == K and math_abs(j - i) == 2 then
+        -- Castling: rook origin and rook destination are extra edits. The
+        -- rotated frame negates colors, so the rook lands as -R (enemy).
+        local rook_from = j < i and A1 or H1
+        for k = 0, 119 do
+            if k == r then
+                nb[k] = -p
+            elseif k == s then
+                nb[k] = EMPTY
+            elseif k == 119 - rook_from then
+                nb[k] = EMPTY
+            elseif k == 119 - kp then
+                nb[k] = -R
+            else
+                local v = b[119 - k]
+                if v < 0 then
+                    nb[k] = -v
+                elseif v > 6 then
+                    nb[k] = v
+                else
+                    nb[k] = -v
+                end
+            end
+        end
+    else
+        local dest = A8 <= j and j <= H8 and -Q or -p -- promotion -> queen
+        for k = 0, 119 do
+            if k == r then
+                nb[k] = dest
+            elseif k == s then
+                nb[k] = EMPTY
+            else
+                local v = b[119 - k]
+                if v < 0 then
+                    nb[k] = -v
+                elseif v > 6 then
+                    nb[k] = v
+                else
+                    nb[k] = -v
+                end
+            end
+        end
+        if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
+            nb[119 - (j + S)] = EMPTY -- en passant
         end
     end
     return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp)
 end
 
-function Position:value(move)
-    local i, j = move[1], move[2]
-    local b = self:ensure_arr()
+function Position:value(move, b)
+    local i, j
+    if type(move) == 'table' then
+        i, j = move[1], move[2] -- public path: parsed UCI tuple
+    else
+        i, j = move_from(move), move_to(move) -- internal: packed int
+    end
+    b = b or self:ensure_arr()
     local p = b[i]
     local q = b[j]
 
@@ -584,38 +889,27 @@ function Position:value(move)
     return score
 end
 
+-- Fixed-size transposition table. Each slot: {key, depth, score, gamma, move}.
+-- Probing uses key % TT_SIZE and verifies slot.key == key (full 32-bit key), so
+-- hash collisions only cause a missed entry, never a wrong result.
 local tp = {}
-local tp_index = {}
-local tp_count = 0
+for _i = 0, TT_SIZE - 1 do tp[_i] = {} end
 
-local function tp_set(pos, val)
-    -- Simplified and fixed transposition hashing.
-    -- 1. Using numbers directly avoids concatenating boolean 't' and 'f' strings in Lua.
-    -- 2. Fixed critical bug in original engine where w1 & w2 looked at 'pos.bc' instead of 'pos.wc'
-    local b1 = pos.bc[1] and 1 or 0
-    local b2 = pos.bc[2] and 1 or 0
-    local w1 = pos.wc[1] and 1 or 0
-    local w2 = pos.wc[2] and 1 or 0
-    local hash = pos:ensure_board() .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
-
-    tp[hash] = val
-    tp_count = tp_count + 1
-    tp_index[tp_count] = hash
+local function tp_set(pos, key, val)
+    local slot = tp[key % TT_SIZE]
+    slot.key = key
+    slot.depth = val.depth
+    slot.score = val.score
+    slot.gamma = val.gamma
+    slot.move = val.move
 end
 
-local function tp_get(pos)
-    local b1 = pos.bc[1] and 1 or 0
-    local b2 = pos.bc[2] and 1 or 0
-    local w1 = pos.wc[1] and 1 or 0
-    local w2 = pos.wc[2] and 1 or 0
-    local hash = pos:ensure_board() .. pos.score .. w1 .. w2 .. b1 .. b2 .. pos.ep .. pos.kp
-    return tp[hash]
-end
-
-local function tp_popitem()
-    tp[tp_index[tp_count]] = nil
-    tp_index[tp_count] = nil
-    tp_count = tp_count - 1
+local function tp_get(pos, key)
+    local slot = tp[key % TT_SIZE]
+    if slot.key == key then
+        return slot
+    end
+    return nil
 end
 
 -------------------------------------------------------------------------------
@@ -623,6 +917,25 @@ end
 -------------------------------------------------------------------------------
 
 local nodes = 0
+
+-- Hoisted sorter (created once, not per bound() call). Moves are packed
+-- integers: sort value in the high bits, i and j in the low bits. Same
+-- ordering as before (value desc, then i desc, then j asc).
+local function sorter(a, b)
+    if a ~= b then
+        if a > b then return true end
+        if a < b then return false end
+        -- identical packed value: break ties by i desc, j asc
+        local ai, aj = move_from(a), move_to(a)
+        local bi, bj = move_from(b), move_to(b)
+        if ai ~= bi then
+            return ai > bi
+        else
+            return aj < bj
+        end
+    end
+    return false
+end
 
 local function bound(pos, gamma, depth)
     nodes = nodes + 1
@@ -632,18 +945,31 @@ local function bound(pos, gamma, depth)
         return pos.score
     end
 
+    -- Look up the transposition table BEFORE move generation. A usable entry
+    -- (same depth, bound satisfied) lets us return immediately without paying
+    -- for genMoves + the legality filter. Mate/stalemate is safe: a position
+    -- with no legal moves never stores a TT entry with `move == nil` (we only
+    -- store after a legal move is found), and the terminal-score check above
+    -- catches already-decided positions.
+    local key = pos:key()
+    local entry = tp_get(pos, key)
+    if entry ~= nil and entry.depth >= depth and (
+            entry.score < entry.gamma and entry.score < gamma or
+                    entry.score >= entry.gamma and entry.score >= gamma) then
+        return entry.score
+    end
+
     -- Generate pseudo-legal moves and filter out those that leave our own king
     -- in check. If no legal move exists the position is checkmate or stalemate.
-    -- This must happen BEFORE the TT lookup so mated/stalemated positions
-    -- always evaluate to the terminal score (a stale TT entry could otherwise
-    -- mask the mate).
     local pseudo = pos:genMoves()
     local moves = {}
     local nlegal = 0
     local king = pos:king_index()
+    local b = pos._b
+    local sens, sens_g = pos:king_sensitive(king, b)
     for k = 1, #pseudo do
         local move = pseudo[k]
-        if pos:is_legal(move, king) then
+        if pos:is_legal(move, king, sens, b, sens_g) then
             nlegal = nlegal + 1
             moves[nlegal] = move
         end
@@ -656,13 +982,6 @@ local function bound(pos, gamma, depth)
         end
     end
 
-    local entry = tp_get(pos)
-    if entry ~= nil and entry.depth >= depth and (
-            entry.score < entry.gamma and entry.score < gamma or
-                    entry.score >= entry.gamma and entry.score >= gamma) then
-        return entry.score
-    end
-
     local nullscore = depth > 0 and -bound(pos:rotate(), 1 - gamma, depth - 3) or pos.score
     if nullscore >= gamma then
         return nullscore
@@ -672,28 +991,17 @@ local function bound(pos, gamma, depth)
 
     -- Cache calculated move values so table.sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
     for k = 1, nlegal do
-        moves[k][3] = pos:value(moves[k])
+        moves[k] = move_set_val(moves[k], pos:value(moves[k], b))
     end
 
-    local function sorter(a, b)
-        if a[3] ~= b[3] then
-            return a[3] > b[3]
-        else
-            if a[1] == b[1] then
-                return a[2] > b[2]
-            else
-                return a[1] < b[1]
-            end
-        end
-    end
     table_sort(moves, sorter)
 
     for k = 1, nlegal do
         local move = moves[k]
-        if depth <= 0 and move[3] < 150 then
+        if depth <= 0 and move_val(move) < 150 then
             break
         end
-        local score = -bound(pos:move(move), 1 - gamma, depth - 1)
+        local score = -bound(pos:move(move, move_val(move)), 1 - gamma, depth - 1)
         if score > best then
             best = score
             bmove = move
@@ -708,10 +1016,7 @@ local function bound(pos, gamma, depth)
     end
 
     if entry == nil or depth >= entry.depth and best >= gamma then
-        tp_set(pos, { depth = depth, score = best, gamma = gamma, move = bmove })
-        if tp_count > TABLE_SIZE then
-            tp_popitem()
-        end
+        tp_set(pos, key, { depth = depth, score = best, gamma = gamma, move = bmove })
     end
     return best
 end
@@ -743,7 +1048,7 @@ local function search(pos, maxn)
         end
     end
 
-    local entry = tp_get(pos)
+    local entry = tp_get(pos, pos:key())
     if entry ~= nil then
         return entry.move, score
     end
@@ -771,8 +1076,10 @@ end
 local function ttfind(t, k)
     assert(t)
     if not k then return false end
+    -- `k` is a parsed UCI tuple {from, to}; `t` holds packed ints.
+    local ki, kj = k[1], k[2]
     for _, v in ipairs(t) do
-        if k[1] == v[1] and k[2] == v[2] then
+        if move_from(v) == ki and move_to(v) == kj then
             return true
         end
     end
@@ -838,7 +1145,7 @@ function sunfish.ai_move(game)
     game = game:move(move)
     game:ensure_board()
 
-    return game, render(119 - move[1]) .. render(119 - move[2]), score
+    return game, render(119 - move_from(move)) .. render(119 - move_to(move)), score
 end
 
 -- Position query helpers (backward-compatible additions).
