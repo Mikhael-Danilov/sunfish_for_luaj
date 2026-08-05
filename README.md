@@ -27,8 +27,46 @@ lua tests/test_endgames.lua       # endgame correctness tests
 python3 tests/compare_python_chess.py
 
 # Benchmarks
-luajit benchmarks/bench_sunfish.lua
+luajit benchmarks/bench_sunfish.lua     # fastest
+lua5.1 benchmarks/bench_sunfish.lua
+BENCH_SCALE=0.01 benchmarks/run_luaj.sh # LuaJ (Java) - much slower VM
 ```
+
+The benchmark honors `BENCH_SCALE` (0..1) to shrink iteration counts for slow
+interpreters; the LuaJ wrapper defaults to 0.01 so a run finishes in ~1 minute.
+
+## LuaJ (Java) benchmarks
+
+LuaJ is the Java-based Lua interpreter (luaj.org / `luaj/luaj` on GitHub),
+not LuaJIT. The engine was tuned for "Luaj interpreter mode", so run the
+benchmarks under it:
+
+```sh
+# One-time setup (Java 21 + LuaJ 3.0.2 live under .reference/, gitignored):
+mkdir -p .reference
+curl -sL -o .reference/jdk.tar.gz "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12_8.tar.gz"
+curl -sL -o .reference/luaj-jse-3.0.2.jar "https://github.com/luaj/luaj/releases/download/v3.0.2/luaj-jse-3.0.2.jar"
+(cd .reference && tar -xzf jdk.tar.gz)
+
+# Then:
+benchmarks/run_luaj.sh               # runs the benchmark under LuaJ
+TEST_BUDGET=120 benchmarks/run_luaj.sh tests/test_sunfish.lua  # run tests under LuaJ
+```
+
+Measured on this machine (iter/s, higher is better; `ai_move` = ms per full search):
+
+| Benchmark           | LuaJ    | LuaJIT     | Lua 5.1  |
+|---------------------|---------|------------|----------|
+| `new`               | 5,200   | 1,906,000  | 450,000  |
+| `move (e2e4)`       | 145     | 22,700     | 3,100    |
+| store/restore       | 7,200   | 443,000    | 156,000  |
+| `move_2_cell`       | 68,000  | 27,500,000 | 737,000  |
+| illegal `move`      | 145     | 29,000     | 2,700    |
+| `ai_move` (search)  | 20.1s   | 2.8s       | 5.4s     |
+
+LuaJ is 60–900x slower than LuaJIT depending on the operation; the string-heavy
+coordinate conversion is worst (string ops are Java-call-bound), and a full
+search takes ~20s vs ~3s on LuaJIT.
 
 ## Endgame correctness
 
@@ -67,6 +105,7 @@ committed); it is not required to run the tests.
 - **Global transposition table**: the TT is module-level and never cleared, so repeated
   `ai_move` calls in one process become progressively slower (measured ~0.4s, 1.1s,
   6.7s for the first three searches). The tests keep `ai_move` usage light and the
-  harness gives each test a 30s budget.
+  harness gives each test a per-test budget (`TEST_BUDGET` seconds, default 30;
+  raise it for LuaJ, e.g. `TEST_BUDGET=120`).
 - **`sunfish.move` with non-string input** (e.g. `nil`) will raise, not return `false`.
   Only string moves are validated.

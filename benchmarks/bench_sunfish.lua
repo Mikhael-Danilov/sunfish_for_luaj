@@ -36,33 +36,41 @@ end
 print(string.format("Lua: %s", _VERSION))
 print(string.format("sunfish.MATE_VALUE = %d\n", sunfish.MATE_VALUE))
 
+-- Iteration scale for slow interpreters (e.g. LuaJ). Set BENCH_SCALE=0.01 to
+-- run 1/100th of the iterations, keeping runtime proportional.
+local scale = tonumber(os.getenv("BENCH_SCALE")) or 1
+if scale <= 0 or scale > 1 then scale = 1 end
+local function N(n)
+    return math.max(1, math.floor(n * scale))
+end
+
 local game = sunfish.new()
 
 -- 1. Position lifecycle
-bench("sunfish.new", 100000, function()
+bench("sunfish.new", N(100000), function()
     sunfish.new()
 end)
 
-bench("sunfish.move (e2e4)", 20000, function()
+bench("sunfish.move (e2e4)", N(20000), function()
     sunfish.move(game, "e2e4")
 end)
 
-bench("store_data / restore_data round-trip", 50000, function()
+bench("store_data / restore_data round-trip", N(50000), function()
     local d = sunfish.store_data(game)
     sunfish.restore_data(d)
 end)
 
 -- 2. Coordinate conversion
-bench("move_2_cell", 1000000, function()
+bench("move_2_cell", N(1000000), function()
     sunfish.move_2_cell(91)
 end)
 
-bench("cell_2_move", 1000000, function()
+bench("cell_2_move", N(1000000), function()
     sunfish.cell_2_move("a1")
 end)
 
 -- 3. Illegal move rejection (no genMoves traversal)
-bench("move (illegal, e2e5)", 200000, function()
+bench("move (illegal, e2e5)", N(200000), function()
     sunfish.move(game, "e2e5")
 end)
 
@@ -70,7 +78,7 @@ end)
 -- complete search (up to ~10k nodes) and is the heaviest public call.
 -- Note: the engine's module-level transposition table persists across calls,
 -- so repeated ai_move calls degrade; we benchmark one cold search.
-bench("ai_move (full search, cold)", 1, function()
+bench("ai_move (full search, cold)", N(1), function()
     in_coroutine(function()
         local g = sunfish.new()
         sunfish.ai_move(g)

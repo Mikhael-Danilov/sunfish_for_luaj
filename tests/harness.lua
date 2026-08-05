@@ -26,7 +26,7 @@ end
 -- coroutine instead. Errors are propagated back as normal exceptions.
 local function coroutine_guard(fn)
     local co = coroutine.create(fn)
-    local deadline = os.clock() + 30 -- allow up to 30s of engine search per test
+    local deadline = os.clock() + tonumber(os.getenv("TEST_BUDGET") or 30) -- 30s of engine search per test
     local ok, err = coroutine.resume(co)
     -- Keep resuming while the engine yields; stop after the time budget.
     while ok and coroutine.status(co) == "suspended" and os.clock() < deadline do
@@ -34,7 +34,7 @@ local function coroutine_guard(fn)
     end
     if ok and coroutine.status(co) == "suspended" then
         -- Budget exhausted mid-search: report instead of hanging forever.
-        return false, "test exceeded the 30s engine-search budget"
+        return false, "test exceeded the engine-search budget (TEST_BUDGET=" .. tostring(os.getenv("TEST_BUDGET") or 30) .. "s)"
     end
     return ok, err
 end
