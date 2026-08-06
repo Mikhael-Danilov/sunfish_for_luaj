@@ -859,27 +859,29 @@ loop's bookkeeping but not the move chosen (the last fail-high at the deepest
 completed depth is exactly what the TT re-probe would return when it's not
 overwritten).
 
-**Benchmark outcome (A+B+C+D): behavior-identical, perf-neutral — shipped as a
-cleanup batch.** All gates green (node invariant 27/197/411/1818/4036/15803 +
-`a8b6`; suites 14+15+21 on luajit/lua5.1/LuaJ; oracle 40/40; 300-position hash
-walk). Cold `ai_move` A/B on a single-core, heavily loaded machine (load avg
-~2 during runs, ~1 GB RAM — see the machine note below) measured **no reliable
-gain**: sequential `/usr/bin/time` runs, base 11.7/11.5/12.8s (mean 12.0) vs
-mod 12.9/11.9/12.3s (mean 12.4), and an A-only isolate 11.4/12.2s (mean 11.8) —
-all within the load-noise band. The leaf-rotate skip (A) — theoretically the
-biggest win — measures as a wash: LuaJ's pooled 120-cell rotate is not the
-dominant per-node cost at these node counts. Decision: **ship A+B+C+D anyway**
-as a behavior-identical cleanup (zero risk, removes genuinely dead work, D
-fixes the rare `(pass)` artifact), explicitly *not* as a perf win. If a real
-gain is needed, E (attacked() instrumentation) and F2 (TT size/depth-preferred)
-are the higher-value next steps.
+**Benchmark outcome (A+B+C+D): behavior-identical, ~13% CPU-time win — shipped
+as a cleanup batch (upgraded from "perf-neutral").** All gates green (node
+invariant 27/197/411/1818/4036/15803 + `a8b6`; suites 14+15+21 on
+luajit/lua5.1/LuaJ; oracle 40/40; 300-position hash walk). Initial wall-clock
+A/Bs on the single-core busy VM looked perf-neutral (base 11.7/11.5/12.8s vs
+mod 12.9/11.9/12.3s), but that was wall-clock noise. Re-measured with
+**OS-level CPU time** (`/usr/bin/time` `User time`, load-immune, stable to
+~0.1s across runs): base 13.24/13.34s (mean 13.29) vs mod 12.64/10.38/11.43s
+(mean 11.48) — **mod ~13.6% faster CPU, winning all three runs**. The
+wall-clock spread was load-induced waiting, not engine time. Note: LuaJ's
+`os.clock()` is `System.currentTimeMillis()`-based (verified in the bytecode),
+i.e. wall-clock, NOT CPU time — never trust engine-internal "ms" on a loaded
+machine. ThreadMXBean thread-CPU also reported ~0 on this VM, so
+`/usr/bin/time` `User time` (minus the ~0.36s JVM-startup CPU constant) is the
+reliable CPU measure here.
 
 **Machine note**: this repo is benchmarked on a single-core 1 GB VM with
 frequent load spikes (19 users; load avg 1.5-3.9 observed). All cold-JVM A/Bs
-must run **sequentially** (never in parallel), prefer the engine's internal
-`ai_move` timing over OS wall-clock (JVM startup ~60s swamps the ~1s deltas),
-and treat <10% deltas as noise. `/usr/bin/time -v` is used for OS-level
-confirmation.
+must run **sequentially** (never in parallel), and **CPU time
+(`/usr/bin/time -v` `User time`) is the signal** — wall-clock and LuaJ
+`os.clock()` are both load-contaminated. `benchmarks/bench_cpu.lua` +
+`LuajCpuRun` launcher provide the harness (though ThreadMXBean is broken on
+this VM, the `os.cpuclock()` hook remains for machines where it works).
 
 **E — measure `attacked()` share by caller class.** With `key()` O(1) and the
 TT probe nearly free, the 54% `is_legal`/`attacked`/`genMoves` share is almost
