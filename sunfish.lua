@@ -384,6 +384,57 @@ function Position.from_array(b, score, wc, bc, ep, kp, nk, nek)
     return self
 end
 
+-------------------------------------------------------------------------------
+-- Pooled Position/board reuse for the search hot path
+--
+-- Every bound() node creates a child via move() (and a rotate() child for the
+-- null move). In the immutable design those children allocate a fresh 120-slot
+-- board + Position object each: measured ~1 board + ~1 object per node
+-- (~23k tables + ~11.6k objects per 10k-node search), all short-lived garbage
+-- on a GC'd interpreter.
+--
+-- The children's lifetimes are strictly nested with the recursion: each child
+-- is passed to the next bound() frame, fully consumed there (only numbers --
+-- scores and packed moves -- escape), and is dead before the next sibling is
+-- created. So a simple free-list pool is safe: a pooled slot is only reused
+-- after its position has fully returned. The pool is bounded (POOL_CAP slots);
+-- beyond that, freed slots drop out and GC reclaims them.
+--
+-- move()/rotate() take a `pooled` flag: the search passes true, the public API
+-- (sunfish.move, ai_move's returned position, tests calling rotate()) passes
+-- nothing and keeps allocating fresh.
+local POOL_CAP = 1024
+local pool_free = {} -- free list of dead Position objects, each still holding its _b
+
+local function pool_alloc()
+    local self = pool_free[#pool_free]
+    if self then
+        pool_free[#pool_free] = nil
+        return self, self._b
+    end
+    local b = {}
+    local self = setmetatable({}, Position)
+    self._b = b
+    return self, b
+end
+
+local function pool_free_pos(self)
+    -- Drop all fields so a stale reference can never alias a live board; the
+    -- board (_b) stays on the object so it is reused with the slot.
+    self.board = nil
+    self._key = nil
+    self._king = nil
+    self._eking = nil
+    self.score = nil
+    self.wc = nil
+    self.bc = nil
+    self.ep = nil
+    self.kp = nil
+    if #pool_free < POOL_CAP then
+        pool_free[#pool_free + 1] = self
+    end
+end
+
 -- Compute (and cache) the integer key for a position. The key is stored on the
 -- position as `_key` so it is computed once per position, not per TT probe.
 function Position:key()
@@ -781,11 +832,18 @@ function Position:is_stalemate()
     return #self:legal_moves() == 0
 end
 
-function Position:rotate()
+function Position:rotate(pooled)
     -- One pass over the integer array: reverse (k -> 119-k) and negate the
     -- piece codes (case swap). Padding codes are untouched.
+    -- `pooled` (search null-move) reuses a pooled Position + board.
     local b = self:ensure_arr()
-    local nb = {}
+    local child, nb
+    if pooled then
+        child, nb = pool_alloc()
+    else
+        nb = {}
+        child = nil
+    end
     for k = 0, 119 do
         local v = b[119 - k]
         if v < 0 then
@@ -804,11 +862,22 @@ function Position:rotate()
     local nk, nek = nil, nil
     if ok and ek then nk = 119 - ek end
     if ek and ok then nek = 119 - ok end
+    if pooled then
+        child._b = nb
+        child.score = -self.score
+        child.wc = self.bc
+        child.bc = self.wc
+        child.ep = 119 - self.ep
+        child.kp = 119 - self.kp
+        child._king = nk
+        child._eking = nek
+        return child
+    end
     return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp,
         nk, nek)
 end
 
-function Position:move(move, val)
+function Position:move(move, val, pooled)
     local i, j
     if type(move) == 'table' then
         i, j = move[1], move[2] -- public path: parsed UCI tuple
@@ -847,7 +916,15 @@ function Position:move(move, val)
     -- the captured pawn at j+S is emptied (valid only when j was empty).
     -- The common case (plain piece move, no castling/promotion) stays a tight
     -- 2-branch loop; rare special cases take a slower branch.
-    local nb = {}
+    -- `pooled` (search path) reuses a pooled Position + board; otherwise a
+    -- fresh object + table is allocated (public API / tests).
+    local child, nb
+    if pooled then
+        child, nb = pool_alloc()
+    else
+        nb = {}
+        child = nil
+    end
     local r = 119 - j
     local s = 119 - i
     if p == K and math_abs(j - i) == 2 then
@@ -905,6 +982,18 @@ function Position:move(move, val)
     local nk, nek = nil, nil
     if ek then nk = 119 - ek end
     if ok then nek = 119 - (p == K and j or ok) end
+    if pooled then
+        -- Reuse the pooled object: set the new frame fields on it.
+        child._b = nb
+        child.score = -score
+        child.wc = bc
+        child.bc = wc
+        child.ep = 119 - ep
+        child.kp = 119 - kp
+        child._king = nk
+        child._eking = nek
+        return child
+    end
     return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp, nk, nek)
 end
 
@@ -1073,7 +1162,9 @@ local function bound(pos, gamma, depth)
         end
     end
 
-    local nullscore = depth > 0 and -bound(m_rotate(pos), 1 - gamma, depth - 3) or pos.score
+    local null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
+    local nullscore = depth > 0 and -bound(null_child, 1 - gamma, depth - 3) or pos.score
+    pool_free_pos(null_child) -- the null-move child is dead after this node
     if nullscore >= gamma then
         return nullscore
     end
@@ -1092,7 +1183,9 @@ local function bound(pos, gamma, depth)
         if depth <= 0 and move_val(move) < 150 then
             break
         end
-        local score = -bound(m_move(pos, move, move_val(move)), 1 - gamma, depth - 1)
+        local child = m_move(pos, move, move_val(move), true) -- pooled
+        local score = -bound(child, 1 - gamma, depth - 1)
+        pool_free_pos(child) -- the child is dead after its subtree returns
         if score > best then
             best = score
             bmove = move

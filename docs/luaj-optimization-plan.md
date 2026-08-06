@@ -321,13 +321,43 @@ the hash *inside* the existing single-pass `move()` board build (one 120-pass,
 not two), which saves the second pass and the `key()` metatable dispatch, but it
 is O(120), not O(1). Deferred — modest win, touches the highest-risk function.
 
-### Reviewed and deferred: make/unmake + ply buffers (item 05)
+### Reviewed and shipped (subset): board/Position pooling (item 05)
 
-Highest ceiling: the immutable design allocates a 120-slot board + Position
-object per child, plus list tables per node, which dominates on a GC'd
-interpreter. But it's the structural redesign with the documented
-recursion-corruption risk (two prior scratch-pooling attempts were reverted).
-Keep the public immutable API as a thin wrapper; do this last, behind a rewrite.
+The full make/unmake rewrite (one mutable board, ply buffers) is still deferred,
+but the *safe subset* shipped: a free-list pool of Position objects + their
+120-slot boards, used by the search's `move()`/`rotate()` children.
+
+Measured allocation profile (11,649-node start-position search, instrumented):
+`move()` builds a 120-slot board 8,929x, `rotate()` 2,690x, and `from_array`
+creates a Position object 11,619x — ~1 board + ~1 object per node, ~23k tables
++ ~11.6k objects per search, all short-lived garbage.
+
+Safety argument: search children have strictly nested (LIFO) lifetimes — each is
+passed to the next `bound()` frame, fully consumed there (only numbers escape:
+scores, packed moves), and is dead before the next sibling is created. So a
+bounded free list (POOL_CAP=1024, overflow drops to GC) is safe: a slot is only
+reused after its position has fully returned. The public API (`sunfish.move`,
+`ai_move`'s returned position, tests calling `rotate()`) keeps allocating fresh
+via a `pooled` flag; `pool_free_pos` clears all fields so a stale reference can
+never alias a live board.
+
+Same-JVM LuaJ A/B (start position, identical `b8c6`/sc=41 every round):
+
+| Round | baseline | pooled | delta |
+|-------|----------|--------|-------|
+| 1 | 17.0s | 10.7s | **-37.2%** |
+| 2 | 23.1s | 19.8s | **-14.3%** |
+| 3 | 16.0s | 12.3s | **-23.1%** |
+| 4 | 12.3s | 14.1s | +14.7% (noise outlier) |
+| 5 | 16.5s | 10.6s | **-35.5%** |
+
+Mean ~-19% excluding the outlier; consistently negative with identical move
+selection. This is the largest single win since the Phase-6 method hoisting.
+Tests green on luajit/lua5.1/LuaJ (14+15+21) + oracle 40/40.
+
+The full make/unmake rewrite (also pooling the per-node move lists) remains the
+known next step for the remaining allocation, but the list-pooling attempts were
+already reverted as net-slower under LuaJ (see "tried and reverted" above).
 
 ### Reviewed and shipped: yield countdown (item 07)
 
@@ -364,16 +394,18 @@ needs its own A/B against the same position. Deferred.
 | 4 | Search micro-opts (hoisted sorter, king-sensitive short-circuit) | 1.1-1.3x | Low | **DONE** |
 | 5 | Hot-path call elimination (board threading, cached king, single-pass move, generation-tagged sens, flat Zobrist, TT-before-movegen) | 1.15-1.3x | Med (signature churn, in-place mutation invariants) | **DONE** |
 | 6 | Phase-6 review: method hoisting, 64-square genMoves, value micro-hoists, king propagation, parallel-array TT | 1.3-2.0x cumulative on top of Phase 5 | Low-Med | **DONE** |
+| 7 | Board/Position pooling (search children reuse a bounded free list) | 1.2-1.5x on top of Phase 6 | Med (LIFO lifetime invariant) | **DONE** |
 
 Cumulative target: **~21s -> 3-5s** per `ai_move` under LuaJ.
 Current: **~15.9s (Phase 1) -> ~14.2s (Phases 2-4) -> ~12.5s (Phase 5) -> ~8-11s
-(Phase 6)**. The move-gen and lifecycle paths are 2-3.4x faster; `ai_move`
-(search) gained ~27% cumulative through Phase 5 and a further ~30-55% from the
-Phase-6 method hoisting + 64-square + value-hoist + king-propagation +
-parallel-TT batch (same-JVM A/B: 15.3->10.4s, 18.2->8.7s, 17.9->7.6s). The
-remaining search time is dominated by `is_legal`'s `attacked()` walks and
-per-node `move()` array construction, which are hard to reduce without deeper
-search restructuring (make/unmake is the known next step).
+(Phase 6) -> ~10-11s (Phase 7 pooling)**. The move-gen and lifecycle paths are
+2-3.4x faster; `ai_move` (search) gained ~27% cumulative through Phase 5, a
+further ~30-55% from the Phase-6 method hoisting + 64-square + value-hoist +
+king-propagation + parallel-TT batch, and ~14-37% (mean ~19%) from Phase-7
+board/Position pooling (same-JVM A/B, identical move selection every round).
+The remaining search time is dominated by `is_legal`'s `attacked()` walks and
+per-node `move()` array construction; the full make/unmake rewrite is the known
+next step but carries the documented recursion-corruption risk.
 
 ## Validation per phase
 
