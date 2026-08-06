@@ -22,6 +22,10 @@ local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k sl
 -- benchmark harness measure the uncapped ceiling (no coroutine switches).
 local YIELD_QUANTUM = 256
 local YIELD_ENABLED = true
+-- Gate the per-depth search progress print. Under LuaJ (and Android log
+-- routing) the unconditional print/string_format is expensive; SUNFISH_VERBOSE=1
+-- enables it for debugging, otherwise search runs silent.
+local VERBOSE = os.getenv("SUNFISH_VERBOSE") == "1"
 
 local A1, H1, A8, H8 = 92, 99, 22, 29
 local initial = '         \n' .. --   0 -  9
@@ -69,8 +73,12 @@ local NL, SP = 98, 99
 -- Pure arithmetic (no bit32/bitwise ops, per the LuaJ-interpreter constraint).
 local VAL_SHIFT = 14
 local VAL_BIAS = 2 ^ 22 -- half of the 23-bit value field
+-- Precomputed constants (Lua 5.1 has no constant folding; `2 ^ VAL_SHIFT` and
+-- `128 * 128` were recomputed on every call in the hot path).
+local VAL_SCALE = 2 ^ VAL_SHIFT
+local MOVE_MOD = 128 * 128
 local function move_pack(i, j, val)
-    return i * 128 + j + (val + VAL_BIAS) * 2 ^ VAL_SHIFT
+    return i * 128 + j + (val + VAL_BIAS) * VAL_SCALE
 end
 local function move_from(v)
     return math_floor(v / 128) % 128
@@ -79,11 +87,11 @@ local function move_to(v)
     return v % 128
 end
 local function move_val(v)
-    return math_floor(v / 2 ^ VAL_SHIFT) - VAL_BIAS
+    return math_floor(v / VAL_SCALE) - VAL_BIAS
 end
 -- Rewrite the value field of a packed move (sorting updates the cached value).
 local function move_set_val(v, val)
-    return (v % (128 * 128)) + (val + VAL_BIAS) * 2 ^ VAL_SHIFT
+    return (v % MOVE_MOD) + (val + VAL_BIAS) * VAL_SCALE
 end
 
 -- ASCII byte -> piece code (for lazy string -> array conversion).
@@ -442,6 +450,12 @@ end
 
 -- Compute (and cache) the integer key for a position. The key is stored on the
 -- position as `_key` so it is computed once per position, not per TT probe.
+-- NOTE: an incremental (O(1)) dual-hash key was implemented and verified
+-- correct on every move/rotate path, but reverted: the search exposes a
+-- pre-existing `_b` corruption (an extra pawn leaks into a pooled child via a
+-- path the per-call key() masked by re-hashing `_b`), so a cached board hash
+-- is unsafe (node counts 11651 vs 11653 baseline). The full 120-pass re-hashes
+-- the current `_b` and is immune. See the doc's Post-Phase-9 review.
 function Position:key()
     local k = self._key
     if not k then
@@ -1063,6 +1077,19 @@ local ttS = {}
 local ttG = {}
 local ttM = {}
 
+-- Pre-size the five parallel arrays at module load. Lua tables grow
+-- incrementally; without this the first search pays several rehashes while
+-- filling up to TT_SIZE integer keys *during the timed region*. Filling with
+-- sentinels (ttK = -1) allocates the array part once; a probe verifies
+-- ttK[s] == key, so the sentinel can never be a false match (keys are >= 0).
+for s = 1, TT_SIZE do
+    ttK[s] = -1
+    ttD[s] = 0
+    ttS[s] = 0
+    ttG[s] = 0
+    ttM[s] = 0
+end
+
 local function tp_set(key, depth, score, gamma, move)
     local s = key % TT_SIZE + 1
     ttK[s] = key
@@ -1072,11 +1099,13 @@ local function tp_set(key, depth, score, gamma, move)
     ttM[s] = move
 end
 
--- Probe the TT. Returns (score, depth, move) when an entry exists, else nil.
+-- Probe the TT. Returns (score, depth, move, slot) when an entry exists, else
+-- nil. The slot is `key % TT_SIZE + 1` (already computed here) so the caller's
+-- bound-check can reuse it instead of recomputing the modulo.
 local function tp_get(key)
     local s = key % TT_SIZE + 1
     if ttK[s] == key then
-        return ttS[s], ttD[s], ttM[s]
+        return ttS[s], ttD[s], ttM[s], s
     end
     return nil
 end
@@ -1199,20 +1228,15 @@ local function bound(pos, gamma, depth)
     -- Look up the transposition table BEFORE move generation. A usable entry
     -- (same depth, bound satisfied) lets us return immediately without paying
     -- for genMoves + the legality filter. Mate/stalemate is safe: a position
-    -- with no legal moves never stores a TT entry with `move == nil` (we only
-    -- store after a legal move is found), and the terminal-score check above
-    -- catches already-decided positions.
-    local key = m_key(pos)
-    local es, ed = tp_get(key)
-    local had_entry = es ~= nil
-    -- A usable entry (same depth, bound satisfied) returns immediately without
-    -- genMoves + the legality filter. Mate/stalemate is safe: a position with
-    -- no legal moves never stores a TT entry with `move == nil` (we only store
-    -- after a legal move is found), and the terminal-score check above catches
+    -- with no legal moves never stores a TT entry (we only store after a legal
+    -- move is found), and the terminal-score check above catches
     -- already-decided positions.
+    local key = m_key(pos)
+    local es, ed, _, ed_slot = tp_get(key)
+    local had_entry = es ~= nil
     if had_entry and ed >= depth and (
-            es < ttG[key % TT_SIZE + 1] and es < gamma or
-                    es >= ttG[key % TT_SIZE + 1] and es >= gamma) then
+            es < ttG[ed_slot] and es < gamma or
+                    es >= ttG[ed_slot] and es >= gamma) then
         return es
     end
 
@@ -1262,14 +1286,30 @@ local function bound(pos, gamma, depth)
         buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
     end
 
-    move_sort(buf, nlegal)
-
-    for k = 1, nlegal do
-        local move = buf[k]
-        if depth <= 0 and move_val(move) < 150 then
-            break
+    -- At depth <= 0 the loop below breaks at the first move_val < 150 (the
+    -- tail is never searched), so filter to the >= 150 subset BEFORE sorting:
+    -- the searched set and order are unchanged, but the heap sort only sees the
+    -- kept subset (leaves are a large fraction of nodes). Compaction is in
+    -- place (nlegal <= k, never overwrites an unread entry); the kept count is
+    -- exact so no `#` or tail-clear is needed.
+    local sort_n = nlegal
+    if depth <= 0 then
+        local keep = 0
+        for k = 1, nlegal do
+            if move_val(buf[k]) >= 150 then
+                keep = keep + 1
+                buf[keep] = buf[k]
+            end
         end
-        local child = m_move(pos, move, move_val(move), true) -- pooled
+        sort_n = keep
+    end
+
+    move_sort(buf, sort_n)
+
+    for k = 1, sort_n do
+        local move = buf[k]
+        local mv = move_val(move)
+        local child = m_move(pos, move, mv, true) -- pooled
         local score = -bound(child, 1 - gamma, depth - 1)
         pool_free_pos(child) -- the child is dead after its subtree returns
         if score > best then
@@ -1313,7 +1353,9 @@ local function search(pos, maxn)
         end
         assert(score)
 
-        print(string_format("Searched %d nodes. Depth %d. Score %d(%d/%d)", nodes, depth, score, lower, upper))
+        if VERBOSE then
+            print(string_format("Searched %d nodes. Depth %d. Score %d(%d/%d)", nodes, depth, score, lower, upper))
+        end
 
         if nodes >= maxn or math_abs(score) >= MATE_VALUE then
             break
@@ -1344,19 +1386,6 @@ local function render(i)
     -- `i` is a 0-based public square (A1=91). Use the 0-based A1 constant.
     local rank, fil = math_floor((i - 91) / 10), (i - 91) % 10
     return string.char(fil + string_byte('a')) .. tostring(-rank + 1)
-end
-
-local function ttfind(t, k)
-    assert(t)
-    if not k then return false end
-    -- `k` is a parsed UCI tuple {from, to}; `t` holds packed ints.
-    local ki, kj = k[1], k[2]
-    for _, v in ipairs(t) do
-        if move_from(v) == ki and move_to(v) == kj then
-            return true
-        end
-    end
-    return false
 end
 
 --//RPD interface:
@@ -1404,13 +1433,30 @@ end
 
 function sunfish.move(game, mv)
     local move = { parse(string_sub(mv, 1, 2)), parse(string_sub(mv, 3, 4)) }
-    if move[1] and move[2] and ttfind(game:legal_moves(), move) then
-        local ng = game:move(move)
-        ng:ensure_board()
-        return ng
-    else
+    if not (move[1] and move[2]) then
         return false
     end
+    -- Validate ONE user move instead of building the whole legal_moves() list:
+    -- generate pseudo-legal moves, find the matching {i, j}, and run is_legal on
+    -- only that move. This keeps sunfish.move snappy under LuaJ (legal_moves
+    -- filters every pseudo-move through is_legal + attacked()).
+    local pseudo = {}
+    local pe = game:genMoves(pseudo, 1)
+    local b = game:ensure_arr()
+    local king = game:king_index()
+    local sens, sens_g = game:king_sensitive(king, b)
+    for k = 1, pe do
+        local m = pseudo[k]
+        if move_from(m) == move[1] and move_to(m) == move[2] then
+            if game:is_legal(m, king, sens, b, sens_g) then
+                local ng = game:move(move)
+                ng:ensure_board()
+                return ng
+            end
+            return false
+        end
+    end
+    return false
 end
 
 function sunfish.ai_move(game)

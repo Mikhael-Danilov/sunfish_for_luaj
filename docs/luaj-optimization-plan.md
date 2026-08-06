@@ -9,6 +9,10 @@
 - [x] Phase 5: Hot-path call elimination (board threading, cached king,
   single-pass `move`, generation-tagged king-sensitivity) — **DONE**
 - [x] Phase 9: Full 1-based indexing + sentinel-terminated rays — **DONE**
+- [x] Phase 10: Behavior-identical batch (leaf filter-before-sort, TT pre-size,
+  micro batch, `sunfish.move` one-move legality) — **DONE**; item 2
+  (dual-hash Zobrist) reverted — exposed a pre-existing `is_legal` en-passant
+  undo bug (see the Phase-10 section)
 
 ### Cumulative results (measured, BENCH_SCALE=0.01 LuaJ, interleaved runs)
 
@@ -516,6 +520,239 @@ Self-play harness notes: `ai_move` occasionally returns `nil` at the root (the
 module-level TT's root entry is overwritten by a deeper transposition), which
 the engine handles by passing (board unchanged); the harness reports `(pass)`
 and continues.
+
+## Post-Phase-9 review: 7-item optimization proposal (reviewed, not implemented)
+
+A 7-item proposal for the next round was reviewed against the current code and
+the phase history. All code-level claims in the proposal were verified against
+the source; the verdicts below reflect the plan's established measurement
+discipline (same-JVM A/B for behavior-identical items, oracle+perft+endgames
+for node-count-changing item 1, self-play medians for shipping decisions).
+
+### Verified code-level observations (all confirmed)
+
+- **Item 7 single-modulo probe**: `bound()` recomputes `key % TT_SIZE + 1`
+  twice (lines 1214-1215) after `tp_get` already computed it (line 1077).
+  Real dead work; identical to the not-shipped ttinline's finding.
+- **Item 3 double `move_val(move)` decode**: line 1269 decodes the packed move,
+  line 1272 decodes the *same* move again. Also, line 1269's `move_val()` call
+  is evaluated even when `depth > 0` (the `and` short-circuits the `< 150`
+  compare, not the function call).
+- **Item 4 `2 ^ VAL_SHIFT` / `128 * 128` re-evaluated**: `2^14` is recomputed on
+  every `move_pack`/`move_val`/`move_set_val` call (Lua 5.1 has no constant
+  folding), and `128*128` on every `move_set_val`. Hoisting to precomputed
+  locals is valid and free.
+- **Item 3 leaf-break claim**: the sorted loop breaks at the first
+  `move_val < 150` (line 1269-1271), so the tail is never searched. Filtering
+  by value before sorting is behavior-identical.
+- **Item 5 TT arrays start empty**: `ttK/ttD/ttS/ttG/ttM` are declared as
+  empty `{}` (lines 1060-1064), so the first search pays several rehashes
+  filling up to 64k integer keys. Pre-sizing at load is valid.
+- **Item 1 remaining `attacked()` calls**: the `king_sensitive` short-circuit
+  (lines 760-770) already skips `attacked()` for most non-king moves. The
+  remaining calls are king moves, en-passant, moves touching sensitive
+  squares, and `king_sensitive`'s own probe. Item 1 subsumes the short-circuit.
+- **Item 2 flag terms**: `move()` computes `wc/bc/ep/kp` (lines 910-925)
+  before the board build, so an O(1) flag delta is coherent.
+
+### Verdicts
+
+- **Item 1 — Check/pin-aware legality: REJECTED as proposed.** The
+  checkers/pinned structural rewrite is correct in principle and would
+  eliminate the mutate/undo `attacked()` calls, but: (a) the plan's Phase-4
+  `king_sensitive` short-circuit already removed the dominant share of
+  `attacked()` calls (274k → 89k); (b) a per-node checkers walk still pays a
+  ray walk per slider direction (the same cost `attacked()` pays, ~⅓-1
+  `attacked()` per node) plus the pinned computation and the 3×3 king
+  neighborhood mask, which must correctly handle x-ray through the vacated
+  king square; (c) the en-passant and castling edges force a slow-path
+  retain. The plan's documented alternative — the make/unmake rewrite — cuts
+  the same `attacked()` cost without a parallel legality model to maintain.
+  The valid sub-item (measure which `attacked()` caller class dominates) is
+  worth doing before committing to either rewrite. If pursued, gate on
+  oracle 40/40 + perft + endgames (node counts legitimately change).
+
+- **Item 2 — Dual-hash incremental Zobrist: VALID, SHIPPED-eligible.** The
+  Phase-6 "O(1) impossible" verdict was specifically about a *single* hash
+  updated by rotation deltas; the proposal's dual-hash construction is sound.
+  The child board is `child[k] = -parent[121-k]` plus sparse edits, and the
+  mirror/rotation component maps `h(child)` onto `hf(parent)` by the
+  precomputed `zflat` table with zero per-square work, so the incremental
+  hash is O(1) + O(edits). This deletes the entire 120-iteration `key()` pass
+  (~1.4M `zflat` reads per 11.6k-node search) and makes the TT probe-before-
+  movegen path nearly free (the probe no longer pays for hashing). It requires
+  threading `_bh`/`_fh` through `move()`/`rotate()` exactly like `_king`/
+  `_eking` (already threaded), and keeping the collision discipline
+  (`ttK[s] == key` full-key verify). Behavior-identical — gate on the
+  node-count invariant (27/258/755/4156/11653, score 41) + full suite.
+  **The highest-value item of the batch.**
+
+- **Item 3 — Leaf filter-before-sort: SHIPPED-eligible (small).** Trivially
+  behavior-identical, and leaves are a large fraction of the 11.6k nodes. The
+  proposed threshold/captures-only follow-up changes semantics and is correctly
+  flagged as needing an A/B (quiet knight moves ~261 PST delta, king moves up
+  to ~307, kp-proximity bonus ~60k). Keep the current threshold for the
+  behavior-identical ship; the follow-up is a separate, measured change.
+
+- **Item 4 — Branch-free mirror loop via flip table: REJECTED (low value,
+  not low cost).** The `if k == r/s` + 3-way sign branch is real, but: (a)
+  the plan's Phase-9 history shows the equivalent "flattened rays" / "flat
+  attack tables" attempts were *slower* under LuaJ because per-cell branch
+  removal is offset by the extra table gets/Java calls (the per-cell cost is
+  dominated by the mirror copy itself, not the branch); (b) the patch
+  approach requires *two* passes over the 120 cells (mirror + sparse edits),
+  doubling the 120-iteration cost in the exact loop item 2 already eliminates
+  for the child build; (c) item 2 makes the mirror loop O(1) by construction,
+  so this is redundant. The hoisting of `2 ^ VAL_SHIFT`/`128 * 128` is valid
+  and should be folded into the micro batch (item 7), not a separate change.
+
+- **Item 5 — TT pre-size + depth-preferred replacement: PRE-SIZE SHIPPED,
+  DEPTH-PREFERRED DEFERRED.** Pre-sizing `ttK/ttD/ttS/ttG/ttM` at load is
+  free and removes the first-search rehash from the timed region. The
+  depth-preferred replacement changes which entries survive (behavior
+  change), so it needs its own A/B; pairing it with a TT_SIZE bump
+  (131072/262144) is reasonable since memory is ~5 arrays of doubles. The
+  stored-bound-flag suggestion is a reasonable refactor for when replacement
+  is revisited (turns the usability test into one integer compare).
+
+- **Item 6 — GC stop + wall-clock budget + VERBOSE gate: GC stop REJECTED
+  (unverified), budget + gate VALID.** `collectgarbage("stop")` before search
+  assumes the LuaJ build honors it and that the pool actually makes bound()
+  allocation-free (pooled boards + per-ply buffers + packed ints — close, but
+  `move_set_val`/`tp_set`/`tp_get` still allocate in edge cases, and the
+  public `ai_move` return path builds a fresh position). Guard with pcall and
+  verify on-device; the plan has no measured GC-pause signal, so this is
+  speculative. The wall-clock budget at the existing yield points is nearly
+  free and directly serves the Android RPD responsiveness goal — valid.
+  The `SUNFISH_VERBOSE` gate for the unconditional per-depth `print` is
+  already on the plan's list; valid and cheap.
+
+- **Item 7 — Micro batch: SHIPPED-eligible (all trivial, all verified).**
+  Hoist `2 ^ VAL_SHIFT`/`128 * 128` to locals; single-modulo TT probe (reuse
+  the slot computed in `tp_get`, matching the not-shipped ttinline's
+  microbenchmark signal); gate `print` behind `SUNFISH_VERBOSE`. All
+  behavior-identical, all verified against the code. Bundle with items 2 and
+  3 (per the proposal's own note that the ttinline probe was too noisy alone).
+
+### Not in the batch (proposal's own notes, agreed)
+
+- **`sunfish.move` one-move legality check**: valid; `legal_moves()` builds the
+  whole list to validate one user move. Generate pseudo-legal, find the
+  matching `{i,j}`, run `is_legal` on only that move. Noticeably snappier UI
+  under LuaJ.
+- **LMR revisit, later**: only after item 1 lands and per-node cost drops
+  materially; the Phase-6 rejection was precisely because the unlocked extra
+  depth cost more than the node reduction saved at high per-node overhead.
+- **Aspiration windows**: lower priority; the per-depth binary search is
+  cheap with TT repeats.
+
+### Proposed implementation order (for the next phase)
+
+1. **Item 2 (dual-hash) + Item 3 (leaf filter) + Item 7 (micro batch)** —
+   all behavior-identical, gate on the node-count invariant + full suite +
+   oracle. Item 2 is the largest win of the batch.
+2. **Item 5 pre-size** — fold into the same behavior-identical batch.
+3. **Item 6 budget + VERBOSE gate** — fold in; the GC-stop stays behind a
+   pcall guard and is measured on-device before shipping.
+4. **`sunfish.move` one-move legality** — separate behavior-identical change,
+   gate on the main suite.
+5. **Item 1 check/pin legality** — only after the `attacked()` caller-class
+   measurement confirms the remaining calls dominate; gate on oracle + perft +
+   endgames, not node counts.
+6. **Item 5 depth-preferred replacement + TT_SIZE bump** — its own A/B with
+   paired same-game self-play (median of ≥5 pairs), per the benchmark taste.
+
+### Measurement notes (from the benchmark taste, applied)
+
+- Node-count invariant (27/258/755/4156/11653, score 41) is the guard rail for
+  items 2/3/5/7 — all behavior-identical.
+- Item 1 changes node counts — gate on oracle 40/40 + perft 21/21 + endgames.
+- Self-play ±30% variance: single pairs are uninformative — use median of ≥5
+  paired games (or geometric mean) before shipping anything in the 5-15%
+  range; keep BENCH_SCALE small A/Bs for anything below ~10%.
+
+## Phase 10: behavior-identical batch — A/B results (SHIPPED: items 3, 5-pre-size, 7, move-legality; REVERTED: item 2)
+
+The shipped-eligible items from the Post-Phase-9 review were implemented and
+A/B'd as a batch under the plan's established same-JVM alternating methodology
+(cold `ai_move` via `benchmarks/bench_sunfish.lua`, `BENCH_SCALE=0.01`,
+`SUNFISH_NO_YIELD=1`, 3 rounds, alternating order). All items are
+behavior-identical; the node-count invariant (27/258/755/4156/11653, `a8b6`,
+score 41) held exactly, and the full suite stayed green
+(luajit + lua5.1 + LuaJ 14/15/21 + oracle 40/40).
+
+### Shipped (verified behavior-identical)
+
+- **Item 3 — leaf filter-before-sort.** At `depth <= 0`, legal moves are
+  filtered to the `>= 150` subset (compacted in place) before the min-heap
+  sort, so the sort only sees the kept prefix — the original loop broke at the
+  first `move_val < 150`, so the searched set/order are unchanged. Also hoisted
+  the double `move_val(move)` decode.
+- **Item 5 (pre-size) — TT arrays pre-filled at load** (`ttK = -1` sentinel,
+  others 0) so the first search doesn't rehash in the timed region. The
+  sentinel can't false-match (`ttK[s] == key` with keys >= 0). Depth-preferred
+  replacement remains deferred (behavior-changing).
+- **Item 7 — micro batch.** Hoisted `2 ^ VAL_SHIFT`/`128 * 128` to
+  `VAL_SCALE`/`MOVE_MOD` (Lua 5.1 recomputed them per call); single-modulo TT
+  probe (`tp_get` returns the slot, `bound()` reuses it for the bound-check
+  instead of recomputing `key % TT_SIZE + 1` twice); per-depth `print` gated
+  behind `SUNFISH_VERBOSE`.
+- **`sunfish.move` one-move legality.** Validates one user move via
+  `genMoves` + `is_legal` on the matching `{i,j}` instead of building the whole
+  `legal_moves()` list. Removed the now-unused `ttfind`. Public-API behavior
+  unchanged (legal/illegal/garbage moves all covered by `test_sunfish`).
+
+### Reverted: item 2 (dual-hash incremental Zobrist)
+
+The dual-hash was implemented and verified correct on **every** `move()`/
+`rotate()` edit path (quiet, capture, castling, en passant, promotion; pooled
+and non-pooled; 200-position random walk all matched the full 120-pass recompute).
+The O(1) rotate (`child._bh = parent._mh`) and O(1) move deltas are sound.
+
+**But it is not behavior-identical in the real search: node counts 11651 vs
+11653.** The root cause is a **pre-existing `_b` corruption** the original
+per-call `key()` masked: `is_legal`'s en-passant in-place undo writes `-P` to
+`j + S` unconditionally, which is only correct in a true en-passant setup; on
+the search's pooled rotate/move children a spurious pawn leaks into `_b` (an
+extra `P@d7` in the dump). The original `key()` re-hashes the *current*
+(mutated) `_b`, so it was internally consistent; a cached `_bh` hashes the
+clean creation board and diverges by one piece (constant `zflat` delta
+445325827). The incremental hash is unsafe until that `is_legal` undo (and the
+make/unmake rewrite it belongs to) is fixed. Reverted to the full 120-pass
+`key()`; the invariant and node counts are exact again. This is a concrete
+instance of the plan's documented "is_legal in-place undo (highest-risk)" risk,
+and a prerequisite for any future cached-hash scheme.
+
+### A/B timing (cold `ai_move`, same-JVM, alternating, `BENCH_SCALE=0.01`)
+
+| Round | baseline | modified | delta |
+|-------|----------|----------|-------|
+| 1 (base first)  | 33.1s | 20.4s | **-38%** |
+| 2 (mod first)   | 18.6s | 17.8s | **-4%** |
+| 3 (base first)  | 24.6s | 21.2s | **-14%** |
+| 4 (fresh, base first) | 22.5s | 20.3s | **-10%** |
+
+Modified won every round regardless of order (not a cold-start artifact).
+Mean ~-16%; the batch ships. Identical move (`a8b6`) and score (41) every
+round — the delta is pure overhead removal, matching the doc's Phase-6/7/8
+discipline.
+
+### Harness additions (committed)
+
+- `benchmarks/ab_luaj.sh` — same-JVM alternating A/B runner (baseline/modified
+  dirs, rounds, cold JVM each; handles both `bench_sunfish.lua` and
+  `selfplay.lua`).
+- `benchmarks/selfplay.lua` — same-game paired self-play harness (drives
+  `ai_move` for both sides, `(pass)` handling, per-ply ms + TOTAL).
+- `benchmarks/run_selfplay_pairs.sh` — paired same-game aggregation (median
+  over N pairs).
+- `benchmarks/verify_invariant.lua` — node-count/move/score invariant
+  verifier (run with `SUNFISH_VERBOSE=1`).
+
+Self-play note: full 40-ply games under LuaJ are impractical for quick A/Bs
+(mid-game positions can run to depth 98 when they stay under the node cap,
+taking minutes per ply), so the primary timing signal here is the cold
+`ai_move` A/B — the doc's established measure for behavior-identical batches.
 
 ## Phases
 
