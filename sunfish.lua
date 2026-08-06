@@ -27,6 +27,12 @@ local YIELD_ENABLED = true
 -- enables it for debugging, otherwise search runs silent.
 local VERBOSE = os.getenv("SUNFISH_VERBOSE") == "1"
 
+-- E instrumentation: attacked() caller-class counters, active only when
+-- SUNFISH_PROFILE_ATTACKED=1 (zero cost otherwise). Drives the plan's
+-- decision on pin/check-aware legality; see benchmarks/profile_attacked.lua.
+local PROF_ATTACKED = os.getenv("SUNFISH_PROFILE_ATTACKED") == "1"
+local acnt_probe, acnt_king, acnt_touch, acnt_ep, acnt_castle = 0, 0, 0, 0, 0
+
 local A1, H1, A8, H8 = 92, 99, 22, 29
 local initial = '         \n' .. --   0 -  9
         '         \n' .. --  10 - 19
@@ -666,7 +672,16 @@ end
 -- Is square `i` attacked by any opponent (lowercase) piece?
 -- `i` is 0-indexed as in genMoves. Works on the integer array `_b`.
 -- `b` is the board array; if nil it is fetched lazily (used by public paths).
-function Position:attacked(i, b)
+-- `ptag` (E instrumentation) is the caller-class tag counted when
+-- SUNFISH_PROFILE_ATTACKED=1: "probe"/"king"/"touch"/"ep"/"castle".
+function Position:attacked(i, b, ptag)
+    if PROF_ATTACKED then
+        if ptag == "probe" then acnt_probe = acnt_probe + 1
+        elseif ptag == "king" then acnt_king = acnt_king + 1
+        elseif ptag == "touch" then acnt_touch = acnt_touch + 1
+        elseif ptag == "ep" then acnt_ep = acnt_ep + 1
+        elseif ptag == "castle" then acnt_castle = acnt_castle + 1 end
+    end
     b = b or self:ensure_arr()
 
     -- King attacks (opponent kings)
@@ -794,7 +809,7 @@ function Position:king_sensitive(king, b)
         end
     end
     -- If the king is currently attacked, fall back to no short-circuit.
-    if self:attacked(king, b) then return nil end
+    if self:attacked(king, b, "probe") then return nil end
     return sens_tmp, g
 end
 
@@ -852,7 +867,7 @@ function Position:is_legal(move, king, sens, b, sens_g)
             b[j + S] = EMPTY
             ep_undo = true
         end
-        local legal = not self:attacked(king, b)
+        local legal = not self:attacked(king, b, ep_undo and "ep" or "touch")
         -- undo
         b[i] = p
         b[j] = q
@@ -874,10 +889,10 @@ function Position:is_legal(move, king, sens, b, sens_g)
         b[between] = K
         b[j] = R
         local legal
-        if self:attacked(between, b) then
+        if self:attacked(between, b, "castle") then
             legal = false
         else
-            legal = not self:attacked(j, b)
+            legal = not self:attacked(j, b, "castle")
         end
         -- undo
         b[i] = K
@@ -888,7 +903,7 @@ function Position:is_legal(move, king, sens, b, sens_g)
 
     b[i] = EMPTY
     b[j] = K
-    local legal = not self:attacked(j, b)
+    local legal = not self:attacked(j, b, "king")
     b[i] = K
     b[j] = q
     return legal
@@ -1498,6 +1513,7 @@ local function search(pos, maxn)
     nodes = 0
     budget_exhausted = false
     tt_probe, tt_hit, tt_slot_hit = 0, 0, 0
+    acnt_probe, acnt_king, acnt_touch, acnt_ep, acnt_castle = 0, 0, 0, 0, 0
     if TIME_BUDGET > 0 then
         time_deadline = os.clock() + TIME_BUDGET
     end
@@ -1658,6 +1674,13 @@ end
 -- F2 measurement: TT probe/hit/occupancy stats from the last search.
 function sunfish.tt_stats()
     return { probe = tt_probe, hit = tt_hit, slot_hit = tt_slot_hit }
+end
+
+-- E measurement: attacked() caller-class counts from the last search
+-- (only populated when SUNFISH_PROFILE_ATTACKED=1).
+function sunfish.attacked_stats()
+    return { probe = acnt_probe, king = acnt_king, touch = acnt_touch,
+             ep = acnt_ep, castle = acnt_castle }
 end
 
 local game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)

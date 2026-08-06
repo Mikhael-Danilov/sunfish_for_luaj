@@ -42,6 +42,11 @@
   and `search()` now validates the root move before returning it. All caught
   by the new stockfish-validated selfplay correctness gate. See "Correctness
   gate" below.
+- [x] E instrumentation (`sunfish.attacked_stats`, `SUNFISH_PROFILE_ATTACKED=1`
+  caller-class counters): **committed** — previously referenced by the profile
+  harness but absent from the engine (harness crashed on a nil value).
+  Re-measured post-F1/F3: ~85% sensitive-touch stands, decision for
+  pin/check-aware legality confirmed. See the E section.
 
 > **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
 > `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
@@ -1006,9 +1011,31 @@ search (deterministic: 128,574 total both runs):
 rule points to **pin/check-aware legality** (it eliminates the mutate/undo
 `attacked()` for that class). The rewrite is the highest-risk remaining change
 (the x-ray/ep/castling edges force slow paths, per the Phase-6 item-1
-analysis); it remains DEFERRED as its own gated phase, not this batch. The
-instrumentation (`sunfish.attacked_stats`) stays in the engine for the
-re-measurement when the rewrite is attempted.
+analysis); it remains DEFERRED as its own gated phase, not this batch.
+
+**Instrumentation now committed**: the debug-only counters
+(`SUNFISH_PROFILE_ATTACKED=1`, zero cost when off) and the
+`sunfish.attacked_stats()` accessor are now in the engine (they were previously
+only referenced by `benchmarks/profile_attacked.lua` — running the harness
+crashed with "attempt to call a nil value"). `attacked()` takes an optional
+caller-class tag ("probe"/"king"/"touch"/"ep"/"castle"); the en-passant class is
+disambiguated from the shared sensitive-touch call via the `ep_undo` flag, and
+castling counts both `attacked()` calls in its branch. Re-measured on the
+current engine (post-F1/F3, `SUNFISH_PROFILE_ATTACKED=1 SUNFISH_NO_YIELD=1`,
+cold start-position search, 84,055 total, identical under luajit and LuaJ):
+
+| Caller class | Count | Share |
+|---|---|---|
+| `king_sensitive` probe | 9,390 | 11.2% |
+| king-move destination | 3,540 | 4.2% |
+| **sensitive-touch (non-king move past short-circuit)** | **71,091** | **84.6%** |
+| en-passant | 0 | 0.0% |
+| castling | 34 | ~0% |
+
+The proportions are unchanged from the original measurement (~85%
+sensitive-touch), so the decision stands. The absolute counts dropped (128,574 →
+84,055) because the search now stops at ~10k nodes (F1) instead of 15.8k and
+aspiration (F3) cuts the explored tree.
 
 ### F1 — budget-aware stop + `sunfish.set_time_budget`: SHIPPED
 
@@ -1086,12 +1113,17 @@ new sequence when the next behavior-identical batch needs the guard.
 
 ### Remaining open items (for a future phase)
 
-- **Pin/check-aware legality** (E's decision): the 85% sensitive-touch
-  `attacked()` class. Highest remaining structural win; own gated phase.
+- **Pin/check-aware legality** (E's decision): the ~85% sensitive-touch
+  `attacked()` class. Highest remaining structural win; own gated phase. The E
+  instrumentation is committed and re-verified — the decision stands.
 - **Make/unmake rewrite**: still the alternative if E's profile changes.
 - **F2 depth-preferred + TT_SIZE bump**: revisit only if node budgets rise
   enough to approach TT saturation.
 - **LMR**: stays parked until E lands (per the Phase-6 rejection).
+- **`verify_invariant.lua`**: still asserts the pre-F1/F3 sequence
+  (27/197/411/1818/4036/15803) and reports "INVARIANT BROKEN"; update to the
+  F1/F3 sequence (27/153/287/1498/3030/10026) when the next
+  behavior-identical batch needs the guard.
 
 
 ## Phases
