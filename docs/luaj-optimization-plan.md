@@ -47,6 +47,14 @@
   harness but absent from the engine (harness crashed on a nil value).
   Re-measured post-F1/F3: ~85% sensitive-touch stands, decision for
   pin/check-aware legality confirmed. See the E section.
+- [x] Pin/check-aware legality (the E decision): **SHIPPED** —
+  `compute_check_pins` + `on_ray` replace `king_sensitive`; `is_legal` is
+  branch logic (2-checker/1-checker/0-checker + pin rule) with the
+  mutate/undo `attacked()` slow path retained only for king moves, en-passant,
+  and castling. `attacked()` calls per search cut 84,055 → 3,578 (~96%);
+  ~16% CPU-time win (mean). All gates green (suites + oracle + perft +
+  stockfish selfplay). Two perft-caught bugs fixed (block-beyond-checker,
+  ep-capture-of-checker). See the pin/check section below.
 
 > **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
 > `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
@@ -1111,15 +1119,68 @@ pre-phase baseline. `verify_invariant.lua` still asserts the OLD
 design (node counts legitimately changed); the verifier should be updated to the
 new sequence when the next behavior-identical batch needs the guard.
 
+### Pin/check-aware legality: SHIPPED (the E decision, now implemented)
+
+The E instrumentation's decision (sensitive-touch `attacked()` at ~85%) was
+acted on: `is_legal` no longer mutate/undo-tests most moves. Replaces
+`king_sensitive` with `compute_check_pins` — one 8-ray walk + fixed-attacker
+probes per node that returns the checker squares (`chk[1..2]`, with the
+between-squares for a slider checker), the pinned pieces (`pin[sq]` generation-
+tagged) and their pin directions (`pdir[sq]`), and the checker count. A new
+`on_ray[a*121+b] = di` precompute (built once from `ray_squares`) makes the
+pin/block test a single table read.
+
+`is_legal` now decides most non-king moves without touching the board:
+- **2+ checkers** → only king moves (non-king moves can't capture/block two).
+- **1 checker** → capture the checker (directly or via en-passant when the
+  captured pawn is the checker) or block the between-square (slider checker).
+- **0 checkers** → legal unless the moving piece is pinned and the move leaves
+  its pin ray (stays on the pin line via `on_ray[king*121+j] == pdir[i]`).
+- **King moves, en-passant, castling** keep the mutate/undo `attacked()` slow
+  path (x-ray-correct attack test after a real board change).
+
+Two correctness bugs found and fixed during implementation (both caught by
+perft, not by the unit suites):
+1. **Block-beyond-checker**: the initial block test (`on_ray[chk1*121+j] ~= 0
+   and on_ray[king*121+j] == on_ray[king*121+chk1]`) wrongly accepted squares
+   BEYOND the checker (e.g. d3/e4 when a bishop on c2 checks a king on b1).
+   Fixed to require j strictly between: `on_ray[king*121+j] == kc and
+   on_ray[j*121+chk1] == kc` (the checker continues on the same ray from j).
+2. **En-passant capture of a checking pawn**: when a pawn double-pushes and
+   gives check, the ep capture of that pawn (`j+S == chk1`) is the legal
+   reply, but the 1-checker branch only handled `j == chk1`. Added the
+   `is_ep and j+S == chk1` case (subject to the same pin-line rule).
+
+**Validation** (all green): luajit + lua5.1 + LuaJ suites (14+15+21), oracle
+40/40, perft 21/21, and the stockfish-validated selfplay gate (20 plies, all
+legal, natural checkmate). The start-position node invariant is unchanged:
+27/153/287/1498/3030/10026, `b8c6`, score 0.
+
+**E re-measurement** (the payoff): `attacked()` calls per search dropped from
+**84,055 → 3,578 (~96% reduction)**. The sensitive-touch class (84.6% of the
+old total) is **eliminated** — remaining calls are exactly the intended slow
+paths: king-move 3,540 (98.9%), castling 34, en-passant 4.
+
+**CPU-time A/B** (cold `ai_move`, `/usr/bin/time` `User time`, 3 runs):
+baseline 8.50/8.92/9.88 (mean ~9.10) vs rewrite 6.48/8.92/7.58 (mean ~7.66) —
+**~16% faster** (run 2 is load-noise; the qualitative win is confirmed by the
+96% `attacked()` cut). Node counts legitimately could change but the start
+position's search is identical.
+
+The `king_sensitive` function, `sens_tmp`/`sens_gen`, and the `sens` parameter
+threading are all removed. The E instrumentation stays for future profiling.
+
 ### Remaining open items (for a future phase)
 
-- **Pin/check-aware legality** (E's decision): the ~85% sensitive-touch
-  `attacked()` class. Highest remaining structural win; own gated phase. The E
-  instrumentation is committed and re-verified — the decision stands.
-- **Make/unmake rewrite**: still the alternative if E's profile changes.
+- **Make/unmake rewrite**: the pin/check rewrite removed the dominant
+  `attacked()` cost, so make/unmake is now lower value; revisit only if a
+  future profile shows the remaining king-move/castling `attacked()` calls
+  matter.
 - **F2 depth-preferred + TT_SIZE bump**: revisit only if node budgets rise
   enough to approach TT saturation.
-- **LMR**: stays parked until E lands (per the Phase-6 rejection).
+- **LMR**: stays parked (the Phase-6 rejection reason — extra depth costing
+  more than node savings — is unchanged; the per-node cost is now lower, so a
+  re-A/B is reasonable at some point).
 - **`verify_invariant.lua`**: still asserts the pre-F1/F3 sequence
   (27/197/411/1818/4036/15803) and reports "INVARIANT BROKEN"; update to the
   F1/F3 sequence (27/153/287/1498/3030/10026) when the next

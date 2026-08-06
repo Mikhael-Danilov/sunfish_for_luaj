@@ -310,6 +310,27 @@ local slider_dirs_by_piece = {
     [Q] = { 1, 2, 3, 4, 5, 6, 7, 8 }
 }
 
+-- on_ray[a*121 + b] = di when square b lies on a direction-di ray from square a
+-- (a,b are 1-based squares), else 0. Built once from ray_squares so a pin/check
+-- test is a single table read: a piece is pinned to the king iff on_ray[king*121+sq]
+-- is nonzero and the enemy slider is beyond it on that same ray. Used by
+-- compute_check_pins and the pin-aware is_legal.
+local on_ray = {}
+for a = 1, 120 do
+    local base = a * 121
+    local rs = ray_squares[a]
+    if rs then
+        for di = 1, 8 do
+            local ray = rs[di]
+            for c = 1, #ray do
+                local sq = ray[c]
+                if sq == 0 then break end
+                on_ray[base + sq] = di
+            end
+        end
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Transposition-table key (integer, cached per Position)
 --
@@ -782,45 +803,107 @@ function Position:eking_index()
     return k
 end
 
--- Squares that could affect the safety of the king at `king`: the 8 adjacent
--- squares plus all squares along the 8 rays from the king up to (and including)
--- the first occupied square. A non-king move only changes the king's attack
--- status if it touches one of these squares (or is en passant).
--- Returns `sens` (a generation-tagged table, truthy) and `gen` (the generation),
--- or nil if the king is currently attacked (no short-circuit is safe). Instead
--- of clearing the reusable table every call, we bump a generation counter and
--- store it per square; `is_legal` checks `sens[sq] == gen`.
-local sens_tmp = {}
-local sens_gen = 0
-function Position:king_sensitive(king, b)
-    b = b or self:ensure_arr()
-    sens_gen = sens_gen + 1
-    local g = sens_gen
-    -- Adjacent squares.
+-- Pin/check detection (replaces king_sensitive): computes, for the side to
+-- move's king at `king`, the checks and pins in one 8-ray walk plus the
+-- fixed-attacker probes (enemy king/knights/pawns). Returns:
+--   nch            : number of checkers (0, 1, or 2+)
+--   chk[1..2]      : the checker squares (only the first two are stored; a
+--                    position with 2+ checkers only allows king moves anyway)
+--   n_pinned       : number of pinned own pieces
+--   pin[sq]        : truthy (== generation) when square `sq` is pinned
+--   pin_dir[sq]    : the ray direction (di) along which `sq` is pinned
+--   pg             : the generation tag for pin/pin_dir
+-- The pinned direction is recovered from on_ray[king*121 + sq] when needed, so
+-- pin_dir is only filled for the pinned pieces (cheap).
+local chk_tmp, pin_tmp, pdir_tmp = {}, {}, {}
+local pin_gen = 0
+local function compute_check_pins(b, king)
+    pin_gen = pin_gen + 1
+    local g = pin_gen
+    local nch, npin = 0, 0
+    local c0, c1 = 0, 0
+
+    -- Fixed attackers: enemy king, knights, pawns (mirror of attacked()).
     local kg = king_targets[king]
-    for c = 1, #kg do sens_tmp[kg[c]] = g end
-    -- Rays from the king.
-    for di = 1, 8 do
-        local ray = ray_squares[king][di]
-        for c = 1, #ray do
-            local sq = ray[c]
-            sens_tmp[sq] = g
-            if b[sq] ~= EMPTY then break end -- stop at first piece
+    for c = 1, #kg do
+        if b[kg[c]] == -K then
+            nch = nch + 1; if c0 == 0 then c0 = kg[c] elseif c1 == 0 then c1 = kg[c] end
         end
     end
-    -- If the king is currently attacked, fall back to no short-circuit.
-    if self:attacked(king, b, "probe") then return nil end
-    return sens_tmp, g
+    local kt = knight_targets[king]
+    for c = 1, #kt do
+        if b[kt[c]] == -KN then
+            nch = nch + 1; if c0 == 0 then c0 = kt[c] elseif c1 == 0 then c1 = kt[c] end
+        end
+    end
+    local pc = pawn_caps[king]
+    for c = 1, #pc do
+        if b[pc[c]] == -P then
+            nch = nch + 1; if c0 == 0 then c0 = pc[c] elseif c1 == 0 then c1 = pc[c] end
+        end
+    end
+
+    -- Slider checkers + pins: walk the 8 rays.
+    for di = 1, 8 do
+        local ray = ray_squares[king][di]
+        local first, second = 0, 0
+        local c = 1
+        while true do
+            local sq = ray[c]
+            if sq == 0 then break end
+            local v = b[sq]
+            if v ~= EMPTY then
+                if first == 0 then first = sq
+                elseif second == 0 then second = sq
+                else break end
+            end
+            c = c + 1
+        end
+        if first ~= 0 then
+            local fv = b[first]
+            if fv < 0 then
+                -- Enemy slider attacking along this ray (rook on di 1..4,
+                -- bishop on di 5..8, queen either) = checker.
+                local atk = fv == -R and (di <= 4) or fv == -B and (di >= 5) or fv == -Q
+                if atk then
+                    nch = nch + 1
+                    if c0 == 0 then c0 = first elseif c1 == 0 then c1 = first end
+                end
+            elseif fv >= P and fv <= K and second ~= 0 then
+                -- Own piece first, enemy slider second = pinned.
+                local sv = b[second]
+                if sv < 0 then
+                    local atk = sv == -R and (di <= 4) or sv == -B and (di >= 5) or sv == -Q
+                    if atk then
+                        npin = npin + 1
+                        pin_tmp[first] = g
+                        pdir_tmp[first] = di
+                    end
+                end
+            end
+        end
+    end
+
+    chk_tmp[1], chk_tmp[2] = c0, c1
+    return nch, chk_tmp, npin, pin_tmp, pdir_tmp, g
 end
 
--- Is the given pseudo-legal move legal? Applies the move in place on the
--- integer array, tests the own king, then undoes it.
--- `king` (optional) is the precomputed index of the own king.
--- `sens` (optional) is the king-sensitive square table from king_sensitive(),
--- `sens_g` its generation tag, or nil. When sens ~= nil and the move does not
--- touch a sensitive square, the king's safety is unchanged, so we can skip the
--- attacked() re-check.
-function Position:is_legal(move, king, sens, b, sens_g)
+-- Is the given pseudo-legal move legal? Uses the pin/check detection computed
+-- once per position (see compute_check_pins) to decide most moves without any
+-- board mutation:
+--   - 2+ checkers -> only king moves are legal.
+--   - 1 checker  -> a non-king move is legal iff it captures the checker or
+--                   blocks the between-square (for a slider checker). A pinned
+--                   piece may still capture the checker if the checker lies
+--                   along the pin ray (capture along the pin line).
+--   - 0 checkers -> every non-king move is legal unless the moving piece is
+--                   pinned and the move leaves its pin ray.
+-- King moves, en-passant, and castling keep the mutate/undo attacked() slow
+-- path (they need the x-ray-correct attack test after a real board change).
+-- `king` (optional) is the index of the own king; `nch`, `chk`, `pin`, `pdir`,
+-- `pg` are the compute_check_pins result (see above). When they are nil the
+-- full mutate/undo slow path is used (public API), which is always correct.
+function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
     local i, j = move_from(move), move_to(move)
     b = b or self:ensure_arr()
     local p = b[i]
@@ -839,74 +922,114 @@ function Position:is_legal(move, king, sens, b, sens_g)
         king = self:king_index()
     end
 
-    if p ~= K then
-        -- Non-king move: the king stays at `king`.
-        -- A diagonal pawn move to an empty square is an en-passant candidate
-        -- (captures the enemy pawn behind the destination, j+S). Computed once
-        -- and reused by the short-circuit and the capture below.
-        local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
-        if sens then
-            -- Short-circuit: if this move doesn't touch a sensitive square and
-            -- isn't en passant, the king's safety is unchanged. `sens` being
-            -- non-nil means the king is currently NOT attacked, so the move is
-            -- legal.
-            if i ~= king and sens[i] ~= sens_g and sens[j] ~= sens_g then
-                -- A genuine en passant requires the enemy pawn behind the
-                -- destination (j+S); a stale `ep` (e.g. from a null-move rotate
-                -- that mirrored a target) must not be treated as a capture.
-                if not is_ep or (b[j + S] == -P and sens[j + S] ~= sens_g) then
-                    return true
-                end
+    -- King move: destination (and castling intermediate square) must not be
+    -- attacked. This is the x-ray-correct slow path — a king may not step into
+    -- a square attacked by a slider even if a piece currently shields it.
+    if p == K then
+        if math_abs(j - i) == 2 then
+            -- Castling. Replicate the original construction exactly: i emptied,
+            -- between holds the KING, j holds the ROOK (the original put K at j
+            -- then overwrote j with R), and the rook's origin square is left
+            -- untouched. Attack-tests between and j.
+            local between = j < i and i - 1 or i + 1
+            b[i] = EMPTY
+            b[between] = K
+            b[j] = R
+            local legal
+            if self:attacked(between, b, "castle") then
+                legal = false
+            else
+                legal = not self:attacked(j, b, "castle")
             end
+            -- undo
+            b[i] = K
+            b[between] = EMPTY
+            b[j] = q
+            return legal
         end
+        b[i] = EMPTY
+        b[j] = K
+        local legal = not self:attacked(j, b, "king")
+        b[i] = K
+        b[j] = q
+        return legal
+    end
+
+    -- Non-king move. The fast path needs the precomputed checks/pins; without
+    -- them, fall back to the mutate/undo attacked() test (always correct).
+    if not nch then
         b[i] = EMPTY
         b[j] = p
-        local ep_undo = false
-        if is_ep and b[j + S] == -P then
-            -- en passant: capture the pawn behind the destination
-            b[j + S] = EMPTY
-            ep_undo = true
-        end
-        local legal = not self:attacked(king, b, ep_undo and "ep" or "touch")
-        -- undo
+        local legal = not self:attacked(king, b, "touch")
         b[i] = p
         b[j] = q
-        if ep_undo then
-            b[j + S] = -P
-        end
         return legal
     end
 
-    -- King move: destination (and castling intermediate square) must not be
-    -- attacked.
-    if math_abs(j - i) == 2 then
-        -- Castling. Replicate the original construction exactly: i emptied,
-        -- between holds the KING, j holds the ROOK (the original put K at j
-        -- then overwrote j with R), and the rook's origin square is left
-        -- untouched. Attack-tests between and j.
-        local between = j < i and i - 1 or i + 1
-        b[i] = EMPTY
-        b[between] = K
-        b[j] = R
-        local legal
-        if self:attacked(between, b, "castle") then
-            legal = false
+    if nch == 0 then
+        -- No checkers: legal unless the piece is pinned and leaves its pin ray.
+        if pin[i] == pg then
+            -- Pinned: the destination must stay on the pin line (capture along
+            -- the pin ray or a move along it). Moving along the pin direction
+            -- toward/away from the king keeps the shield; off-line is illegal.
+            local di = pdir[i]
+            if on_ray[king * 121 + j] ~= di then
+                return false
+            end
+        end
+        -- En-passant: removing the captured pawn can expose a pin/check. The
+        -- ep square j is on the pin line only for the rare horizontal case; the
+        -- diagonal ep removes a pawn that could be the pinning slider. Run the
+        -- mutate/undo slow path for correctness.
+        local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
+        if is_ep then
+            b[i] = EMPTY
+            b[j] = p
+            local ep_undo = false
+            if b[j + S] == -P then
+                b[j + S] = EMPTY
+                ep_undo = true
+            end
+            local legal = not self:attacked(king, b, "ep")
+            b[i] = p
+            b[j] = q
+            if ep_undo then b[j + S] = -P end
+            return legal
+        end
+        return true
+    end
+
+    -- 1 checker: capture the checker or block the between-square.
+    local chk1 = chk[1]
+    local cv = b[chk1]
+    local ok = false
+    -- A pawn may capture the checker en passant: the destination j is not the
+    -- checker square, but the captured pawn (at j+S) is. This is how a pawn
+    -- resolves a check from a just-double-pushed pawn.
+    local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY and (j + S) == chk1
+    if j == chk1 or is_ep then
+        -- Capturing the checker (directly, or via ep). If the moving piece is
+        -- pinned, the capture is only legal when the checker lies on the pin
+        -- ray (capture along the pin line keeps the shield). Otherwise any
+        -- capture of the checker is legal.
+        if pin[i] == pg then
+            if on_ray[king * 121 + chk1] == pdir[i] then
+                ok = true
+            end
         else
-            legal = not self:attacked(j, b, "castle")
+            ok = true
         end
-        -- undo
-        b[i] = K
-        b[between] = EMPTY
-        b[j] = q
-        return legal
+    elseif cv == -R or cv == -B or cv == -Q then
+        -- Slider checker: block the between-square. j must lie STRICTLY between
+        -- the king and the checker on the checker's ray: j on the king's ray in
+        -- the checker's direction, and the checker continuing on the same ray
+        -- from j (this excludes squares beyond the checker).
+        local kc = on_ray[king * 121 + chk1]
+        if on_ray[king * 121 + j] == kc and on_ray[j * 121 + chk1] == kc then
+            ok = true
+        end
     end
-
-    b[i] = EMPTY
-    b[j] = K
-    local legal = not self:attacked(j, b, "king")
-    b[i] = K
-    b[j] = q
-    return legal
+    return ok
 end
 
 -- All legal moves (filtered from pseudo-legal genMoves).
@@ -917,9 +1040,10 @@ function Position:legal_moves()
     local n = 0
     local king = self:king_index()
     local b = self._b
+    local nch, chk, npin, pin, pdir, pg = compute_check_pins(b, king)
     for k = 1, pe do
         local m = pseudo[k]
-        if self:is_legal(m, king, nil, b) then
+        if self:is_legal(m, king, nch, chk, pin, pdir, pg, b) then
             n = n + 1
             legal[n] = m
         end
@@ -1270,7 +1394,6 @@ local time_deadline = 0
 -- per-node hot path (~10 dispatches per node).
 local m_genMoves = Position.genMoves
 local m_king_index = Position.king_index
-local m_king_sensitive = Position.king_sensitive
 local m_is_legal = Position.is_legal
 local m_in_check = Position.in_check
 local m_key = Position.key
@@ -1417,10 +1540,10 @@ local function bound(pos, gamma, depth, maxn)
     local nlegal = 0
     local king = m_king_index(pos)
     local b = pos._b
-    local sens, sens_g = m_king_sensitive(pos, king, b)
+    local nch, chk, npin, pin, pdir, pg = compute_check_pins(b, king)
     for k = 1, pe do
         local move = buf[k]
-        if m_is_legal(pos, move, king, sens, b, sens_g) then
+        if m_is_legal(pos, move, king, nch, chk, pin, pdir, pg, b) then
             nlegal = nlegal + 1
             buf[nlegal] = move
         end
@@ -1593,18 +1716,19 @@ local function search(pos, maxn)
     -- by a deeper search), and a full-key collision would make it illegal here.
     -- The correctness gate (selfplay, stockfish-validated) caught exactly this:
     -- an illegal h1e1 was returned. Fall back to nil (engine passes) if the
-    -- move isn't legal. Use the full check (sens=nil) so no short-circuit can
-    -- mask an illegal move; ensure_arr() materializes _b for public positions.
+    -- move isn't legal. ensure_arr() materializes _b for public positions.
     local root_b = pos:ensure_arr()
+    local rk = m_king_index(pos)
+    local rnch, rchk, rnpin, rpin, rpdir, rpg = compute_check_pins(root_b, rk)
     if rootmove ~= nil then
-        if m_is_legal(pos, rootmove, m_king_index(pos), nil, root_b, nil) then
+        if m_is_legal(pos, rootmove, rk, rnch, rchk, rpin, rpdir, rpg, root_b) then
             return rootmove, score
         end
         rootmove = nil
     end
     local _, _, ttmove = tp_get(m_key(pos))
     if ttmove ~= nil then
-        if m_is_legal(pos, ttmove, m_king_index(pos), nil, root_b, nil) then
+        if m_is_legal(pos, ttmove, rk, rnch, rchk, rpin, rpdir, rpg, root_b) then
             return ttmove, score
         end
     end
@@ -1724,11 +1848,11 @@ function sunfish.move(game, mv)
     local pe = game:genMoves(pseudo, 1)
     local b = game:ensure_arr()
     local king = game:king_index()
-    local sens, sens_g = game:king_sensitive(king, b)
+    local nch, chk, npin, pin, pdir, pg = compute_check_pins(b, king)
     for k = 1, pe do
         local m = pseudo[k]
         if move_from(m) == move[1] and move_to(m) == move[2] then
-            if game:is_legal(m, king, sens, b, sens_g) then
+            if game:is_legal(m, king, nch, chk, pin, pdir, pg, b) then
                 local ng = game:move(move)
                 ng:ensure_board()
                 return ng
