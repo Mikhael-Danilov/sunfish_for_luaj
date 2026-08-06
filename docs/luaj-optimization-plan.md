@@ -355,9 +355,42 @@ Mean ~-19% excluding the outlier; consistently negative with identical move
 selection. This is the largest single win since the Phase-6 method hoisting.
 Tests green on luajit/lua5.1/LuaJ (14+15+21) + oracle 40/40.
 
-The full make/unmake rewrite (also pooling the per-node move lists) remains the
-known next step for the remaining allocation, but the list-pooling attempts were
-already reverted as net-slower under LuaJ (see "tried and reverted" above).
+### Reviewed and shipped: pooled move buffers + count-driven sort
+
+The remaining per-node allocation was the two move-list tables (`genMoves`'
+pseudo list + `bound`'s filter list, ~0.93/node each). The earlier "scratch-
+pooled move lists" attempt was reverted because it relied on `#` (LuaJ's
+`rawlen` is a binary search over the array part) + a stale-tail clear, whose
+bookkeeping added more Java calls than the saved allocations. The re-test
+avoids both:
+
+- `genMoves(out, start)` writes packed moves into a caller-provided array and
+  returns the end index (public `legal_moves` still passes a fresh table).
+- `bound()` uses a **per-ply `move_stack`** (indexed by recursion depth), so
+  each frame has its own buffer — a single shared buffer is *not* safe because
+  the recursion overwrites it while the outer frame still iterates its sorted
+  moves (measured live: shared buffer exploded the search to 97k nodes with a
+  wrong move before the per-ply fix).
+- Filtering compacts in place (`nlegal <= k`, so compaction never overwrites an
+  unread entry); the explicit count makes `#` and tail-clearing unnecessary.
+- A count-driven **min-heap `move_sort`** replaces `table.sort` + the Lua
+  comparator on the search path (max-heap + extract-to-end would produce
+  ascending; the min-heap yields descending = best-first). Verified byte-
+  identical ordering to the old `sorter` on randomized inputs.
+
+Search output is byte-identical to baseline (11,649 nodes, `b8c6`, sc=41).
+Same-JVM LuaJ A/B (start position, identical move/score every round):
+
+| Round | baseline | pooled-moves | delta |
+|-------|----------|--------------|-------|
+| 1 | 23.0s | 11.3s | **-51.0%** |
+| 2 | 16.5s | 11.9s | **-27.6%** |
+| 3 | 14.5s | 11.5s | **-20.9%** |
+
+Mean ~-33%. This is the largest win of any Phase-6/7 item and directly
+contradicts the old reversion: eliminating the list tables AND the Java-side
+`table.sort` heap dwarfs the `LuaInteger` per-entry churn. Tests green on
+luajit/lua5.1/LuaJ (14+15+21) + oracle 40/40.
 
 ### Reviewed and shipped: yield countdown (item 07)
 
@@ -395,17 +428,19 @@ needs its own A/B against the same position. Deferred.
 | 5 | Hot-path call elimination (board threading, cached king, single-pass move, generation-tagged sens, flat Zobrist, TT-before-movegen) | 1.15-1.3x | Med (signature churn, in-place mutation invariants) | **DONE** |
 | 6 | Phase-6 review: method hoisting, 64-square genMoves, value micro-hoists, king propagation, parallel-array TT | 1.3-2.0x cumulative on top of Phase 5 | Low-Med | **DONE** |
 | 7 | Board/Position pooling (search children reuse a bounded free list) | 1.2-1.5x on top of Phase 6 | Med (LIFO lifetime invariant) | **DONE** |
+| 8 | Pooled move buffers + count-driven min-heap sort (per-ply move_stack, genMoves(out,start), no `#`/table.sort) | 1.2-1.5x on top of Phase 7 | Med (per-ply buffer invariant) | **DONE** |
 
 Cumulative target: **~21s -> 3-5s** per `ai_move` under LuaJ.
 Current: **~15.9s (Phase 1) -> ~14.2s (Phases 2-4) -> ~12.5s (Phase 5) -> ~8-11s
-(Phase 6) -> ~10-11s (Phase 7 pooling)**. The move-gen and lifecycle paths are
-2-3.4x faster; `ai_move` (search) gained ~27% cumulative through Phase 5, a
-further ~30-55% from the Phase-6 method hoisting + 64-square + value-hoist +
-king-propagation + parallel-TT batch, and ~14-37% (mean ~19%) from Phase-7
-board/Position pooling (same-JVM A/B, identical move selection every round).
-The remaining search time is dominated by `is_legal`'s `attacked()` walks and
-per-node `move()` array construction; the full make/unmake rewrite is the known
-next step but carries the documented recursion-corruption risk.
+(Phase 6) -> ~10-11s (Phase 7) -> ~11s (Phase 8 pooled-moves)**. The move-gen
+and lifecycle paths are 2-3.4x faster; `ai_move` (search) gained ~27% cumulative
+through Phase 5, a further ~30-55% from the Phase-6 method hoisting + 64-square
++ value-hoist + king-propagation + parallel-TT batch, ~14-37% (mean ~19%) from
+Phase-7 board/Position pooling, and ~21-51% (mean ~33%) from Phase-8 pooled
+move buffers + count-driven sort (same-JVM A/B, identical move selection every
+round). The remaining search time is dominated by `is_legal`'s `attacked()`
+walks; the full make/unmake rewrite is the known next step but carries the
+documented recursion-corruption risk.
 
 ## Validation per phase
 

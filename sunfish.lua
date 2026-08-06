@@ -4,7 +4,6 @@
 -- Localize global functions for massive performance gains in Luaj interpreter mode
 local math_floor = math.floor
 local math_abs = math.abs
-local table_sort = table.sort
 local string_sub = string.sub
 local string_byte = string.byte
 local string_format = string.format
@@ -61,7 +60,6 @@ local initial = '         \n' .. --   0 -  9
 -- direction constant N=-10 used throughout the engine.
 local EMPTY, P, KN, B, R, Q, K = 0, 1, 2, 3, 4, 5, 6
 local NL, SP = 98, 99
-local OUT_OR_BAD = { [98]=true, [99]=true }
 
 -- Packed move encoding. A move is a single integer instead of a {i, j, val}
 -- table: value semantics (no aliasing), and genMoves allocates one number per
@@ -288,9 +286,6 @@ local slider_dirs_by_piece = {
     [B] = { 5, 6, 7, 8 },
     [Q] = { 1, 2, 3, 4, 5, 6, 7, 8 }
 }
--- attack-direction map for attacked(): direction index -> piece codes that attack along it
-local rook_dirs = { 1, 2, 3, 4 }
-local bishop_dirs = { 5, 6, 7, 8 }
 
 -------------------------------------------------------------------------------
 -- Transposition-table key (integer, cached per Position)
@@ -489,9 +484,9 @@ function Position:ensure_board()
     return self.board
 end
 
-function Position:genMoves()
-    local moves = {}
-    local move_idx = 1
+function Position:genMoves(out, start)
+    local moves = out or {}
+    local move_idx = start or 1
     local b = self:ensure_arr()
     local wc1, wc2 = self.wc[1], self.wc[2]
     local ep, kp = self.ep, self.kp
@@ -578,7 +573,7 @@ function Position:genMoves()
             end
         end
     end
-    return moves
+    return move_idx - 1 -- end index (count of moves written into `out`)
 end
 
 -------------------------------------------------------------------------------
@@ -805,12 +800,13 @@ end
 
 -- All legal moves (filtered from pseudo-legal genMoves).
 function Position:legal_moves()
-    local pseudo = self:genMoves()
+    local pseudo = {}
+    local pe = self:genMoves(pseudo, 1)
     local legal = {}
     local n = 0
     local king = self:king_index()
     local b = self._b
-    for k = 1, #pseudo do
+    for k = 1, pe do
         local m = pseudo[k]
         if self:is_legal(m, king, nil, b) then
             n = n + 1
@@ -1084,14 +1080,32 @@ local m_rotate = Position.rotate
 local m_value = Position.value
 local m_move = Position.move
 
--- Hoisted sorter (created once, not per bound() call). Moves are packed
--- integers: sort value in the high bits, i and j in the low bits. Same
--- ordering as before (value desc, then i desc, then j asc).
-local function sorter(a, b)
+-------------------------------------------------------------------------------
+-- Pooled move buffer + count-driven sort (search hot path)
+--
+-- genMoves writes packed moves into a caller-provided array and returns the
+-- end index; bound() filters/sorts in place on a module-level reusable buffer.
+-- No `#` (LuaJ's rawlen is a binary search), no table.sort null-scan, no tail
+-- clear -- the explicit count says exactly how many entries are live. Entries
+-- beyond the count are stale but never read. This removes the per-node list
+-- table allocation that the earlier scratch-pooling attempt could not (it
+-- relied on `#`, whose bookkeeping overhead made it slower).
+--
+-- The comparator is `move_greater` below (value desc via packed integer,
+-- tie-break i desc / j asc). Written as a plain heap sort with an explicit
+-- count so we never need `#` or a nil boundary.
+
+-- Per-depth move buffers: each bound() frame needs its own buffer because the
+-- recursion overwrites shared storage while the outer frame still iterates its
+-- sorted moves. Buffers are indexed by search depth (bounded ~10-20 plies),
+-- so each frame reads/writes its own region; no clear needed (explicit count).
+local move_stack = {}
+local ply = 0 -- current recursion depth (incremented per bound() entry)
+
+local function move_greater(a, b)
     if a ~= b then
         if a > b then return true end
         if a < b then return false end
-        -- identical packed value: break ties by i desc, j asc
         local ai, aj = move_from(a), move_to(a)
         local bi, bj = move_from(b), move_to(b)
         if ai ~= bi then
@@ -1101,6 +1115,47 @@ local function sorter(a, b)
         end
     end
     return false
+end
+
+-- In-place heap sort of buf[1..n] descending by `move_greater`.
+-- Classic max-heap + extract-to-end produces ASCENDING; for descending we build
+-- a MIN-heap (smallest at root) and extract to the end, so the largest lands
+-- first. The comparator is inverted for the heap property.
+local function move_sort(buf, n)
+    -- build min-heap (root is the smallest)
+    for start = math_floor(n / 2), 1, -1 do
+        local root = start
+        while root * 2 <= n do
+            local child = root * 2
+            if child < n and move_greater(buf[child], buf[child + 1]) then
+                child = child + 1
+            end
+            if move_greater(buf[root], buf[child]) then
+                buf[root], buf[child] = buf[child], buf[root]
+                root = child
+            else
+                break
+            end
+        end
+    end
+    -- extract min to the end -> descending order
+    for endpos = n, 2, -1 do
+        buf[1], buf[endpos] = buf[endpos], buf[1]
+        local root = 1
+        local m = endpos - 1
+        while root * 2 <= m do
+            local child = root * 2
+            if child < m and move_greater(buf[child], buf[child + 1]) then
+                child = child + 1
+            end
+            if move_greater(buf[root], buf[child]) then
+                buf[root], buf[child] = buf[child], buf[root]
+                root = child
+            else
+                break
+            end
+        end
+    end
 end
 
 local function bound(pos, gamma, depth)
@@ -1141,20 +1196,28 @@ local function bound(pos, gamma, depth)
 
     -- Generate pseudo-legal moves and filter out those that leave our own king
     -- in check. If no legal move exists the position is checkmate or stalemate.
-    local pseudo = m_genMoves(pos)
-    local moves = {}
+    -- genMoves writes packed moves into this frame's per-ply buffer; we filter
+    -- in place (nlegal <= k, so compaction never overwrites an unread entry).
+    ply = ply + 1
+    local buf = move_stack[ply]
+    if not buf then
+        buf = {}
+        move_stack[ply] = buf
+    end
+    local pe = m_genMoves(pos, buf, 1)
     local nlegal = 0
     local king = m_king_index(pos)
     local b = pos._b
     local sens, sens_g = m_king_sensitive(pos, king, b)
-    for k = 1, #pseudo do
-        local move = pseudo[k]
+    for k = 1, pe do
+        local move = buf[k]
         if m_is_legal(pos, move, king, sens, b, sens_g) then
             nlegal = nlegal + 1
-            moves[nlegal] = move
+            buf[nlegal] = move
         end
     end
     if nlegal == 0 then
+        ply = ply - 1
         if m_in_check(pos) then
             return -MATE_VALUE -- checkmate: side to move loses
         else
@@ -1166,20 +1229,21 @@ local function bound(pos, gamma, depth)
     local nullscore = depth > 0 and -bound(null_child, 1 - gamma, depth - 3) or pos.score
     pool_free_pos(null_child) -- the null-move child is dead after this node
     if nullscore >= gamma then
+        ply = ply - 1
         return nullscore
     end
 
     local best, bmove = -3 * MATE_VALUE, nil
 
-    -- Cache calculated move values so table.sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
+    -- Cache calculated move values so the sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
     for k = 1, nlegal do
-        moves[k] = move_set_val(moves[k], m_value(pos, moves[k], b))
+        buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
     end
 
-    table_sort(moves, sorter)
+    move_sort(buf, nlegal)
 
     for k = 1, nlegal do
-        local move = moves[k]
+        local move = buf[k]
         if depth <= 0 and move_val(move) < 150 then
             break
         end
@@ -1196,12 +1260,14 @@ local function bound(pos, gamma, depth)
     end
 
     if depth <= 0 and best < nullscore then
+        ply = ply - 1
         return nullscore
     end
 
     if not had_entry or depth >= ed and best >= gamma then
         tp_set(key, depth, best, gamma, bmove)
     end
+    ply = ply - 1
     return best
 end
 
