@@ -99,9 +99,11 @@ committed); it is not required to run the tests.
   necessarily replay through `sunfish.move` on the same position. It is meant to be
   shown to the user, not fed back into `move`.
 - **Search must run inside a coroutine**: `search`/`bound` call `coroutine.yield()`
-  every 30 nodes. Call `ai_move` from a coroutine (the test harness does this; so does
-  the benchmark). Calling it at top level raises "attempt to yield across C-call
-  boundary".
+  periodically (every `YIELD_QUANTUM` = 256 nodes by default, tunable via
+  `sunfish.set_yield(quantum, enable)`). Call `ai_move` from a coroutine (the
+  test harness does this; so does the benchmark). Calling it at top level raises
+  "attempt to yield across C-call boundary". Set `SUNFISH_NO_YIELD=1` in the
+  benchmark to disable yields and measure uncapped throughput.
 - **Global transposition table**: the TT is module-level and never cleared, so repeated
   `ai_move` calls in one process become progressively slower (measured ~0.4s, 1.1s,
   6.7s for the first three searches). The tests keep `ai_move` usage light and the

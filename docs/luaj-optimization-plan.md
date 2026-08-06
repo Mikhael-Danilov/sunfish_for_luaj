@@ -329,13 +329,24 @@ interpreter. But it's the structural redesign with the documented
 recursion-corruption risk (two prior scratch-pooling attempts were reverted).
 Keep the public immutable API as a thin wrapper; do this last, behind a rewrite.
 
-### Reviewed and deferred: yield countdown (item 07)
+### Reviewed and shipped: yield countdown (item 07)
 
 `nodes % 30` is a cheap integer modulo; the real cost is ~330 coroutine switches
-per 10k search. A countdown with a bigger quantum removes both, BUT the 30-node
-quantum is a documented *Android responsiveness* mechanism (the RPD loop drives
-the search). Make the quantum tunable (128-256) rather than jumping to 1024 —
-this is a product-level trade-off, not a pure perf win.
+per 10k search, each a JVM context hop under LuaJ. Replaced with a countdown
+(`yield_left` decrement per node, yield every `YIELD_QUANTUM` nodes). Same-JVM
+LuaJ A/B (start position, identical `b8c6`/sc=41 every round):
+
+| Variant | Mean delta | Best round |
+|---------|-----------|------------|
+| countdown -> 256 | **-33%** | -55.7% |
+| countdown -> 1024 | **-41%** | -57.9% |
+| no yield at all | **-56%** | -77.4% |
+
+Shipped with `YIELD_QUANTUM = 256` (tunable) and `YIELD_ENABLED`; the Android
+RPD layer can lower the quantum for responsiveness or raise it for throughput,
+and `sunfish.set_yield(quantum, enable)` exposes both. The benchmark harness
+uses `SUNFISH_NO_YIELD=1` to measure the uncapped ceiling (no coroutine
+switches).
 
 ### Reviewed and deferred: TT replacement policy (item 09)
 
@@ -378,7 +389,9 @@ search restructuring (make/unmake is the known next step).
 - Fixed-size TT (`TT_SIZE = 65536`) replaces the unbounded string-keyed dict
   (`TABLE_SIZE = 1e6` was removed) -> bounded ~10MB. `TT_SIZE` is now a tunable
   constant; `NODES_SEARCHED` remains the exposed tunable.
-- The yield interval is still hardcoded at every 30 nodes (`nodes % 30`).
+- The yield interval is a tunable countdown: `YIELD_QUANTUM = 256` nodes by
+  default (was hardcoded at 30), configurable via `sunfish.set_yield()`;
+  `SUNFISH_NO_YIELD=1` disables yields for benchmark throughput.
 - Search `print` is still unconditional (no `SUNFISH_VERBOSE` gate yet).
 
 ## Key risks (covered by existing tests)

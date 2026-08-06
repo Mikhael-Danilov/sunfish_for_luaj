@@ -78,6 +78,12 @@ end)
 -- complete search (up to ~10k nodes) and is the heaviest public call.
 -- Note: the engine's module-level transposition table persists across calls,
 -- so repeated ai_move calls degrade; we benchmark one cold search.
+-- Set SUNFISH_NO_YIELD=1 to disable the search coroutine's periodic yields
+-- (uncapped throughput: no coroutine switches). The engine yields by default
+-- for the Android RPD responsiveness loop; the benchmark measures the ceiling.
+if os.getenv("SUNFISH_NO_YIELD") == "1" then
+    sunfish.set_yield(nil, false)
+end
 bench("ai_move (full search, cold)", N(1), function()
     in_coroutine(function()
         local g = sunfish.new()

@@ -13,6 +13,17 @@ local NODES_SEARCHED = 10000
 local MATE_VALUE = 30000
 local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
+-- Yield tuning. The search runs inside a coroutine (the Android RPD loop and
+-- the test harness drive it) and yields periodically so the caller can poll.
+-- Under LuaJ each coroutine.yield() is a JVM context hop (~330 switches per
+-- 10k search at the old hardcoded 30-node quantum), so a bigger countdown
+-- quantum is measurably faster (~33% at 256, ~41% at 1024; no-yield ~56%).
+-- YIELD_QUANTUM is a tunable; the Android layer can lower it for
+-- responsiveness or raise it for throughput. YIELD_ENABLED lets the
+-- benchmark harness measure the uncapped ceiling (no coroutine switches).
+local YIELD_QUANTUM = 256
+local YIELD_ENABLED = true
+
 local A1, H1, A8, H8 = 91, 98, 21, 28
 local initial = '         \n' .. --   0 -  9
         '         \n' .. --  10 - 19
@@ -968,6 +979,7 @@ end
 -------------------------------------------------------------------------------
 
 local nodes = 0
+local yield_left = YIELD_QUANTUM -- countdown for the periodic coroutine yield
 
 -- Hoist hot Position methods to upvalues: each `pos:method()` is a table read
 -- that misses into __index (a metamethod event + function lookup). Binding
@@ -1004,7 +1016,15 @@ end
 
 local function bound(pos, gamma, depth)
     nodes = nodes + 1
-    if nodes % 30 == 0 then coroutine.yield() end
+    -- Countdown-based yield: one decrement + compare per node (vs a modulo),
+    -- and a coroutine switch only every YIELD_QUANTUM nodes.
+    if YIELD_ENABLED then
+        yield_left = yield_left - 1
+        if yield_left == 0 then
+            yield_left = YIELD_QUANTUM
+            coroutine.yield()
+        end
+    end
 
     if math_abs(pos.score) >= MATE_VALUE then
         return pos.score
@@ -1162,6 +1182,15 @@ end
 local sunfish = {}
 
 sunfish.MATE_VALUE = MATE_VALUE
+
+-- Tunable yield behavior for the search coroutine (see the YIELD_QUANTUM
+-- comment near the top of the file). Pass enable=false to disable yields
+-- entirely (throughput ceiling; only safe where the caller never polls).
+function sunfish.set_yield(quantum, enable)
+    if quantum then YIELD_QUANTUM = quantum end
+    if enable ~= nil then YIELD_ENABLED = enable end
+    yield_left = YIELD_QUANTUM -- re-arm so the next search uses the new quantum
+end
 
 local game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)
 
