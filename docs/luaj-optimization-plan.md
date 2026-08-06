@@ -13,6 +13,11 @@
   micro batch, `sunfish.move` one-move legality) — **DONE**; item 2
   (dual-hash Zobrist) reverted — exposed a pre-existing `is_legal` en-passant
   undo bug (see the Phase-10 section)
+- [x] En-passant undo bug: **root-caused and fixed** — `rotate()` (null-move
+  child) mirrored a stale `ep`, producing bogus ep captures + board corruption;
+  `rotate()` now clears `ep` and `is_legal` verifies `b[j+S] == -P`. Genuine ep
+  still works; suites green. Search now reaches depth 6 (~15.8k nodes) — see
+  "En-passant undo bug" note below.
 
 ### Cumulative results (measured, BENCH_SCALE=0.01 LuaJ, interleaved runs)
 
@@ -722,6 +727,37 @@ make/unmake rewrite it belongs to) is fixed. Reverted to the full 120-pass
 `key()`; the invariant and node counts are exact again. This is a concrete
 instance of the plan's documented "is_legal in-place undo (highest-risk)" risk,
 and a prerequisite for any future cached-hash scheme.
+
+### En-passant undo bug: root-caused and fixed (post-Phase-10)
+
+The `_b` corruption that reverted item 2 was traced to a genuine latent bug:
+
+- **Root cause**: `rotate()` (used for the search's null-move child) mirrored
+  the parent's `ep` (`child.ep = 121 - self.ep`). But a rotation is a **null
+  move** — no pawn was pushed — so the mirrored ep target is stale. With a
+  stale `ep`, `genMoves` emits bogus en-passant captures (`q == EMPTY and
+  j == ep` with no enemy pawn at `j+S`), and `is_legal`'s ep undo
+  (`b[j+S] = -P`) writes a phantom pawn into the pooled child's `_b`.
+- **Fix** (two layers):
+  1. `rotate()` now clears `ep` (the ep flag is only ever set by `move()` on a
+     genuine double-push; `kp` still mirrors correctly).
+  2. `is_legal`'s ep branch verifies `b[j+S] == -P` before treating a
+     diagonal-to-empty move as an ep capture — defense in depth so a stale ep
+     can never corrupt the board or admit an illegal capture.
+- **Verified**: genuine ep captures still work end-to-end (`e5xf6` legal, the
+  captured pawn is removed); after a null-move rotate no pseudo-legal move
+  corrupts the board (was 2 of 30). Suites green on luajit/lua5.1/LuaJ
+  (14+15+21) + oracle 40/40.
+- **Search-cost side effect**: removing the bogus ep moves cuts the per-depth
+  node count sharply (depth 5: 11653 -> 4036) but lets the search reach
+  **depth 6** (15803 nodes) instead of stopping at the depth-5 node cap — the
+  same depth-unlock pattern the LMR reversion documented. Under LuaJ's high
+  per-node overhead the deeper top tree makes `ai_move` roughly neutral to
+  slightly slower wall-clock (mixed A/B: -10%, +49%, -11%, +9% across rounds,
+  within the +/-30% variance band). The fix is a **correctness** fix (removes a
+  board-corruption source and illegal moves); its search-cost profile is a
+  separate effect. `NODES_SEARCHED`/`YIELD_QUANTUM` tuning can re-balance if
+  the deeper search is undesired.
 
 ### A/B timing (cold `ai_move`, same-JVM, alternating, `BENCH_SCALE=0.01`)
 

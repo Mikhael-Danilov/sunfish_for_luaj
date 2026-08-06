@@ -777,8 +777,11 @@ function Position:is_legal(move, king, sens, b, sens_g)
             -- non-nil means the king is currently NOT attacked, so the move is
             -- legal.
             if i ~= king and sens[i] ~= sens_g and sens[j] ~= sens_g then
+                -- A genuine en passant requires the enemy pawn behind the
+                -- destination (j+S); a stale `ep` (e.g. from a null-move rotate
+                -- that mirrored a target) must not be treated as a capture.
                 local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
-                if not is_ep or sens[j + S] ~= sens_g then
+                if not is_ep or (b[j + S] == -P and sens[j + S] ~= sens_g) then
                     return true
                 end
             end
@@ -786,7 +789,7 @@ function Position:is_legal(move, king, sens, b, sens_g)
         b[i] = EMPTY
         b[j] = p
         local ep_undo = false
-        if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
+        if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY and b[j + S] == -P then
             -- en passant: capture the pawn behind the destination
             b[j + S] = EMPTY
             ep_undo = true
@@ -893,19 +896,24 @@ function Position:rotate(pooled)
     local nk, nek = nil, nil
     if ok and ek then nk = 121 - ek end
     if ek and ok then nek = 121 - ok end
+    -- rotate() is a NULL move (no pawn pushed): the en-passant target must be
+    -- cleared, not mirrored from the parent. Mirroring a stale `ep` makes
+    -- genMoves emit bogus ep captures and is_legal's undo corrupts the board
+    -- (a phantom pawn leaks into the pooled child). kp mirrors correctly (it is
+    -- a king-past-square, not an ep flag).
+    local ep, kp = 0, 121 - self.kp
     if pooled then
         child._b = nb
         child.score = -self.score
         child.wc = self.bc
         child.bc = self.wc
-        child.ep = 121 - self.ep
-        child.kp = 121 - self.kp
+        child.ep = ep
+        child.kp = kp
         child._king = nk
         child._eking = nek
         return child
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, 121 - self.ep, 121 - self.kp,
-        nk, nek)
+    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek)
 end
 
 function Position:move(move, val, pooled)

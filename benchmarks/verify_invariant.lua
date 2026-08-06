@@ -1,9 +1,9 @@
 -- benchmarks/verify_invariant.lua
--- Node-count + move/score invariant verifier for the behavior-identical batch.
+-- Node-count + move/score invariant verifier for the current baseline.
 --
 -- Runs one cold start-position search and asserts the invariant the plan uses
 -- as the guard rail for behavior-identical changes:
---   nodes 27/258/755/4156/11653, score 41, and the exact root move.
+--   nodes 27/197/411/1818/4036/15803, root move a8b6 (post-ep-fix baseline).
 -- The engine's search prints "Searched %d nodes. Depth %d. Score %d(...)" per
 -- depth; we capture that and check it against the expected sequence.
 --
@@ -15,14 +15,18 @@
 -- depth-by-depth node counts. Run with SUNFISH_VERBOSE=1 (see the header).
 local sunfish = require("sunfish")
 
+-- Post-ep-fix baseline: the en-passant undo fix removed bogus ep moves, so the
+-- per-depth node counts dropped (depth 5: 11653 -> 4036) and the search now
+-- reaches depth 6 (15803 nodes) instead of stopping at the depth-5 node cap.
 local EXPECTED = {
     { depth = 1, nodes = 27,   score = 99 },
-    { depth = 2, nodes = 258,  score = 0 },
-    { depth = 3, nodes = 755,  score = 99 },
-    { depth = 4, nodes = 4156, score = 0 },
-    { depth = 5, nodes = 11653, score = 41 },
+    { depth = 2, nodes = 197,  score = 0 },
+    { depth = 3, nodes = 411,  score = 99 },
+    { depth = 4, nodes = 1818, score = 0 },
+    { depth = 5, nodes = 4036, score = 40 },
+    { depth = 6, nodes = 15803, score = 0 },
 }
--- The invariant root move (Phase-9 engine, 1-based indexing): a8b6, score 41.
+-- The invariant root move (post-ep-fix baseline): a8b6.
 local EXPECTED_MOVE = "a8b6"
 
 local captured = {}
