@@ -21,7 +21,17 @@
 - [x] Item 2 (dual-hash incremental Zobrist): **re-shipped after the ep fix** —
   now behavior-identical (invariant 27/197/411/1818/4036/15803, `a8b6`); A/B
   won 4 of 5 rounds (mean ~-7%); O(1) `key()` for search children. See the
-  Phase-10 section.
+  Phase-10 section. **⚠️ REBENCH — wall-clock-based, within CPU noise.**
+- [x] A+B+C+D cleanup batch: behavior-identical; **~13% CPU-time win** (base
+  13.29s vs mod 11.48s mean `User time`) — confirmed with OS-level CPU timing,
+  not wall-clock. See the post-item-2 review.
+
+> **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
+> `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
+> bytecode) or `/usr/bin/time` wall — both load-contaminated on this VM. The
+> reliable signal is `/usr/bin/time -v` `User time` (CPU). Phase-6/7/8/9 and
+> Phase-10 percentages are wall-clock-based and **not yet re-verified**; item 2
+> and the Phase-10 A/B table carry explicit rebench markers.
 
 ### Cumulative results (measured, BENCH_SCALE=0.01 LuaJ, interleaved runs)
 
@@ -356,6 +366,13 @@ via a `pooled` flag; `pool_free_pos` clears all fields so a stale reference can
 never alias a live board.
 
 Same-JVM LuaJ A/B (start position, identical `b8c6`/sc=41 every round):
+
+> **⚠️ REBENCH — wall-clock contaminated.** The Phase-6/7/8 A/B tables below
+> used LuaJ's `os.clock()` (wall-clock, `System.currentTimeMillis()`-based).
+> The percentages are load-affected on this VM and are **directional, not
+> authoritative** — the qualitative wins (pooling, pooled move buffers, sorted
+> generation) are real, but the exact deltas need CPU-time re-measurement
+> (`/usr/bin/time -v` `User time`) in a clean session.
 
 | Round | baseline | pooled | delta |
 |-------|----------|--------|-------|
@@ -739,7 +756,10 @@ are green (14+15+21 + oracle 40/40).
 baseline vs dual-hash):** mod won 4 of 5 rounds (R1 -3%, R2 -23%, R3 +6%, R4
 -17%, R5 -1%), mean ~-7%, identical `a8b6`/score every round. The O(1) `key()`
 for search children (vs the 120-pass) is a small but consistent search-path
-win; **SHIPPED**.
+win; **SHIPPED**. **⚠️ REBENCH — wall-clock contaminated** (engine-internal
+timer = `os.clock()` = `System.currentTimeMillis()`; loaded VM). The ~-7% is
+**within the CPU-time noise band** — re-measure with `User time`/
+`bench_cpu.lua` in a clean session to confirm the win before relying on it.
 
 ### En-passant undo bug: root-caused and fixed (post-Phase-10)
 
@@ -774,6 +794,14 @@ The `_b` corruption that reverted item 2 was traced to a genuine latent bug:
 
 ### A/B timing (cold `ai_move`, same-JVM, alternating, `BENCH_SCALE=0.01`)
 
+> **⚠️ REBENCH — wall-clock contaminated.** This table used the engine's
+> internal timer, which under LuaJ is `os.clock()` =
+> `System.currentTimeMillis()` — **wall-clock, not CPU time** (verified in the
+> OsLib bytecode). On this loaded single-core VM, wall-clock numbers include
+> load-induced waiting; the "won every round" pattern may be real or may be
+> noise. **Re-measure with CPU time** (`/usr/bin/time -v` `User time`, or the
+> `bench_cpu.lua` harness) in a clean session before trusting the ~-16%.
+
 | Round | baseline | modified | delta |
 |-------|----------|----------|-------|
 | 1 (base first)  | 33.1s | 20.4s | **-38%** |
@@ -784,7 +812,7 @@ The `_b` corruption that reverted item 2 was traced to a genuine latent bug:
 Modified won every round regardless of order (not a cold-start artifact).
 Mean ~-16%; the batch ships. Identical move (`a8b6`) and score (41) every
 round — the delta is pure overhead removal, matching the doc's Phase-6/7/8
-discipline.
+discipline. **CPU-time re-measurement pending.**
 
 ### Harness additions (committed)
 
