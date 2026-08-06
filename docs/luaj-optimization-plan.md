@@ -471,6 +471,52 @@ roughly doubles and the sentinel rays add another ~+34% on top. Tests green on
 luajit/lua5.1/LuaJ (14+15+21) + oracle 40/40 (oracle `render` decode updated
 for the 1-based packed moves).
 
+## Post-Phase-9 review: TT probe/store inlining + flattened rays (NOT SHIPPED)
+
+Two follow-ups from the original suggestion list were A/B'd on top of Phase 9:
+
+- **Inline TT probe/store in `bound()`**: replace `tp_get`/`tp_set` calls with
+  the flat-array reads (`ttK[ts] == key` guard, `ttS[ts]`/`ttD[ts]`, and direct
+  writes at the store site), reusing the computed slot `ts = key % TT_SIZE + 1`
+  for the bound-check instead of recomputing `%`.
+- **Flattened ray walks**: build `ray1..ray8` per-direction aliases
+  (`rayN[sq] == ray_squares[sq][N]`) and rewrite `attacked()`'s two nested-di
+  loops into 8 direct sentinel walks, turning `ray_squares[i][di]` (two table
+  gets) into `rayN[i]` (one).
+
+Both are pure overhead removal: identical move selection, node counts, and
+score (11653 nodes, `a8b6`, 41) vs the Phase-9 baseline; all tests green
+(14+15+21) + oracle 40/40.
+
+**Microbenchmark signal (`move`, BENCH_SCALE=0.05 LuaJ)**: clearly faster on the
+movegen path — ttinline ~450-650/s and flatray ~390-480/s vs baseline
+~270-575/s (noisy but ttinline consistently at the top).
+
+**Self-play signal (primary benchmark)**: a new `benchmarks`-style harness
+drives `ai_move` for both sides (the engine rotates, so one engine plays both
+colors), derives each actual chess move by un-rotating the child board and
+diffing, and logs per-ply move/score/ms. Paired, same-game runs (the two
+engines produce byte-identical move sequences) give a **mixed result**:
+
+| Protocol | Combined (ttinline+flatray) vs baseline |
+|----------|------------------------------------------|
+| 40-ply, 2 pairs | -12.9s, -12.9s (combined faster) |
+| 20-ply, 3 pairs | -2865, +2098, +1158 ms |
+| 16-ply, 5 pairs | -1269, +2409, +5841, +78, -407 ms |
+
+**Verdict: not shipped.** The self-play timing is within LuaJ's ±30% variance —
+combined won some pairs and lost others by similar margins, and the largest
+single swing went against it. The `move` microbenchmark overstates the win
+because it isolates one hot loop; real self-play is dominated by the ~11k-node
+iterative-deepening search per move, where saving a couple of `CALL`/table-get
+per node is lost in the noise. The known next step for search speed remains the
+make/unmake rewrite (cutting `is_legal`'s `attacked()` cost).
+
+Self-play harness notes: `ai_move` occasionally returns `nil` at the root (the
+module-level TT's root entry is overwritten by a deeper transposition), which
+the engine handles by passing (board unchanged); the harness reports `(pass)`
+and continues.
+
 ## Phases
 
 | # | Step | Est. LuaJ gain | Risk |
@@ -507,6 +553,8 @@ documented recursion-corruption risk.
 - `python3 tests/compare_python_chess.py` — 40/40 legal-move oracle.
 - `TEST_BUDGET=120 benchmarks/run_luaj.sh tests/test_sunfish.lua` under LuaJ.
 - `BENCH_SCALE=0.01 benchmarks/run_luaj.sh` — record `ai_move` ms / `move` iter/s.
+- Self-play: `lua selfplay.lua <engine_dir> <plies>` — same-game paired timing
+  comparison (primary benchmark for search-path changes).
 
 ## Android specifics
 
