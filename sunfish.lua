@@ -821,6 +821,10 @@ function Position:is_legal(move, king, sens, b, sens_g)
 
     if p ~= K then
         -- Non-king move: the king stays at `king`.
+        -- A diagonal pawn move to an empty square is an en-passant candidate
+        -- (captures the enemy pawn behind the destination, j+S). Computed once
+        -- and reused by the short-circuit and the capture below.
+        local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
         if sens then
             -- Short-circuit: if this move doesn't touch a sensitive square and
             -- isn't en passant, the king's safety is unchanged. `sens` being
@@ -830,7 +834,6 @@ function Position:is_legal(move, king, sens, b, sens_g)
                 -- A genuine en passant requires the enemy pawn behind the
                 -- destination (j+S); a stale `ep` (e.g. from a null-move rotate
                 -- that mirrored a target) must not be treated as a capture.
-                local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
                 if not is_ep or (b[j + S] == -P and sens[j + S] ~= sens_g) then
                     return true
                 end
@@ -839,7 +842,7 @@ function Position:is_legal(move, king, sens, b, sens_g)
         b[i] = EMPTY
         b[j] = p
         local ep_undo = false
-        if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY and b[j + S] == -P then
+        if is_ep and b[j + S] == -P then
             -- en passant: capture the pawn behind the destination
             b[j + S] = EMPTY
             ep_undo = true
@@ -1340,12 +1343,12 @@ local function bound(pos, gamma, depth)
     -- move is found), and the terminal-score check above catches
     -- already-decided positions.
     local key = m_key(pos)
-    local es, ed, _, ed_slot = tp_get(key)
+    local es, ed, em, ed_slot = tp_get(key)
     local had_entry = es ~= nil
     if had_entry and ed >= depth and (
             es < ttG[ed_slot] and es < gamma or
                     es >= ttG[ed_slot] and es >= gamma) then
-        return es
+        return es, em
     end
 
     -- Generate pseudo-legal moves and filter out those that leave our own king
@@ -1379,9 +1382,17 @@ local function bound(pos, gamma, depth)
         end
     end
 
-    local null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
-    local nullscore = depth > 0 and -bound(null_child, 1 - gamma, depth - 3) or pos.score
-    pool_free_pos(null_child) -- the null-move child is dead after this node
+    -- Null-move search. At depth <= 0 the recursion is skipped (the `or
+    -- pos.score` short-circuit), so the rotated child's board is never read --
+    -- creating it is pure waste on every leaf (the largest node class). Only
+    -- build + free the child when depth > 0.
+    local null_child
+    local nullscore = pos.score
+    if depth > 0 then
+        null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
+        nullscore = -bound(null_child, 1 - gamma, depth - 3)
+        pool_free_pos(null_child) -- the null-move child is dead after this node
+    end
     if nullscore >= gamma then
         ply = ply - 1
         return nullscore
@@ -1412,7 +1423,11 @@ local function bound(pos, gamma, depth)
         sort_n = keep
     end
 
-    move_sort(buf, sort_n)
+    -- A 0-1 element sort is a no-op; skip the call at the many leaves with
+    -- 0-1 kept moves.
+    if sort_n > 1 then
+        move_sort(buf, sort_n)
+    end
 
     for k = 1, sort_n do
         local move = buf[k]
@@ -1438,22 +1453,31 @@ local function bound(pos, gamma, depth)
         tp_set(key, depth, best, gamma, bmove)
     end
     ply = ply - 1
-    return best
+    return best, bmove
 end
 
 local function search(pos, maxn)
     maxn = maxn or NODES_SEARCHED
     nodes = 0
     local score
+    -- The move to return: the last fail-high (score >= gamma) bound call at the
+    -- deepest completed depth. Capturing it directly avoids the post-loop TT
+    -- re-probe, whose root slot can be overwritten by a deeper transposition
+    -- (the `(pass)` UX artifact). Falls back to the re-probe when no bound call
+    -- failed high (e.g. the very first call at depth 1 returns a bound score
+    -- below gamma with no move yet).
+    local rootmove
 
     for depth = 1, 98 do
         local lower, upper = -3 * MATE_VALUE, 3 * MATE_VALUE
         while lower < upper - 3 do
             local gamma = math_floor((lower + upper + 1) / 2)
-            score = bound(pos, gamma, depth)
+            local mv
+            score, mv = bound(pos, gamma, depth)
             assert(score)
             if score >= gamma then
                 lower = score
+                rootmove = mv
             end
             if score < gamma then
                 upper = score
@@ -1470,9 +1494,12 @@ local function search(pos, maxn)
         end
     end
 
-    local _, _, rootmove = tp_get(m_key(pos))
     if rootmove ~= nil then
         return rootmove, score
+    end
+    local _, _, ttmove = tp_get(m_key(pos))
+    if ttmove ~= nil then
+        return ttmove, score
     end
     return nil, score
 end

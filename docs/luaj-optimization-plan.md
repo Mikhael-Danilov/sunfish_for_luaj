@@ -803,6 +803,126 @@ Self-play note: full 40-ply games under LuaJ are impractical for quick A/Bs
 taking minutes per ply), so the primary timing signal here is the cold
 `ai_move` A/B — the doc's established measure for behavior-identical batches.
 
+### Post-item-2 review: six new suggestions (A+B+C+D shipped as cleanup, E/F deferred)
+
+A re-review after the dual-hash re-ship, focusing on what changed. First, a
+**correction to the record**: the flip-table rejection rationale (c) is
+factually wrong — item 2 made `key()` O(1), but it did **not** make the mirror
+loop O(1): `move()`/`rotate()` still run the full 120-cell board copy on every
+call. The rejection still stands on rationale (b)/Phase-9 grounds (an extra
+per-cell table get for `flipT[...]` would likely lose under LuaJ, same lesson
+as the flat attack tables), but the consequence matters: the 120-cell copies
+are now one of the two clearly visible remaining structural costs, alongside
+`attacked()`. The six new suggestions, with verdicts against the code:
+
+| # | Item | Verdict | Notes |
+|---|------|---------|-------|
+| A | Skip the null-move `rotate()` at `depth <= 0` | **SHIPPED (cleanup)** | `depth > 0 and -bound(null_child, ...) or pos.score` short-circuits at leaves; the child's board is never read there, so skipping the rotate + pool alloc/free is byte-identical |
+| B | Hoist the en-passant guard in `is_legal` | **SHIPPED (cleanup)** | The `p == P and (j-i)==N+W/E and q == EMPTY` test is recomputed; a precomputed `is_ep` local is identical |
+| C | Skip `move_sort` when `sort_n < 2` | **SHIPPED (cleanup)** | `if sort_n > 1 then move_sort(buf, sort_n) end` skips the sort call at the many leaves with 0-1 kept moves; identical kept set/order |
+| D | Capture the root move directly in `search()` (fix the `(pass)` artifact) | **SHIPPED (cleanup)** | `bound()` returns `best, bmove`; remember the last fail-high move instead of re-probing the TT after the loop (the root entry can be overwritten by a deeper transposition) |
+| E | Measure `attacked()` share by caller class before choosing the legality rewrite | **VALID, next step** | Instrument `king_sensitive` probe / king-move / sensitive-touch / ep / castling; decides pin/check-aware legality vs make/unmake vs nothing |
+| F | Depth-unlock consequences (budget-aware stop / TT size / aspiration) | **CONDITIONAL** | F1/F2/F3 are behavior-changing; need their own gates |
+
+Details:
+
+**A — skip null-move rotate at leaves.** `bound()` line 1383:
+`local nullscore = depth > 0 and -bound(null_child, 1 - gamma, depth - 3) or pos.score`
+already skips the recursion at `depth <= 0`, but the `m_rotate(pos, true)` at
+line 1382 + `pool_free_pos` at 1384 still run (a full 120-cell copy + alloc)
+for **every leaf node** — leaves are the largest node class. The child's board
+is never read when the recursion is skipped, so gating the rotate itself
+(`local null_child; local nullscore = depth > 0 and (null_child =
+m_rotate(pos, true) and -bound(...)) or pos.score` with the free only in the
+`depth > 0` branch) is byte-identical. Estimated: skips ~the leaf-fraction of
+the 120-cell rotate cost — one of the two biggest remaining per-node costs.
+
+**B — hoist the ep guard in `is_legal`.** The `p == P and (j-i)==N+W/E and
+q == EMPTY` test appears at line 780 (short-circuit) and line 789 (the real
+ep). Both are recomputed; a local `is_ep` from the first test is identical
+(short-circuit only returns early when `not is_ep or ...`, so the second use is
+only reached when `is_ep` is true anyway). Marginal but free.
+
+**C — skip the sort for 0-1 kept moves.** After the leaf filter, `move_sort`
+is called unconditionally (`move_sort(buf, sort_n)` line 1415). Many leaves
+have 0 or 1 kept moves; `if sort_n > 1 then move_sort(buf, sort_n) end` skips
+the call. Identical (a 0-1 element sort is a no-op).
+
+**D — capture the root move directly.** The plan's `(pass)` artifact: the
+module-level TT's root entry can be overwritten by a deeper transposition, so
+the post-loop `tp_get(m_key(pos))` occasionally returns nil. Fix: have
+`bound()` return `best, bmove` as a second value (the TT-hit path already
+returns `es, ttM[ed_slot]`), and in `search()` remember `bmove` from the last
+fail-high (`score >= gamma`) `bound` call at each depth. Cheap, removes the
+`(pass)` UX artifact, cleaner self-play data. Note: this changes the search
+loop's bookkeeping but not the move chosen (the last fail-high at the deepest
+completed depth is exactly what the TT re-probe would return when it's not
+overwritten).
+
+**Benchmark outcome (A+B+C+D): behavior-identical, perf-neutral — shipped as a
+cleanup batch.** All gates green (node invariant 27/197/411/1818/4036/15803 +
+`a8b6`; suites 14+15+21 on luajit/lua5.1/LuaJ; oracle 40/40; 300-position hash
+walk). Cold `ai_move` A/B on a single-core, heavily loaded machine (load avg
+~2 during runs, ~1 GB RAM — see the machine note below) measured **no reliable
+gain**: sequential `/usr/bin/time` runs, base 11.7/11.5/12.8s (mean 12.0) vs
+mod 12.9/11.9/12.3s (mean 12.4), and an A-only isolate 11.4/12.2s (mean 11.8) —
+all within the load-noise band. The leaf-rotate skip (A) — theoretically the
+biggest win — measures as a wash: LuaJ's pooled 120-cell rotate is not the
+dominant per-node cost at these node counts. Decision: **ship A+B+C+D anyway**
+as a behavior-identical cleanup (zero risk, removes genuinely dead work, D
+fixes the rare `(pass)` artifact), explicitly *not* as a perf win. If a real
+gain is needed, E (attacked() instrumentation) and F2 (TT size/depth-preferred)
+are the higher-value next steps.
+
+**Machine note**: this repo is benchmarked on a single-core 1 GB VM with
+frequent load spikes (19 users; load avg 1.5-3.9 observed). All cold-JVM A/Bs
+must run **sequentially** (never in parallel), prefer the engine's internal
+`ai_move` timing over OS wall-clock (JVM startup ~60s swamps the ~1s deltas),
+and treat <10% deltas as noise. `/usr/bin/time -v` is used for OS-level
+confirmation.
+
+**E — measure `attacked()` share by caller class.** With `key()` O(1) and the
+TT probe nearly free, the 54% `is_legal`/`attacked`/`genMoves` share is almost
+certainly higher now. The plan's check/pin-legality verdict is defensible (the
+`king_sensitive` short-circuit already captured most of it, and the
+x-ray/ep/castling edges force slow paths), but its "valid sub-item" — count
+`attacked()` calls by caller class (king_sensitive probe / king moves /
+sensitive-touch / ep / castling) — is the right next step. That single profile
+decides between:
+- pin/check-aware legality (wins if sensitive-touch dominates),
+- make/unmake (wins if king-move and castling tests dominate),
+- or nothing (if the residual is small enough that A-C are the better spend).
+
+Given rotation makes classic make/unmake awkward (frame flip per ply), a
+**hybrid** is worth noting: keep the copy model but apply A-C, then re-profile.
+If `attacked()` is still >30% of LuaJ time after that, the rewrite is clearly
+worth its risk.
+
+**F — depth-unlock consequences.** The ep fix cut depth-5 nodes 11653->4036 and
+the search now runs depth 6 (15,803 nodes — a 58% overshoot of
+`NODES_SEARCHED = 10000`, since the budget is only checked between depths).
+Three levers, in increasing order of risk:
+- **F1 budget-aware stop**: check `nodes >= maxn` at the yield points and abort
+  gracefully, or retune `NODES_SEARCHED` (~6500) for the old time/strength
+  point. Also pending: the wall-clock deadline at yield points
+  (`sunfish.settime_budget`).
+- **F2 TT replacement + size**: more compelling now — 15.8k nodes/move with a
+  TT that persists across a game will saturate 64k slots. Add a probe/hit
+  counter first, then A/B `depth + 2 >= ttD[s]` and `TT_SIZE 131072/262144` as
+  its own paired self-play test, per the plan's protocol.
+- **F3 aspiration windows**: with depth 6 now the dominant per-depth cost,
+  narrowing the root window around the previous depth's score (re-widening on
+  fail) is slightly more attractive than before. Node-count-changing ->
+  oracle/perft gate. LMR stays parked until E lands.
+
+**One small Android note**: `VERBOSE` reads `os.getenv` at module load; on the
+device you likely can't set env vars at runtime, so for debug output from a
+release build add a `sunfish.set_verbose(flag)`.
+
+**Suggested order**: A + B + C as the next behavior-identical batch (gate:
+node invariant 27/197/411/1818/4036/15803 + suites), D alongside, then E's
+instrumentation before any structural rewrite, and F2/F1 as their own A/Bs.
+
 ## Phases
 
 | # | Step | Est. LuaJ gain | Risk |
