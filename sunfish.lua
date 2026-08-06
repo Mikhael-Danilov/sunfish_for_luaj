@@ -23,7 +23,7 @@ local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k sl
 local YIELD_QUANTUM = 256
 local YIELD_ENABLED = true
 
-local A1, H1, A8, H8 = 91, 98, 21, 28
+local A1, H1, A8, H8 = 92, 99, 22, 29
 local initial = '         \n' .. --   0 -  9
         '         \n' .. --  10 - 19
         ' rnbqkbnr\n' .. --  20 - 29
@@ -232,10 +232,15 @@ pst[K] = pst['K']
 -- edge; the engine's while-loops stop at SP/NL, which is exactly this wall.
 -------------------------------------------------------------------------------
 local is_on_board = {}
-local real_squares = {} -- the 64 real board squares (20..99, col 1..8), built once
+local is_on_board_1 = {} -- 1-based mirror for genMoves (j is a 1-based square)
+local real_squares = {} -- the 64 real board squares, stored 1-based (built once)
 for _i = 0, 119 do
     is_on_board[_i] = _i >= 20 and _i < 100 and (_i % 10) >= 1 and (_i % 10) <= 8
-    if is_on_board[_i] then real_squares[#real_squares + 1] = _i end
+    if is_on_board[_i] then
+        local i1 = _i + 1
+        real_squares[#real_squares + 1] = i1
+        is_on_board_1[i1] = true
+    end
 end
 
 -- ray_squares[i][d]: squares along direction d (d in 1..8) from i.
@@ -246,34 +251,37 @@ local knight_offsets = { 2 * N + E, N + 2 * E, S + 2 * E, 2 * S + E, 2 * S + W, 
 local king_offsets = { N, E, S, W, N + E, S + E, S + W, N + W }
 for i = 0, 119 do
     if is_on_board[i] then
-        ray_squares[i] = {}
+        local t = i + 1
+        ray_squares[t] = {}
         for di, d in ipairs(all_dirs) do
             local j = i + d
             local sqs = {}
             local n = 0
             while is_on_board[j] do
                 n = n + 1
-                sqs[n] = j
+                sqs[n] = j + 1
                 j = j + d
             end
-            ray_squares[i][di] = sqs
+            n = n + 1
+            sqs[n] = 0 -- sentinel terminator
+            ray_squares[t][di] = sqs
         end
         local kt, kg, pc = {}, {}, {}
         for oi, o in ipairs(knight_offsets) do
             local j = i + o
-            if is_on_board[j] then kt[#kt + 1] = j end
+            if is_on_board[j] then kt[#kt + 1] = j + 1 end
         end
         for oi, o in ipairs(king_offsets) do
             local j = i + o
-            if is_on_board[j] then kg[#kg + 1] = j end
+            if is_on_board[j] then kg[#kg + 1] = j + 1 end
         end
         for _, o in ipairs({ N + W, N + E }) do
             local j = i + o
-            if is_on_board[j] then pc[#pc + 1] = j end
+            if is_on_board[j] then pc[#pc + 1] = j + 1 end
         end
-        knight_targets[i] = kt
-        king_targets[i] = kg
-        pawn_caps[i] = pc
+        knight_targets[t] = kt
+        king_targets[t] = kg
+        pawn_caps[t] = pc
     end
 end
 
@@ -327,18 +335,20 @@ do
     zflat = {}
     for pc = -6, 6 do
         for sq = 0, 119 do
-            zflat[(pc + 6) * 120 + sq] = zob[pc][sq]
+            zflat[(pc + 6) * 120 + sq + 1] = zob[pc][sq]
         end
     end
     zob_wc[1], zob_wc[2] = rnd(), rnd()
     zob_bc[1], zob_bc[2] = rnd(), rnd()
     for sq = 0, 119 do
-        zob_ep[sq] = rnd()
+        zob_ep[sq + 1] = rnd()
     end
-    zob_kp[0] = 0
+    zob_ep[121] = 0 -- mirror of the no-ep sentinel (121 - 0)
+    zob_kp[1] = 0
     for sq = 1, 119 do
-        zob_kp[sq] = rnd()
+        zob_kp[sq + 1] = rnd()
     end
+    zob_kp[121] = 0 -- mirror of the no-kp sentinel (121 - 0)
 end
 
 -- The old string-keyed maps (is_upper_map/is_lower_map/swap_map) are replaced
@@ -438,7 +448,7 @@ function Position:key()
         local b = self._b or self:ensure_arr()
         local zf = zflat
         local h = 0
-        for i = 0, 119 do
+        for i = 1, 120 do
             local pc = b[i]
             -- Skip empty squares and the padding codes (98/99); only pieces hash.
             if pc ~= EMPTY and pc ~= SP and pc ~= NL then h = h + zf[(pc + 6) * 120 + i] end
@@ -462,8 +472,8 @@ function Position:ensure_arr()
         b = {}
         local board = self.board
         local b2c = byte_to_code
-        for i = 0, 119 do
-            b[i] = b2c[string.byte(board, i + 1)]
+        for i = 1, 120 do
+            b[i] = b2c[string.byte(board, i)]
         end
         self._b = b
     end
@@ -476,8 +486,8 @@ function Position:ensure_board()
         local b = self._b
         local c2c = code_to_char
         local parts = {}
-        for i = 0, 119 do
-            parts[i + 1] = c2c[b[i]]
+        for i = 1, 120 do
+            parts[i] = c2c[b[i]]
         end
         self.board = table.concat(parts)
     end
@@ -498,7 +508,7 @@ function Position:genMoves(out, start)
             if p == P then
                 -- Pawn: single push, double push, captures, ep.
                 local j = i + N
-                if is_on_board[j] and b[j] == EMPTY then
+                if is_on_board_1[j] and b[j] == EMPTY then
                     moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
                     -- Double push: original allows it whenever i >= A1+N and
                     -- the intermediate square is empty (the single push above
@@ -506,7 +516,7 @@ function Position:genMoves(out, start)
                     -- case (e.g. a pawn on e1) is preserved.
                     if i >= A1 + N then
                         local j2 = i + 2 * N
-                        if is_on_board[j2] and b[j2] == EMPTY then
+                        if is_on_board_1[j2] and b[j2] == EMPTY then
                             moves[move_idx] = move_pack(i, j2, 0); move_idx = move_idx + 1
                         end
                     end
@@ -548,8 +558,10 @@ function Position:genMoves(out, start)
                     local di = sd[s]
                     local ray = ray_squares[i][di]
                     local castling = p == R and (di == 2 or di == 4) -- E or W
-                    for c = 1, #ray do
+                    local c = 1
+                    while true do
                         local j = ray[c]
+                        if j == 0 then break end
                         local q = b[j]
                         if q == EMPTY then
                             moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
@@ -568,6 +580,7 @@ function Position:genMoves(out, start)
                             end
                             break
                         end
+                        c = c + 1
                     end
                 end
             end
@@ -618,18 +631,26 @@ function Position:attacked(i, b)
     -- Rook rays (di 1..4) attack with -R/-Q; bishop rays (di 5..8) with -B/-Q.
     for di = 1, 4 do
         local ray = ray_squares[i][di]
-        for c = 1, #ray do
-            local q = b[ray[c]]
+        local c = 1
+        while true do
+            local sq = ray[c]
+            if sq == 0 then break end
+            local q = b[sq]
             if q == -R or q == -Q then return true end
             if q ~= EMPTY then break end
+            c = c + 1
         end
     end
     for di = 5, 8 do
         local ray = ray_squares[i][di]
-        for c = 1, #ray do
-            local q = b[ray[c]]
+        local c = 1
+        while true do
+            local sq = ray[c]
+            if sq == 0 then break end
+            local q = b[sq]
             if q == -B or q == -Q then return true end
             if q ~= EMPTY then break end
+            c = c + 1
         end
     end
 
@@ -652,7 +673,7 @@ function Position:king_index()
     local k = self._king
     if not k then
         local b = self:ensure_arr()
-        for i = 0, 119 do
+        for i = 1, 120 do
             if b[i] == K then
                 k = i
                 self._king = i
@@ -670,7 +691,7 @@ function Position:eking_index()
     local k = self._eking
     if not k then
         local b = self:ensure_arr()
-        for i = 0, 119 do
+        for i = 1, 120 do
             if b[i] == -K then
                 k = i
                 self._eking = i
@@ -840,8 +861,8 @@ function Position:rotate(pooled)
         nb = {}
         child = nil
     end
-    for k = 0, 119 do
-        local v = b[119 - k]
+    for k = 1, 120 do
+        local v = b[121 - k]
         if v < 0 then
             nb[k] = -v
         elseif v > 6 then
@@ -856,20 +877,20 @@ function Position:rotate(pooled)
     local ek = self._eking or self:eking_index()
     local ok = self._king or self:king_index()
     local nk, nek = nil, nil
-    if ok and ek then nk = 119 - ek end
-    if ek and ok then nek = 119 - ok end
+    if ok and ek then nk = 121 - ek end
+    if ek and ok then nek = 121 - ok end
     if pooled then
         child._b = nb
         child.score = -self.score
         child.wc = self.bc
         child.bc = self.wc
-        child.ep = 119 - self.ep
-        child.kp = 119 - self.kp
+        child.ep = 121 - self.ep
+        child.kp = 121 - self.kp
         child._king = nk
         child._eking = nek
         return child
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, 119 - self.ep, 119 - self.kp,
+    return Position.from_array(nb, -self.score, self.bc, self.wc, 121 - self.ep, 121 - self.kp,
         nk, nek)
 end
 
@@ -921,23 +942,23 @@ function Position:move(move, val, pooled)
         nb = {}
         child = nil
     end
-    local r = 119 - j
-    local s = 119 - i
+    local r = 121 - j
+    local s = 121 - i
     if p == K and math_abs(j - i) == 2 then
         -- Castling: rook origin and rook destination are extra edits. The
         -- rotated frame negates colors, so the rook lands as -R (enemy).
         local rook_from = j < i and A1 or H1
-        for k = 0, 119 do
+        for k = 1, 120 do
             if k == r then
                 nb[k] = -p
             elseif k == s then
                 nb[k] = EMPTY
-            elseif k == 119 - rook_from then
+            elseif k == 121 - rook_from then
                 nb[k] = EMPTY
-            elseif k == 119 - kp then
+            elseif k == 121 - kp then
                 nb[k] = -R
             else
-                local v = b[119 - k]
+                local v = b[121 - k]
                 if v < 0 then
                     nb[k] = -v
                 elseif v > 6 then
@@ -949,13 +970,13 @@ function Position:move(move, val, pooled)
         end
     else
         local dest = A8 <= j and j <= H8 and -Q or -p -- promotion -> queen
-        for k = 0, 119 do
+        for k = 1, 120 do
             if k == r then
                 nb[k] = dest
             elseif k == s then
                 nb[k] = EMPTY
             else
-                local v = b[119 - k]
+                local v = b[121 - k]
                 if v < 0 then
                     nb[k] = -v
                 elseif v > 6 then
@@ -966,7 +987,7 @@ function Position:move(move, val, pooled)
             end
         end
         if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
-            nb[119 - (j + S)] = EMPTY -- en passant
+            nb[121 - (j + S)] = EMPTY -- en passant
         end
     end
     -- Thread king indices: child own king = mirror of parent's enemy king;
@@ -976,21 +997,21 @@ function Position:move(move, val, pooled)
     local ek = self._eking or self:eking_index()
     local ok = self._king or self:king_index()
     local nk, nek = nil, nil
-    if ek then nk = 119 - ek end
-    if ok then nek = 119 - (p == K and j or ok) end
+    if ek then nk = 121 - ek end
+    if ok then nek = 121 - (p == K and j or ok) end
     if pooled then
         -- Reuse the pooled object: set the new frame fields on it.
         child._b = nb
         child.score = -score
         child.wc = bc
         child.bc = wc
-        child.ep = 119 - ep
-        child.kp = 119 - kp
+        child.ep = 121 - ep
+        child.kp = 121 - kp
         child._king = nk
         child._eking = nek
         return child
     end
-    return Position.from_array(nb, -score, bc, wc, 119 - ep, 119 - kp, nk, nek)
+    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek)
 end
 
 function Position:value(move, b)
@@ -1004,28 +1025,29 @@ function Position:value(move, b)
     local p = b[i]
     local q = b[j]
 
+    -- Squares i/j are 1-based; pst tables are keyed 1-based (pst[piece][sq]).
     local pp = pst[p]
-    local score = pp[j + 1] - pp[i + 1]
+    local score = pp[j] - pp[i]
     if q < 0 then
-        score = score + pst[-q][j + 1] -- captured piece's PST value
+        score = score + pst[-q][j] -- captured piece's PST value
     end
 
     local kp = self.kp
     if j - kp < 2 and kp - j < 2 then
-        score = score + pst[K][j + 1]
+        score = score + pst[K][j]
     end
 
     if p == K and (j - i == 2 or i - j == 2) then
-        score = score + pst[R][math_floor((i + j) / 2) + 1]
-        score = score - pst[R][j < i and A1 + 1 or H1 + 1]
+        score = score + pst[R][math_floor((i + j) / 2)]
+        score = score - pst[R][j < i and A1 or H1]
     end
 
     if p == P then
         if A8 <= j and j <= H8 then
-            score = score + pst[Q][j + 1] - pst[P][j + 1]
+            score = score + pst[Q][j] - pst[P][j]
         end
         if j == self.ep then
-            score = score + pst[P][j + S + 1]
+            score = score + pst[P][j + S]
         end
     end
     return score
@@ -1042,7 +1064,7 @@ local ttG = {}
 local ttM = {}
 
 local function tp_set(key, depth, score, gamma, move)
-    local s = key % TT_SIZE
+    local s = key % TT_SIZE + 1
     ttK[s] = key
     ttD[s] = depth
     ttS[s] = score
@@ -1052,7 +1074,7 @@ end
 
 -- Probe the TT. Returns (score, depth, move) when an entry exists, else nil.
 local function tp_get(key)
-    local s = key % TT_SIZE
+    local s = key % TT_SIZE + 1
     if ttK[s] == key then
         return ttS[s], ttD[s], ttM[s]
     end
@@ -1189,8 +1211,8 @@ local function bound(pos, gamma, depth)
     -- after a legal move is found), and the terminal-score check above catches
     -- already-decided positions.
     if had_entry and ed >= depth and (
-            es < ttG[key % TT_SIZE] and es < gamma or
-                    es >= ttG[key % TT_SIZE] and es >= gamma) then
+            es < ttG[key % TT_SIZE + 1] and es < gamma or
+                    es >= ttG[key % TT_SIZE + 1] and es >= gamma) then
         return es
     end
 
@@ -1319,7 +1341,8 @@ local function parse(c)
 end
 
 local function render(i)
-    local rank, fil = math_floor((i - A1) / 10), (i - A1) % 10
+    -- `i` is a 0-based public square (A1=91). Use the 0-based A1 constant.
+    local rank, fil = math_floor((i - 91) / 10), (i - 91) % 10
     return string.char(fil + string_byte('a')) .. tostring(-rank + 1)
 end
 
@@ -1429,7 +1452,8 @@ function sunfish.move_2_cell(cell)
 end
 
 function sunfish.cell_2_move(move)
-    return parse(string_sub(move, 1, 2))
+    -- parse() returns 1-based (internal convention); public API is 0-based
+    return parse(string_sub(move, 1, 2)) - 1
 end
 
 return sunfish

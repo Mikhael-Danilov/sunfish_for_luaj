@@ -30,7 +30,7 @@ local function build_board(placements)
 end
 
 local function render(i)
-  local rank, fil = math.floor((i - 91)/10), (i - 91) % 10
+  local rank, fil = math.floor((i - 92)/10), (i - 92) % 10
   return string.char(fil + string.byte("a")) .. tostring(-rank + 1)
 end
 

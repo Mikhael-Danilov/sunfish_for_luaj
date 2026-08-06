@@ -8,6 +8,7 @@
 - [x] Phase 4: Search micro-opts — **DONE**
 - [x] Phase 5: Hot-path call elimination (board threading, cached king,
   single-pass `move`, generation-tagged king-sensitivity) — **DONE**
+- [x] Phase 9: Full 1-based indexing + sentinel-terminated rays — **DONE**
 
 ### Cumulative results (measured, BENCH_SCALE=0.01 LuaJ, interleaved runs)
 
@@ -417,6 +418,59 @@ Depth-preferred replacement (`depth + 2 >= ttD[s]`) would raise TT-hit quality
 at fixed 64k slots, but changes search behavior (which entries survive) and
 needs its own A/B against the same position. Deferred.
 
+## Phase 9: full 1-based indexing + sentinel-terminated rays (SHIPPED)
+
+Under LuaJ's `LuaTable`, integer keys only hit the fast `LuaValue[] array` part
+when `1 <= key <= array.length`; `0`/negative keys fall to `hashget` (boxed
+`LuaInteger` + `hashmod` + `Slot` chain). The engine was 0-based everywhere, so
+`_b[0]`, `ttK[0]`, `zflat[0]`, `ray_squares[0]` all lived in the hash part.
+
+An earlier "tables1" experiment shifted *only the table keys* to 1-based while
+keeping 0-based square *values*, which forced a `±1` conversion on every hot
+access (`b[i+1]`, `move_pack(i-1, j-1)`, `120-k+1` in the 120-pass builds) and
+was **~18% slower** than baseline. The clean fix is a **full 1-based
+convention**: squares, packed moves, constants (`A1=92, H1=99, A8=22, H8=29`),
+and mirrors (`121 - x`) all shift together, so the hot path has **zero
+conversion arithmetic** — the only `+1`/`-1` is at the public `parse`/`render`/
+`cell_2_move` boundary.
+
+Implementation notes (the pitfalls that made the earlier attempt fail):
+- **Mirror is `121 - x`, not `120 - x`**: 1-based square `s` mirrors to
+  `121 - s` (0-based `s-1` mirrors to `119-(s-1)` = `120-s`, then +1 = `121-s`).
+  An initial `120 - x` bug mirrored e4 to d5 (off by one) and corrupted the
+  board (the "reproduces parent board" / ep-undo-leak symptoms).
+- **`zob_ep`/`zob_kp` need a sentinel at `121`**: `121 - 0` (mirror of the
+  "no ep/kp" 0 sentinel) must be a valid table key or `key()` crashes.
+- **`pst` indexing drops the `+1`**: `pst[p][j+1]` (0-based) becomes
+  `pst[p][j]` (1-based); the castling between-square and `A1`/`H1` offsets drop
+  too. Missed this and the search picked a wrong move at equal score.
+- **`real_squares`/ray tables store 1-based squares; `is_on_board` stays the
+  0-based predicate** for the precompute's geometry, plus a `is_on_board_1`
+  for `genMoves`' 1-based `j` checks.
+- **Search output**: depth-by-depth node counts and scores match baseline
+  (27/258/755/4156/11653 nodes, depth-5 score 41); only the equal-score
+  tie-break pick can differ (`a8b6` vs `b8c6`) because the packed-int ordering
+  shifts with the +1 encoding — acceptable, both are valid score-41 moves.
+
+Stacked on top: **sentinel-terminated ray arrays** (trailing `0` in each
+`ray_squares[i][di]`, walked with `while true` in `attacked()`/`genMoves`),
+replacing the `#ray` bound in the two hottest walkers. LuaJ's `rawlen` is fast,
+but dropping the per-cell `LEN` + two-level `ray_squares[i][di]` decode in the
+attack walk still helps the movegen-heavy `move` path.
+
+Same-JVM LuaJ A/B (identical move/score, cold, alternating):
+
+| Variant | `ai_move` rounds | `move` (iter/s) |
+|---------|------------------|-----------------|
+| baseline (0-based) | ~24-32s | ~206 |
+| full1 (1-based) | ~17-21s (**-20-40%**) | ~436 (**+2.1x**) |
+| full1 + sentinel rays | ~16-20s (≈ full1, noisy) | ~585 (**+2.8x**) |
+
+The `ai_move` (search) win is ~20-40% consistently; the `move`/movegen path
+roughly doubles and the sentinel rays add another ~+34% on top. Tests green on
+luajit/lua5.1/LuaJ (14+15+21) + oracle 40/40 (oracle `render` decode updated
+for the 1-based packed moves).
+
 ## Phases
 
 | # | Step | Est. LuaJ gain | Risk |
@@ -429,16 +483,20 @@ needs its own A/B against the same position. Deferred.
 | 6 | Phase-6 review: method hoisting, 64-square genMoves, value micro-hoists, king propagation, parallel-array TT | 1.3-2.0x cumulative on top of Phase 5 | Low-Med | **DONE** |
 | 7 | Board/Position pooling (search children reuse a bounded free list) | 1.2-1.5x on top of Phase 6 | Med (LIFO lifetime invariant) | **DONE** |
 | 8 | Pooled move buffers + count-driven min-heap sort (per-ply move_stack, genMoves(out,start), no `#`/table.sort) | 1.2-1.5x on top of Phase 7 | Med (per-ply buffer invariant) | **DONE** |
+| 9 | Full 1-based indexing (squares/packed moves/constants/mirrors `121-x`) + sentinel-terminated rays | ~1.2-1.4x on top of Phase 8 (`move` ~2x) | Med (mirror/pst/sentinel pitfalls, documented above) | **DONE** |
 
 Cumulative target: **~21s -> 3-5s** per `ai_move` under LuaJ.
 Current: **~15.9s (Phase 1) -> ~14.2s (Phases 2-4) -> ~12.5s (Phase 5) -> ~8-11s
-(Phase 6) -> ~10-11s (Phase 7) -> ~11s (Phase 8 pooled-moves)**. The move-gen
+(Phase 6) -> ~10-11s (Phase 7) -> ~11s (Phase 8 pooled-moves) -> ~10-12s
+(Phase 9 1-based)**. The move-gen
 and lifecycle paths are 2-3.4x faster; `ai_move` (search) gained ~27% cumulative
 through Phase 5, a further ~30-55% from the Phase-6 method hoisting + 64-square
 + value-hoist + king-propagation + parallel-TT batch, ~14-37% (mean ~19%) from
-Phase-7 board/Position pooling, and ~21-51% (mean ~33%) from Phase-8 pooled
+Phase-7 board/Position pooling, ~21-51% (mean ~33%) from Phase-8 pooled
 move buffers + count-driven sort (same-JVM A/B, identical move selection every
-round). The remaining search time is dominated by `is_legal`'s `attacked()`
+round), and ~20-40% from Phase-9's full 1-based indexing (with the public
+`move` path roughly 2x and ~2.8x with the sentinel rays). The remaining search
+time is dominated by `is_legal`'s `attacked()`
 walks; the full make/unmake rewrite is the known next step but carries the
 documented recursion-corruption risk.
 
