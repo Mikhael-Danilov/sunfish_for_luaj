@@ -811,8 +811,12 @@ function Position:is_legal(move, king, sens, b, sens_g)
     local p = b[i]
     local q = b[j]
 
-    -- Standard chess has no king captures.
-    if q == -K then
+    -- Standard chess has no king captures, and no piece may land on the own
+    -- king. A move onto either king is illegal. (The own-king case was missed:
+    -- only q == -K was rejected, so a move like h1e1 with the king on e1
+    -- overwrote the king and was wrongly accepted — caught by the selfplay
+    -- correctness gate.)
+    if q == K or q == -K then
         return false
     end
 
@@ -1568,12 +1572,25 @@ local function search(pos, maxn)
         end
     end
 
+    -- Validate the root move before returning it. The TT can return a move
+    -- stored for a different transposition (the root slot can be overwritten
+    -- by a deeper search), and a full-key collision would make it illegal here.
+    -- The correctness gate (selfplay, stockfish-validated) caught exactly this:
+    -- an illegal h1e1 was returned. Fall back to nil (engine passes) if the
+    -- move isn't legal. Use the full check (sens=nil) so no short-circuit can
+    -- mask an illegal move; ensure_arr() materializes _b for public positions.
+    local root_b = pos:ensure_arr()
     if rootmove ~= nil then
-        return rootmove, score
+        if m_is_legal(pos, rootmove, m_king_index(pos), nil, root_b, nil) then
+            return rootmove, score
+        end
+        rootmove = nil
     end
     local _, _, ttmove = tp_get(m_key(pos))
     if ttmove ~= nil then
-        return ttmove, score
+        if m_is_legal(pos, ttmove, m_king_index(pos), nil, root_b, nil) then
+            return ttmove, score
+        end
     end
     return nil, score
 end
@@ -1591,10 +1608,27 @@ local function parse(c)
     return A1 + fil - 10 * rank
 end
 
+-- Internal 1-based square -> coordinate name. Takes a 1-based internal square
+-- (A1=92, Phase 9 convention); the pre-Phase-9 0-based A1=91 made the engine's
+-- own move rendering off by one (ai_move returned a8b6 for the real g1f3).
 local function render(i)
-    -- `i` is a 0-based public square (A1=91). Use the 0-based A1 constant.
+    local rank, fil = math_floor((i - 92) / 10), (i - 92) % 10
+    return string.char(fil + string_byte('a')) .. tostring(-rank + 1)
+end
+
+-- Public 0-based coordinate helpers (backward-compatible with the original
+-- sunfish API: A1=91). They convert between the 0-based public square index
+-- and the coordinate name; internal code uses the 1-based render() above.
+local function render_public(i) -- 0-based public square (A1=91)
     local rank, fil = math_floor((i - 91) / 10), (i - 91) % 10
     return string.char(fil + string_byte('a')) .. tostring(-rank + 1)
+end
+
+local function parse_public(name) -- coordinate name -> 0-based public square
+    local p, v = string_sub(name, 1, 1), string_sub(name, 2, 2)
+    if not (p and v and tonumber(v)) then return nil end
+    local fil, rank = string_byte(p) - string_byte('a'), tonumber(v) - 1
+    return 91 + fil - 10 * rank
 end
 
 --//RPD interface:
@@ -1696,7 +1730,7 @@ function sunfish.ai_move(game)
     game = game:move(move)
     game:ensure_board()
 
-    return game, render(119 - move_from(move)) .. render(119 - move_to(move)), score
+    return game, render(121 - move_from(move)) .. render(121 - move_to(move)), score
 end
 
 -- Position query helpers (backward-compatible additions).
@@ -1717,12 +1751,13 @@ function sunfish.legal_moves(game)
 end
 
 function sunfish.move_2_cell(cell)
-    return render(cell)
+    -- Public API: 0-based square index (A1=91), matching the original sunfish.
+    return render_public(cell)
 end
 
 function sunfish.cell_2_move(move)
-    -- parse() returns 1-based (internal convention); public API is 0-based
-    return parse(string_sub(move, 1, 2)) - 1
+    -- Public API: coordinate name -> 0-based square index (A1=91).
+    return parse_public(string_sub(move, 1, 2))
 end
 
 return sunfish

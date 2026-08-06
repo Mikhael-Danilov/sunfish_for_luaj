@@ -33,6 +33,15 @@
   Phase 9 (both 11.6k nodes); A+B+C+D ~19% CPU win over item 2 (both 15.8k
   nodes) — the doc's shipped claims confirmed; the earlier "ABCD slower"
   reading was a node-count artifact.
+- [x] Coordinate-render fix (Phase-9 regression): `render` was left 0-based
+  (A1=91) after the full 1-based switch, so `ai_move`'s move string and the
+  internal render were off by one (returned `a8b6` for the real `g1f3`). Fixed
+  by making `render` 1-based (A1=92) + `ai_move` mirror `121-x`, keeping the
+  public `move_2_cell`/`cell_2_move` 0-based (backward-compatible). Also
+  fixed `is_legal` to reject moves onto the OWN king (only `-K` was rejected),
+  and `search()` now validates the root move before returning it. All caught
+  by the new stockfish-validated selfplay correctness gate. See "Correctness
+  gate" below.
 
 > **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
 > `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
@@ -1114,6 +1123,34 @@ time is dominated by `is_legal`'s `attacked()`
 walks; the full make/unmake rewrite is the known next step but carries the
 documented recursion-corruption risk.
 
+## Correctness gate: stockfish-validated self-play (new)
+
+`benchmarks/selfplay_correctness.py` drives the engine for up to 100 plies (or
+until the game ends naturally), converts each `ai_move` display string to the
+real-board parent-frame move (tracking the engine's per-ply rotation), and
+validates every move with Stockfish 18 over UCI (the FEN side-to-move flip
+check). Exit 0 only if every move is legal; the engine's own `legal_moves()`
+is the secondary check.
+
+**What it caught (fixed in this commit):**
+1. **Coordinate-render Phase-9 regression** — `render` was left 0-based
+   (A1=91) after the full 1-based switch. `ai_move` returned `a8b6` for the
+   real `g1f3`, and all public coordinates were off by one. Fixed: `render`
+   is 1-based (A1=92), `ai_move` mirror is `121-x`, public `move_2_cell`/
+   `cell_2_move` stay 0-based (backward-compatible).
+2. **`is_legal` own-king bug** — only `q == -K` (enemy king) was rejected, so a
+   move onto the OWN king (e.g. `h1e1` with the king on e1) overwrote the king
+   and was accepted. Fixed: reject `q == K or q == -K`.
+3. **Root-move validation** — `search()` now validates the returned root move
+   (and the TT re-probe fallback) with a full `is_legal` check before playing
+   it; an illegal TT-sourced move falls back to nil (the engine passes).
+
+**Gate result**: the engine self-plays to a legal game — the 100-ply run ended
+at ply 20 with a legitimate checkmate (`e5h2`, stockfish confirms
+`bestmove (none)` on `r1b1kb1r/ppp2pp1/4p1p1/8/1n4P1/8/PPPP1P1q/R1BQ1RK1`),
+every move legal. This is now a committed correctness gate alongside the
+oracle/perft/endgame suites.
+
 ## Validation per phase
 
 - `luajit` + `lua5.1` run `tests/test_sunfish.lua` (14) and
@@ -1123,6 +1160,8 @@ documented recursion-corruption risk.
 - `BENCH_SCALE=0.01 benchmarks/run_luaj.sh` — record `ai_move` ms / `move` iter/s.
 - Self-play: `lua selfplay.lua <engine_dir> <plies>` — same-game paired timing
   comparison (primary benchmark for search-path changes).
+- Correctness: `python3 benchmarks/selfplay_correctness.py [--plies 100]` —
+  stockfish-validated self-play gate (all moves legal, or natural game end).
 
 ## Android specifics
 
