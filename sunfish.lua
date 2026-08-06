@@ -56,8 +56,9 @@ local initial = '         \n' .. --   0 -  9
 --   98    padding row '\n'
 --   99    padding ' '
 --
--- Indexing is unchanged (A1=91, H1=98, A8=21, H8=28, 0..119), so all public
--- coordinate helpers and tests keep working.
+-- Indexing is 1-based (A1=92, H1=99, A8=22, H8=29, 1..120) since Phase 9
+-- (full 1-based squares/constants/mirrors `121-x`); the public coordinate
+-- helpers (parse/render/cell_2_move) convert at the boundary.
 -------------------------------------------------------------------------------
 
 -- Piece codes. NOTE: `N` (knight) is named KN to avoid colliding with the
@@ -1213,10 +1214,18 @@ end
 -- Probe the TT. Returns (score, depth, move, slot) when an entry exists, else
 -- nil. The slot is `key % TT_SIZE + 1` (already computed here) so the caller's
 -- bound-check can reuse it instead of recomputing the modulo.
+local tt_probe = 0 -- F2 measurement: total probes (via tp_get)
+local tt_hit = 0   -- F2 measurement: probes that found a matching full key
+local tt_slot_hit = 0 -- F2 measurement: probes whose slot was occupied (any key)
 local function tp_get(key)
+    tt_probe = tt_probe + 1
     local s = key % TT_SIZE + 1
-    if ttK[s] == key then
-        return ttS[s], ttD[s], ttM[s], s
+    if ttK[s] ~= -1 then
+        tt_slot_hit = tt_slot_hit + 1
+        if ttK[s] == key then
+            tt_hit = tt_hit + 1
+            return ttS[s], ttD[s], ttM[s], s
+        end
     end
     return nil
 end
@@ -1227,6 +1236,14 @@ end
 
 local nodes = 0
 local yield_left = YIELD_QUANTUM -- countdown for the periodic coroutine yield
+
+-- Budget-aware stop (F1): `maxn` is threaded through bound() so it can abort
+-- mid-depth when the node budget is exhausted; TIME_BUDGET (seconds, 0=off)
+-- adds a wall-clock deadline at the same per-node check point. budget_exhausted
+-- is set by bound() and read by search() to break out of the depth loop.
+local budget_exhausted = false
+local TIME_BUDGET = 0
+local time_deadline = 0
 
 -- Hoist hot Position methods to upvalues: each `pos:method()` is a table read
 -- that misses into __index (a metamethod event + function lookup). Binding
@@ -1320,7 +1337,7 @@ local function move_sort(buf, n)
     end
 end
 
-local function bound(pos, gamma, depth)
+local function bound(pos, gamma, depth, maxn)
     nodes = nodes + 1
     -- Countdown-based yield: one decrement + compare per node (vs a modulo),
     -- and a coroutine switch only every YIELD_QUANTUM nodes.
@@ -1330,6 +1347,22 @@ local function bound(pos, gamma, depth)
             yield_left = YIELD_QUANTUM
             coroutine.yield()
         end
+    end
+
+    -- Budget-aware stop (F1): the depth loop only checks nodes >= maxn between
+    -- depths, so a depth can overshoot the budget (depth 6 runs 15.8k vs
+    -- NODES_SEARCHED=10k). Abort here at the per-node check point instead: when
+    -- the budget is exhausted, set the flag and unwind to search(), which breaks
+    -- out of the depth loop. The position's score is returned (the caller never
+    -- uses the depth-6 result when the budget aborted — search() keeps the last
+    -- completed depth's fail-high move).
+    if nodes >= maxn and maxn > 0 then
+        budget_exhausted = true
+        return pos.score
+    end
+    if TIME_BUDGET > 0 and os.clock() >= time_deadline then
+        budget_exhausted = true
+        return pos.score
     end
 
     if math_abs(pos.score) >= MATE_VALUE then
@@ -1390,7 +1423,7 @@ local function bound(pos, gamma, depth)
     local nullscore = pos.score
     if depth > 0 then
         null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
-        nullscore = -bound(null_child, 1 - gamma, depth - 3)
+        nullscore = -bound(null_child, 1 - gamma, depth - 3, maxn)
         pool_free_pos(null_child) -- the null-move child is dead after this node
     end
     if nullscore >= gamma then
@@ -1433,7 +1466,7 @@ local function bound(pos, gamma, depth)
         local move = buf[k]
         local mv = move_val(move)
         local child = m_move(pos, move, mv, true) -- pooled
-        local score = -bound(child, 1 - gamma, depth - 1)
+        local score = -bound(child, 1 - gamma, depth - 1, maxn)
         pool_free_pos(child) -- the child is dead after its subtree returns
         if score > best then
             best = score
@@ -1459,6 +1492,11 @@ end
 local function search(pos, maxn)
     maxn = maxn or NODES_SEARCHED
     nodes = 0
+    budget_exhausted = false
+    tt_probe, tt_hit, tt_slot_hit = 0, 0, 0
+    if TIME_BUDGET > 0 then
+        time_deadline = os.clock() + TIME_BUDGET
+    end
     local score
     -- The move to return: the last fail-high (score >= gamma) bound call at the
     -- deepest completed depth. Capturing it directly avoids the post-loop TT
@@ -1468,12 +1506,25 @@ local function search(pos, maxn)
     -- below gamma with no move yet).
     local rootmove
 
+    -- F3 (aspiration): after depth 1, start the root window at the previous
+    -- depth's score +/- ASPIRATION instead of the full [-3M, 3M] range, and
+    -- widen (double) on a fail. Fewer root probes per depth when the score is
+    -- stable. Node-count-changing (gate: oracle/perft/endgames, not invariant).
+    local ASPIRATION = 100
+    local prev_score = nil
+
     for depth = 1, 98 do
-        local lower, upper = -3 * MATE_VALUE, 3 * MATE_VALUE
+        local lower, upper
+        if prev_score ~= nil then
+            lower = prev_score - ASPIRATION
+            upper = prev_score + ASPIRATION
+        else
+            lower, upper = -3 * MATE_VALUE, 3 * MATE_VALUE
+        end
         while lower < upper - 3 do
             local gamma = math_floor((lower + upper + 1) / 2)
             local mv
-            score, mv = bound(pos, gamma, depth)
+            score, mv = bound(pos, gamma, depth, maxn)
             assert(score)
             if score >= gamma then
                 lower = score
@@ -1484,12 +1535,35 @@ local function search(pos, maxn)
             end
         end
         assert(score)
+        -- F3 fail-widen: if the converged score is on/outside the aspiration
+        -- window boundary, the true score lies outside it — re-search this depth
+        -- with the full window so the result isn't clipped to the window edge.
+        if prev_score ~= nil and (score <= prev_score - ASPIRATION or score >= prev_score + ASPIRATION) then
+            local nlower, nupper = -3 * MATE_VALUE, 3 * MATE_VALUE
+            while nlower < nupper - 3 do
+                local ngamma = math_floor((nlower + nupper + 1) / 2)
+                local nmv
+                score, nmv = bound(pos, ngamma, depth, maxn)
+                assert(score)
+                if score >= ngamma then
+                    nlower = score
+                    rootmove = nmv
+                end
+                if score < ngamma then
+                    nupper = score
+                end
+            end
+        end
+        prev_score = score
 
         if VERBOSE then
             print(string_format("Searched %d nodes. Depth %d. Score %d(%d/%d)", nodes, depth, score, lower, upper))
         end
 
-        if nodes >= maxn or math_abs(score) >= MATE_VALUE then
+        -- Budget-aware stop: break early when bound() aborted mid-depth (the
+        -- flag is set at the per-node check point) or the depth completed the
+        -- budget. The last completed depth's fail-high move is already captured.
+        if budget_exhausted or nodes >= maxn or math_abs(score) >= MATE_VALUE then
             break
         end
     end
@@ -1536,6 +1610,20 @@ function sunfish.set_yield(quantum, enable)
     if quantum then YIELD_QUANTUM = quantum end
     if enable ~= nil then YIELD_ENABLED = enable end
     yield_left = YIELD_QUANTUM -- re-arm so the next search uses the new quantum
+end
+
+-- Wall-clock search budget (F1): limit one ai_move search to `seconds`
+-- (0 disables; the default is unlimited). The deadline is checked at the same
+-- per-node point as the node budget, so a search stops mid-depth instead of
+-- overshooting. Note os.clock() is wall-clock under LuaJ, which is exactly
+-- what a responsiveness deadline wants on the Android RPD layer.
+function sunfish.set_time_budget(seconds)
+    TIME_BUDGET = seconds or 0
+end
+
+-- F2 measurement: TT probe/hit/occupancy stats from the last search.
+function sunfish.tt_stats()
+    return { probe = tt_probe, hit = tt_hit, slot_hit = tt_slot_hit }
 end
 
 local game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)

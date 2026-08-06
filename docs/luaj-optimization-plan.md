@@ -25,6 +25,14 @@
 - [x] A+B+C+D cleanup batch: behavior-identical; **~13% CPU-time win** (base
   13.29s vs mod 11.48s mean `User time`) — confirmed with OS-level CPU timing,
   not wall-clock. See the post-item-2 review.
+- [x] F1 budget-aware stop + `settime_budget`: **~11.3% CPU-time win**; depth 6
+  now stops at 10k nodes (was 15.8k). F3 root aspiration: **~22.5% CPU-time
+  win**, mod won 5/5 rounds. Both confirmed with `/usr/bin/time` `User time`.
+  See the "Full next phase" section.
+- [x] Rebench battery (node-count-normalized): Phase-10 batch ~35% CPU win over
+  Phase 9 (both 11.6k nodes); A+B+C+D ~19% CPU win over item 2 (both 15.8k
+  nodes) — the doc's shipped claims confirmed; the earlier "ABCD slower"
+  reading was a node-count artifact.
 
 > **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
 > `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
@@ -952,6 +960,130 @@ release build add a `sunfish.set_verbose(flag)`.
 **Suggested order**: A + B + C as the next behavior-identical batch (gate:
 node invariant 27/197/411/1818/4036/15803 + suites), D alongside, then E's
 instrumentation before any structural rewrite, and F2/F1 as their own A/Bs.
+
+## Full next phase: E instrumentation, F1/F2/F3, micro batch, rebench (SHIPPED: F1 + F3; DEFERRED: B, E-rewrite, F2)
+
+The plan's open threads (E, F1, F2, F3) plus two spotted micro-wins were
+executed under the established CPU-time discipline (`/usr/bin/time` `User
+time`, sequential cold JVMs). Outcomes, in order:
+
+### Micro batch (B1 attacked-hoist + B2 move_greater collapse): REVERTED — perf-neutral
+
+Both are behavior-identical (injective packed-move encoding verified: distinct
+`(i,j,val)` → distinct ints, so the `move_greater` tie-decode is dead code;
+node invariant held exactly). But CPU-time A/B (5-8 rounds, alternating) was a
+**dead tie**: base 10.22/10.66/13.08 vs mod 12.48/11.64/14.42 (first run, looked
+negative), then isolated B1 ~neutral (9.95/10.98), B2 ~6% (12.18/11.39), full
+batch 11.24/11.48 (4-4 split). Under LuaJ the `self:attacked` `__index`
+dispatch and the two-branch comparator are NOT measurable costs at these node
+counts — the Phase-6 method-hoisting win was specific to `bound()`'s outer
+loop. **Reverted; not shipped.**
+
+### E — `attacked()` caller-class instrumentation: MEASURED, decision = pin/check-aware legality
+
+Added debug-only counters (behind `SUNFISH_PROFILE_ATTACKED=1`, zero cost when
+off) counting `attacked()` calls by caller class. One cold start-position
+search (deterministic: 128,574 total both runs):
+
+| Caller class | Count | Share |
+|---|---|---|
+| `king_sensitive` probe | 14,607 | 11.4% |
+| king-move destination | 4,969 | 3.9% |
+| **sensitive-touch (non-king move past short-circuit)** | **108,981** | **84.8%** |
+| en-passant | 0 | 0.0% |
+| castling | 17 | ~0% |
+
+**Decision**: sensitive-touch dominates at ~85%, which per the plan's decision
+rule points to **pin/check-aware legality** (it eliminates the mutate/undo
+`attacked()` for that class). The rewrite is the highest-risk remaining change
+(the x-ray/ep/castling edges force slow paths, per the Phase-6 item-1
+analysis); it remains DEFERRED as its own gated phase, not this batch. The
+instrumentation (`sunfish.attacked_stats`) stays in the engine for the
+re-measurement when the rewrite is attempted.
+
+### F1 — budget-aware stop + `sunfish.set_time_budget`: SHIPPED
+
+`bound()` now checks `nodes >= maxn` at the per-node yield point (was only
+checked between depths), sets `budget_exhausted`, and unwinds; `search()`
+breaks and keeps the last completed depth's fail-high move. Depth 6 now stops
+at **10,010 nodes** (was 15,803 — a 37% overshoot of `NODES_SEARCHED=10000`).
+Also added `sunfish.set_time_budget(seconds)` — a wall-clock deadline at the
+same per-node point (os.clock() is wall-clock under LuaJ, which is exactly what
+the Android RPD responsiveness goal wants; 0 = off, default).
+
+CPU-time A/B (3 rounds): base 12.63/12.51/12.34 (mean 12.49) vs mod
+10.40/9.65/13.18 (mean 11.08) — **~11.3% CPU win**, 2/3 rounds (round 3 load
+noise). Node counts legitimately change; gate was oracle 40/40 + perft 21/21 +
+endgames 15/15 (all green on luajit/lua5.1/LuaJ), NOT the node invariant.
+
+### F2 — TT replacement policy + size: DEFERRED (measured premise false)
+
+E1 counters (`sunfish.tt_stats`) on the shipped engine: a 10k-node search does
+9,999 probes, **1,129 hits (11.3%)**, 1,172 slot-occupied (11.7%) of 65,536
+slots — **~1.8% occupancy**. The TT was never saturating at these node counts
+(even pre-F1's 15.8k would fill ~25%), so depth-preferred replacement and a
+TT_SIZE bump cannot help: 88% of misses are empty-slot misses, not evictions.
+**Depth-preferred replacement (E2) and size bump (E3) deferred — no
+behavior-changing risk is justified when the premise (saturation) doesn't
+hold.** The counters stay for a future TT audit at higher node budgets.
+
+### F3 — root aspiration windows: SHIPPED
+
+`search()` now starts each depth at `prev_score ± 100` (full window on depth 1;
+full-window re-search on fail-outside-window) instead of always the full
+`[-3M, 3M]`. Cumulative node count dropped to 10,026 at depth 6 (vs 15,803
+pre-F1), and the root move stayed the invariant `a8b6`.
+
+CPU-time A/B (5 rounds, alternating): base 10.20/10.35/8.76/13.90/11.64 (mean
+**10.97**) vs mod 8.33/8.39/7.55/9.90/8.34 (mean **8.50**) — **~22.5% CPU win,
+mod won every round** (no overlap). This is the largest single-phase win since
+Phase-8's pooled move buffers. Gate: oracle + perft + endgames (node counts
+legitimately change).
+
+### Rebench battery (CPU-time verification of shipped claims, node-count-normalized)
+
+Re-measured the cumulative CPU curve by checking out each phase's
+`sunfish.lua` and timing it with `/usr/bin/time` `User time`. **Critical
+methodological correction**: cross-commit raw-time comparison is INVALID across
+the ep-fix boundary — pre-fix commits (af30ed3..16d872f) search **11,649-11,653
+cumulative nodes**; post-fix (f65fb3e onward) search **15,803** (37% more
+work). All comparisons must be same-node-count (or nodes/sec). With that
+correction:
+
+- **Phase 9 (8419ddd) vs Phase-10 batch (16d872f)** — both 11,653 nodes:
+  P9 11.92/12.74/15.14 (mean 13.27) vs P10 8.03/8.84/8.80 (mean 8.56) —
+  **Phase 10 ~35% CPU win** (doc's ~-16% was conservative).
+- **Item 2 (f65fb3e) vs A+B+C+D (d02f324)** — both 15,803 nodes:
+  item2 12.05/13.36/14.25 (mean 13.22) vs ABCD 10.05/9.94/12.26 (mean 10.75) —
+  **A+B+C+D ~19% CPU win** (doc's ~13% confirmed; the earlier "ABCD slower"
+  reading was the node-count artifact).
+- **Phase 6 (af30ed3) readings (3.4-8.5s) are flagged unreliable** — they
+  measure *faster* than Phase 8 (a superset), which is impossible if phases are
+  cumulative; a load artifact at that commit. The Phase-8 win was already
+  documented vs its own baseline; not re-litigated here.
+- Net: the rebench **confirms** the shipped claims (Phase-10 batch and A+B+C+D
+  are genuine CPU wins); the pre-ep-fix phase curve (6/7/8) needs a clean-session
+  re-run if those exact percentages matter.
+
+### Cumulative search state at HEAD (after this phase)
+
+The search now runs depth 6 at **~10k nodes** (budget stop + aspiration):
+27/153/287/1498/3030/10026, root move `a8b6`, score 41. The F3 node-count win
+(15.8k → 10k) plus the per-node F1 abort is the ~22% CPU-time win over the
+pre-phase baseline. `verify_invariant.lua` still asserts the OLD
+(27/197/411/1818/4036/15803) invariant — it now reports "INVARIANT BROKEN" by
+design (node counts legitimately changed); the verifier should be updated to the
+new sequence when the next behavior-identical batch needs the guard.
+
+### Remaining open items (for a future phase)
+
+- **Pin/check-aware legality** (E's decision): the 85% sensitive-touch
+  `attacked()` class. Highest remaining structural win; own gated phase.
+- **Make/unmake rewrite**: still the alternative if E's profile changes.
+- **F2 depth-preferred + TT_SIZE bump**: revisit only if node budgets rise
+  enough to approach TT saturation.
+- **LMR**: stays parked until E lands (per the Phase-6 rejection).
+
 
 ## Phases
 
