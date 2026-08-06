@@ -18,6 +18,10 @@
   `rotate()` now clears `ep` and `is_legal` verifies `b[j+S] == -P`. Genuine ep
   still works; suites green. Search now reaches depth 6 (~15.8k nodes) — see
   "En-passant undo bug" note below.
+- [x] Item 2 (dual-hash incremental Zobrist): **re-shipped after the ep fix** —
+  now behavior-identical (invariant 27/197/411/1818/4036/15803, `a8b6`); A/B
+  won 4 of 5 rounds (mean ~-7%); O(1) `key()` for search children. See the
+  Phase-10 section.
 
 ### Cumulative results (measured, BENCH_SCALE=0.01 LuaJ, interleaved runs)
 
@@ -707,26 +711,35 @@ score 41) held exactly, and the full suite stayed green
   `legal_moves()` list. Removed the now-unused `ttfind`. Public-API behavior
   unchanged (legal/illegal/garbage moves all covered by `test_sunfish`).
 
-### Reverted: item 2 (dual-hash incremental Zobrist)
+### Item 2 (dual-hash incremental Zobrist): reverted, then re-shipped after the ep fix
 
 The dual-hash was implemented and verified correct on **every** `move()`/
 `rotate()` edit path (quiet, capture, castling, en passant, promotion; pooled
 and non-pooled; 200-position random walk all matched the full 120-pass recompute).
 The O(1) rotate (`child._bh = parent._mh`) and O(1) move deltas are sound.
 
-**But it is not behavior-identical in the real search: node counts 11651 vs
-11653.** The root cause is a **pre-existing `_b` corruption** the original
-per-call `key()` masked: `is_legal`'s en-passant in-place undo writes `-P` to
+**First attempt reverted**: it was not behavior-identical in the real search
+(node counts 11651 vs 11653) because of a **pre-existing `_b` corruption** the
+per-call `key()` masked: `is_legal`'s en-passant in-place undo wrote `-P` to
 `j + S` unconditionally, which is only correct in a true en-passant setup; on
-the search's pooled rotate/move children a spurious pawn leaks into `_b` (an
-extra `P@d7` in the dump). The original `key()` re-hashes the *current*
-(mutated) `_b`, so it was internally consistent; a cached `_bh` hashes the
-clean creation board and diverges by one piece (constant `zflat` delta
-445325827). The incremental hash is unsafe until that `is_legal` undo (and the
-make/unmake rewrite it belongs to) is fixed. Reverted to the full 120-pass
-`key()`; the invariant and node counts are exact again. This is a concrete
-instance of the plan's documented "is_legal in-place undo (highest-risk)" risk,
-and a prerequisite for any future cached-hash scheme.
+the search's pooled rotate/move children a spurious pawn leaked into `_b` (an
+extra `P@d7`). The cached `_bh` hashed the clean creation board and diverged
+from the mutated `_b` by one piece (constant `zflat` delta 445325827). Reverted
+to the full 120-pass `key()`.
+
+**Root-caused and fixed** (see the ep-undo note below): `rotate()` (the
+null-move child) mirrored a stale `ep`, producing bogus ep moves + board
+corruption. With that fixed, the dual-hash was **re-applied and is now
+behavior-identical**: the node-count invariant matches the post-fix baseline
+exactly (27/197/411/1818/4036/15803, `a8b6`), a 300-position random walk
+(move + rotate children) matches the full recompute every time, and all suites
+are green (14+15+21 + oracle 40/40).
+
+**A/B (cold `ai_move`, same-JVM, alternating, `BENCH_SCALE=0.01`, post-fix
+baseline vs dual-hash):** mod won 4 of 5 rounds (R1 -3%, R2 -23%, R3 +6%, R4
+-17%, R5 -1%), mean ~-7%, identical `a8b6`/score every round. The O(1) `key()`
+for search children (vs the 120-pass) is a small but consistent search-path
+win; **SHIPPED**.
 
 ### En-passant undo bug: root-caused and fixed (post-Phase-10)
 

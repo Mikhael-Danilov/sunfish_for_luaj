@@ -315,6 +315,7 @@ local slider_dirs_by_piece = {
 -------------------------------------------------------------------------------
 local zob = {}
 local zflat = {}
+local zmirror = {}
 local zob_wc = { 0, 0 }
 local zob_bc = { 0, 0 }
 local zob_ep = {}
@@ -344,6 +345,20 @@ do
     for pc = -6, 6 do
         for sq = 0, 119 do
             zflat[(pc + 6) * 120 + sq + 1] = zob[pc][sq]
+        end
+    end
+    -- Mirror-hash table for the dual-hash incremental Zobrist (item 2):
+    --   zmirror[(pc+6)*120 + sq] == zflat[(-pc+6)*120 + (121-sq)]
+    -- i.e. the contribution that a piece `pc` at 1-based square `sq` makes to
+    -- the hash of a position obtained by rotating this one (mirror `121-sq` +
+    -- negate `-pc`). The child square `121-sq` is already 1-based, so zflat's
+    -- index is (pc+6)*120 + (121-sq) with NO extra +1. With this, the board
+    -- hash of a rotated child is the parent's `_mh` (maintained alongside
+    -- `_bh`), giving an O(1) rotate.
+    zmirror = {}
+    for pc = -6, 6 do
+        for sq = 1, 120 do
+            zmirror[(pc + 6) * 120 + sq] = zflat[(-pc + 6) * 120 + (121 - sq)]
         end
     end
     zob_wc[1], zob_wc[2] = rnd(), rnd()
@@ -379,12 +394,17 @@ function Position.new(board, score, wc, bc, ep, kp)
 end
 
 -- Internal constructor: position with an integer array board (_b).
--- Optional trailing args thread the cached king indices through search:
+-- Optional trailing args thread the cached king indices and dual-hashes
+-- through search:
 --   _king  = index of the side-to-move's king (code K)
 --   _eking = index of the enemy king (code -K)
--- These avoid the up-to-120-square scan in king_index()/eking_index() on every
--- fresh search position.
-function Position.from_array(b, score, wc, bc, ep, kp, nk, nek)
+--   _bh    = board hash (sum of zflat over pieces in the current frame)
+--   _mh    = mirror hash (sum of zmirror over pieces; == what _bh becomes
+--            after a pure rotation)
+--   _fh    = flag hash (wc/bc/ep/kp terms)
+-- These avoid the up-to-120-square scans/hash passes on every fresh search
+-- position.
+function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh)
     local self = setmetatable({}, Position)
     self._b = b
     self.score = score
@@ -394,6 +414,9 @@ function Position.from_array(b, score, wc, bc, ep, kp, nk, nek)
     self.kp = kp
     self._king = nk
     self._eking = nek
+    self._bh = bh
+    self._mh = mh
+    self._fh = fh
     return self
 end
 
@@ -438,6 +461,9 @@ local function pool_free_pos(self)
     self._key = nil
     self._king = nil
     self._eking = nil
+    self._bh = nil
+    self._mh = nil
+    self._fh = nil
     self.score = nil
     self.wc = nil
     self.bc = nil
@@ -448,32 +474,56 @@ local function pool_free_pos(self)
     end
 end
 
+-- Flag hash: the wc/bc/ep/kp contribution to the Zobrist key, computed from
+-- explicit flag values (the child's flags differ from the parent's after
+-- move()/rotate()). Used by the dual-hash incremental path.
+local function flag_hash(wc, bc, ep, kp)
+    local h = 0
+    if wc[1] then h = h + zob_wc[1] end
+    if wc[2] then h = h + zob_wc[2] end
+    if bc[1] then h = h + zob_bc[1] end
+    if bc[2] then h = h + zob_bc[2] end
+    if ep ~= 0 then h = h + zob_ep[ep] end
+    if kp ~= 0 then h = h + zob_kp[kp] end
+    return h
+end
+
 -- Compute (and cache) the integer key for a position. The key is stored on the
 -- position as `_key` so it is computed once per position, not per TT probe.
--- NOTE: an incremental (O(1)) dual-hash key was implemented and verified
--- correct on every move/rotate path, but reverted: the search exposes a
--- pre-existing `_b` corruption (an extra pawn leaks into a pooled child via a
--- path the per-call key() masked by re-hashing `_b`), so a cached board hash
--- is unsafe (node counts 11651 vs 11653 baseline). The full 120-pass re-hashes
--- the current `_b` and is immune. See the doc's Post-Phase-9 review.
+-- Search children carry `_bh`/`_mh`/`_fh` threaded through move()/rotate(), so
+-- this is O(1) for them; public positions (built from strings) fall back to
+-- the full 120-pass, which also populates the three hashes so their children
+-- become incremental.
+--
+-- NOTE: this was previously reverted because a pre-existing `_b` corruption
+-- (stale ep from the null-move rotate) made a cached board hash unsafe. That
+-- bug is now fixed (rotate() clears ep, is_legal guards the ep capture), so the
+-- cached hash is safe again — see the doc's "En-passant undo bug" note.
 function Position:key()
     local k = self._key
     if not k then
-        local b = self._b or self:ensure_arr()
-        local zf = zflat
-        local h = 0
-        for i = 1, 120 do
-            local pc = b[i]
-            -- Skip empty squares and the padding codes (98/99); only pieces hash.
-            if pc ~= EMPTY and pc ~= SP and pc ~= NL then h = h + zf[(pc + 6) * 120 + i] end
+        if self._bh then
+            k = (self._bh + self._fh) % 4294967296
+        else
+            local b = self._b or self:ensure_arr()
+            local zf = zflat
+            local zm = zmirror
+            local bh = 0
+            local mh = 0
+            for i = 1, 120 do
+                local pc = b[i]
+                -- Skip empty squares and the padding codes (98/99); only pieces hash.
+                if pc ~= EMPTY and pc ~= SP and pc ~= NL then
+                    bh = bh + zf[(pc + 6) * 120 + i]
+                    mh = mh + zm[(pc + 6) * 120 + i]
+                end
+            end
+            local fh = flag_hash(self.wc, self.bc, self.ep, self.kp)
+            self._bh = bh
+            self._mh = mh
+            self._fh = fh
+            k = (bh + fh) % 4294967296 -- keep it a 32-bit-range integer for cheap math
         end
-        if self.wc[1] then h = h + zob_wc[1] end
-        if self.wc[2] then h = h + zob_wc[2] end
-        if self.bc[1] then h = h + zob_bc[1] end
-        if self.bc[2] then h = h + zob_bc[2] end
-        if self.ep ~= 0 then h = h + zob_ep[self.ep] end
-        if self.kp ~= 0 then h = h + zob_kp[self.kp] end
-        k = h % 4294967296 -- keep it a 32-bit-range integer for cheap math
         self._key = k
     end
     return k
@@ -902,6 +952,11 @@ function Position:rotate(pooled)
     -- (a phantom pawn leaks into the pooled child). kp mirrors correctly (it is
     -- a king-past-square, not an ep flag).
     local ep, kp = 0, 121 - self.kp
+    -- Dual-hash threading (item 2): a pure rotation maps the board hash to the
+    -- parent's mirror hash, and vice versa (rotate twice = identity on the
+    -- mirror relation). Flags swap wc/bc and mirror kp (ep is cleared above).
+    local fh = flag_hash(self.bc, self.wc, 0, kp)
+    local bh, mh = self._mh, self._bh
     if pooled then
         child._b = nb
         child.score = -self.score
@@ -911,9 +966,12 @@ function Position:rotate(pooled)
         child.kp = kp
         child._king = nk
         child._eking = nek
+        child._bh = bh
+        child._mh = mh
+        child._fh = fh
         return child
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek)
+    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh)
 end
 
 function Position:move(move, val, pooled)
@@ -966,19 +1024,48 @@ function Position:move(move, val, pooled)
     end
     local r = 121 - j
     local s = 121 - i
+    -- Dual-hash threading (item 2): the child is the rotated parent plus sparse
+    -- edits, so child._bh = parent._mh + sum(edit deltas) and child._mh =
+    -- parent._bh + sum(edit deltas). Each edit at child square k replaces the
+    -- pure-rotation value rot_pc = -parent[121-k] with the actual new_pc.
+    -- Only meaningful when the parent already carries hashes (search path);
+    -- public positions leave them nil and key() falls back to the 120-pass.
+    local zf, zm = zflat, zmirror
+    local dbh, dmh = 0, 0
+    -- Zobrist contribution of a piece code at a 1-based square; EMPTY and the
+    -- padding codes contribute 0 (the real key() skips them), so an edit to or
+    -- from an empty square uses 0 on that side of the delta.
+    local function zc(z, pc, sq)
+        if pc ~= EMPTY and pc ~= SP and pc ~= NL then
+            return z[(pc + 6) * 120 + sq]
+        end
+        return 0
+    end
+    local function edit_hash(k, new_pc)
+        local rot_pc = -b[121 - k]
+        dbh = dbh + zc(zf, new_pc, k) - zc(zf, rot_pc, k)
+        dmh = dmh + zc(zm, new_pc, k) - zc(zm, rot_pc, k)
+    end
+    local has_hashes = self._bh ~= nil and self._mh ~= nil
     if p == K and math_abs(j - i) == 2 then
         -- Castling: rook origin and rook destination are extra edits. The
         -- rotated frame negates colors, so the rook lands as -R (enemy).
         local rook_from = j < i and A1 or H1
+        local rook_origin = 121 - rook_from
+        local rook_dest = 121 - kp
         for k = 1, 120 do
             if k == r then
                 nb[k] = -p
+                if has_hashes then edit_hash(k, -p) end
             elseif k == s then
                 nb[k] = EMPTY
-            elseif k == 121 - rook_from then
+                if has_hashes then edit_hash(k, EMPTY) end
+            elseif k == rook_origin then
                 nb[k] = EMPTY
-            elseif k == 121 - kp then
+                if has_hashes then edit_hash(k, EMPTY) end
+            elseif k == rook_dest then
                 nb[k] = -R
+                if has_hashes then edit_hash(k, -R) end
             else
                 local v = b[121 - k]
                 if v < 0 then
@@ -995,8 +1082,10 @@ function Position:move(move, val, pooled)
         for k = 1, 120 do
             if k == r then
                 nb[k] = dest
+                if has_hashes then edit_hash(k, dest) end
             elseif k == s then
                 nb[k] = EMPTY
+                if has_hashes then edit_hash(k, EMPTY) end
             else
                 local v = b[121 - k]
                 if v < 0 then
@@ -1009,7 +1098,9 @@ function Position:move(move, val, pooled)
             end
         end
         if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
-            nb[121 - (j + S)] = EMPTY -- en passant
+            local epk = 121 - (j + S)
+            nb[epk] = EMPTY -- en passant
+            if has_hashes then edit_hash(epk, EMPTY) end
         end
     end
     -- Thread king indices: child own king = mirror of parent's enemy king;
@@ -1021,6 +1112,12 @@ function Position:move(move, val, pooled)
     local nk, nek = nil, nil
     if ek then nk = 121 - ek end
     if ok then nek = 121 - (p == K and j or ok) end
+    local fh = flag_hash(bc, wc, 121 - ep, 121 - kp)
+    local bh, mh = nil, nil
+    if has_hashes then
+        bh = (self._mh + dbh) % 4294967296
+        mh = (self._bh + dmh) % 4294967296
+    end
     if pooled then
         -- Reuse the pooled object: set the new frame fields on it.
         child._b = nb
@@ -1031,9 +1128,12 @@ function Position:move(move, val, pooled)
         child.kp = 121 - kp
         child._king = nk
         child._eking = nek
+        child._bh = bh
+        child._mh = mh
+        child._fh = fh
         return child
     end
-    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek)
+    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek, bh, mh, fh)
 end
 
 function Position:value(move, b)
