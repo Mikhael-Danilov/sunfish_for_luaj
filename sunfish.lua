@@ -84,9 +84,9 @@ local VAL_BIAS = 2 ^ 22 -- half of the 23-bit value field
 -- `128 * 128` were recomputed on every call in the hot path).
 local VAL_SCALE = 2 ^ VAL_SHIFT
 local MOVE_MOD = 128 * 128
-local function move_pack(i, j, val)
-    return i * 128 + j + (val + VAL_BIAS) * VAL_SCALE
-end
+-- move_pack(i, j, 0) — the zero-value packed move emitted by genMoves. Precomputed
+-- so the hot movegen loop skips the (val + VAL_BIAS) * VAL_SCALE arithmetic.
+local PACKED_ZERO_VAL = VAL_BIAS * VAL_SCALE
 local function move_from(v)
     return math_floor(v / 128) % 128
 end
@@ -282,6 +282,7 @@ for i = 0, 119 do
             ray_squares[t][di] = sqs
         end
         local kt, kg, pc = {}, {}, {}
+        local n
         for oi, o in ipairs(knight_offsets) do
             local j = i + o
             if is_on_board[j] then kt[#kt + 1] = j + 1 end
@@ -294,6 +295,13 @@ for i = 0, 119 do
             local j = i + o
             if is_on_board[j] then pc[#pc + 1] = j + 1 end
         end
+        -- Sentinel-pad the fixed-size target lists to their max lengths
+        -- (knight 8, king 8, pawn 2). The consumers loop `for c = 1, MAX`
+        -- and `break` on a 0 sentinel, so no `#` is evaluated in the hot
+        -- loops (see genMoves/attacked).
+        for n = #kt + 1, 8 do kt[n] = 0 end
+        for n = #kg + 1, 8 do kg[n] = 0 end
+        for n = #pc + 1, 2 do pc[n] = 0 end
         knight_targets[t] = kt
         king_targets[t] = kg
         pawn_caps[t] = pc
@@ -601,7 +609,7 @@ function Position:genMoves(out, start)
                 -- Pawn: single push, double push, captures, ep.
                 local j = i + N
                 if is_on_board_1[j] and b[j] == EMPTY then
-                    moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                    moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     -- Double push: original allows it whenever i >= A1+N and
                     -- the intermediate square is empty (the single push above
                     -- already verified b[i+N]==EMPTY). The last-rank special
@@ -609,33 +617,37 @@ function Position:genMoves(out, start)
                     if i >= A1 + N then
                         local j2 = i + 2 * N
                         if is_on_board_1[j2] and b[j2] == EMPTY then
-                            moves[move_idx] = move_pack(i, j2, 0); move_idx = move_idx + 1
+                            moves[move_idx] = i * 128 + j2 + PACKED_ZERO_VAL; move_idx = move_idx + 1
                         end
                     end
                 end
                 -- Captures (diagonals). En passant when the target is empty but is ep.
+                -- pawn_caps is sentinel-padded to 2 (0 terminates).
                 local pc = pawn_caps[i]
-                for c = 1, #pc do
+                for c = 1, 2 do
                     j = pc[c]
+                    if j == 0 then break end
                     local q = b[j]
                     if q < 0 or (q == EMPTY and j == ep) then
-                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     end
                 end
             elseif p == KN then
                 local kt = knight_targets[i]
-                for c = 1, #kt do
+                for c = 1, 8 do
                     local j = kt[c]
+                    if j == 0 then break end
                     if b[j] <= EMPTY then
-                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     end
                 end
             elseif p == K then
                 local kg = king_targets[i]
-                for c = 1, #kg do
+                for c = 1, 8 do
                     local j = kg[c]
+                    if j == 0 then break end
                     if b[j] <= EMPTY then
-                        moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                        moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     end
                 end
             else
@@ -656,18 +668,18 @@ function Position:genMoves(out, start)
                         if j == 0 then break end
                         local q = b[j]
                         if q == EMPTY then
-                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                            moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                         elseif q < 0 then
-                            moves[move_idx] = move_pack(i, j, 0); move_idx = move_idx + 1
+                            moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                             break
                         else
                             -- own piece blocks the ray, but if it's the king and
                             -- the rook has castling rights, emit the castling move
                             if castling then
                                 if i == A1 and q == K and wc1 then
-                                    moves[move_idx] = move_pack(j, j - 2, 0); move_idx = move_idx + 1
+                                    moves[move_idx] = j * 128 + (j - 2) + PACKED_ZERO_VAL; move_idx = move_idx + 1
                                 elseif i == H1 and q == K and wc2 then
-                                    moves[move_idx] = move_pack(j, j + 2, 0); move_idx = move_idx + 1
+                                    moves[move_idx] = j * 128 + (j + 2) + PACKED_ZERO_VAL; move_idx = move_idx + 1
                                 end
                             end
                             break
@@ -705,16 +717,20 @@ function Position:attacked(i, b, ptag)
     end
     b = b or self:ensure_arr()
 
-    -- King attacks (opponent kings)
+    -- King attacks (opponent kings). king_targets is sentinel-padded to 8.
     local kg = king_targets[i]
-    for c = 1, #kg do
-        if b[kg[c]] == -K then return true end
+    for c = 1, 8 do
+        local sq = kg[c]
+        if sq == 0 then break end
+        if b[sq] == -K then return true end
     end
 
     -- Knight attacks
     local kt = knight_targets[i]
-    for c = 1, #kt do
-        if b[kt[c]] == -KN then return true end
+    for c = 1, 8 do
+        local sq = kt[c]
+        if sq == 0 then break end
+        if b[sq] == -KN then return true end
     end
 
     -- Pawn attacks: an enemy pawn attacks square i along one diagonal. The
@@ -724,8 +740,10 @@ function Position:attacked(i, b, ptag)
     -- only be on one diagonal from i, and the other can't be occupied by a
     -- pawn (it would be behind the pawn).
     local pc = pawn_caps[i]
-    for c = 1, #pc do
-        if b[pc[c]] == -P then return true end
+    for c = 1, 2 do
+        local sq = pc[c]
+        if sq == 0 then break end
+        if b[sq] == -P then return true end
     end
 
     -- Sliding pieces (rook, bishop, queen): walk the 8 precomputed rays.
@@ -926,7 +944,7 @@ function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
     -- attacked. This is the x-ray-correct slow path — a king may not step into
     -- a square attacked by a slider even if a piece currently shields it.
     if p == K then
-        if math_abs(j - i) == 2 then
+        if j - i == 2 or i - j == 2 then
             -- Castling. Replicate the original construction exactly: i emptied,
             -- between holds the KING, j holds the ROOK (the original put K at j
             -- then overwrote j with R), and the rook's origin square is left
@@ -1077,13 +1095,9 @@ function Position:rotate(pooled)
     end
     for k = 1, 120 do
         local v = b[121 - k]
-        if v < 0 then
-            nb[k] = -v
-        elseif v > 6 then
-            nb[k] = v
-        else
-            nb[k] = -v
-        end
+        -- EMPTY (0) negates to 0, pieces negate (case swap), padding codes
+        -- 98/99 pass through: a single ternary replaces the 3-way branch.
+        nb[k] = (v == 98 or v == 99) and v or -v
     end
     -- Thread king indices: after rotation, own king = mirror of parent's enemy
     -- king; enemy king = mirror of parent's own king. If either king is absent
@@ -1143,7 +1157,7 @@ function Position:move(move, val, pooled)
 
     if p == K then
         wc = { false, false }
-        if math_abs(j - i) == 2 then
+        if j - i == 2 or i - j == 2 then
             kp = math_floor((i + j) / 2)
         end
     end
@@ -1152,14 +1166,16 @@ function Position:move(move, val, pooled)
         ep = i + N
     end
 
-    -- Build the rotated board in a single pass (no copy-then-rotate). The
-    -- moved-to square (j) becomes 119-j in the new frame (negated piece code =
-    -- opposite color); the moved-from square (i) becomes 119-i and is emptied.
-    -- Castling: the rook origin (A1/H1) is emptied and the rook lands on
-    -- 119-kp. Promotion: the moved pawn becomes a negated queen. En passant:
-    -- the captured pawn at j+S is emptied (valid only when j was empty).
-    -- The common case (plain piece move, no castling/promotion) stays a tight
-    -- 2-branch loop; rare special cases take a slower branch.
+    -- Build the rotated child board as a straight copy + sparse edits (the
+    -- "make/unmake" experiment: measured ~5.5% faster than the single-pass
+    -- rotate loop under LuaJ — the per-cell branch + interleaved edit/hash
+    -- handling in the old loop costs more than a copy + a few overwrites).
+    -- The moved-to square (j) becomes 121-j in the new frame (negated piece
+    -- code = opposite color); the moved-from square (i) becomes 121-i and is
+    -- emptied. Castling: the rook origin (A1/H1) is emptied and the rook lands
+    -- on 121-kp. Promotion: any piece landing on rank 8 becomes a negated
+    -- queen (the engine's promotion inference). En passant: the captured pawn
+    -- at j+S is emptied.
     -- `pooled` (search path) reuses a pooled Position + board; otherwise a
     -- fresh object + table is allocated (public API / tests).
     local child, nb
@@ -1169,85 +1185,57 @@ function Position:move(move, val, pooled)
         nb = {}
         child = nil
     end
+    -- Copy the parent's board into the child (rotated frame) in one pass, then
+    -- apply the sparse edits directly.
+    for k = 1, 120 do
+        local v = b[121 - k]
+        nb[k] = (v == 98 or v == 99) and v or -v
+    end
     local r = 121 - j
     local s = 121 - i
+    local dest = A8 <= j and j <= H8 and -Q or -p -- promotion -> queen (any piece)
+    nb[r] = dest
+    nb[s] = EMPTY
+    if p == K and (j - i == 2 or i - j == 2) then
+        -- Castling: rook origin (A1/H1 in the child frame) empties, rook
+        -- lands on the king's between square (child frame 121-kp).
+        local rook_from = j < i and A1 or H1
+        nb[121 - rook_from] = EMPTY
+        nb[121 - kp] = -R
+    end
+    if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
+        nb[121 - (j + S)] = EMPTY -- en passant
+    end
     -- Dual-hash threading (item 2): the child is the rotated parent plus sparse
     -- edits, so child._bh = parent._mh + sum(edit deltas) and child._mh =
-    -- parent._bh + sum(edit deltas). Each edit at child square k replaces the
-    -- pure-rotation value rot_pc = -parent[121-k] with the actual new_pc.
-    -- Only meaningful when the parent already carries hashes (search path);
-    -- public positions leave them nil and key() falls back to the 120-pass.
+    -- parent._bh + sum(edit deltas). The child board already has the edits;
+    -- here we only accumulate the hash deltas for the edited squares so key()
+    -- stays O(1). Each edit at child square k replaces the pure-rotation value
+    -- rot_pc = -parent[121-k] with the actual new_pc. Only meaningful when the
+    -- parent already carries hashes (search path); public positions leave them
+    -- nil and key() falls back to the 120-pass.
     local zf, zm = zflat, zmirror
     local dbh, dmh = 0, 0
-    -- Zobrist contribution of a piece code at a 1-based square; EMPTY and the
-    -- padding codes contribute 0 (the real key() skips them), so an edit to or
-    -- from an empty square uses 0 on that side of the delta.
-    local function zc(z, pc, sq)
-        if pc ~= EMPTY and pc ~= SP and pc ~= NL then
-            return z[(pc + 6) * 120 + sq]
-        end
-        return 0
-    end
-    local function edit_hash(k, new_pc)
-        local rot_pc = -b[121 - k]
-        dbh = dbh + zc(zf, new_pc, k) - zc(zf, rot_pc, k)
-        dmh = dmh + zc(zm, new_pc, k) - zc(zm, rot_pc, k)
-    end
     local has_hashes = self._bh ~= nil and self._mh ~= nil
-    if p == K and math_abs(j - i) == 2 then
-        -- Castling: rook origin and rook destination are extra edits. The
-        -- rotated frame negates colors, so the rook lands as -R (enemy).
-        local rook_from = j < i and A1 or H1
-        local rook_origin = 121 - rook_from
-        local rook_dest = 121 - kp
-        for k = 1, 120 do
-            if k == r then
-                nb[k] = -p
-                if has_hashes then edit_hash(k, -p) end
-            elseif k == s then
-                nb[k] = EMPTY
-                if has_hashes then edit_hash(k, EMPTY) end
-            elseif k == rook_origin then
-                nb[k] = EMPTY
-                if has_hashes then edit_hash(k, EMPTY) end
-            elseif k == rook_dest then
-                nb[k] = -R
-                if has_hashes then edit_hash(k, -R) end
-            else
-                local v = b[121 - k]
-                if v < 0 then
-                    nb[k] = -v
-                elseif v > 6 then
-                    nb[k] = v
-                else
-                    nb[k] = -v
-                end
-            end
+    if has_hashes then
+        local function add_edit(k, new_pc)
+            local rot_pc = -b[121 - k]
+            local old_zf = (rot_pc == EMPTY or rot_pc == SP or rot_pc == NL) and 0 or zf[(rot_pc + 6) * 120 + k]
+            local new_zf = (new_pc == EMPTY or new_pc == SP or new_pc == NL) and 0 or zf[(new_pc + 6) * 120 + k]
+            dbh = dbh + new_zf - old_zf
+            local old_zm = (rot_pc == EMPTY or rot_pc == SP or rot_pc == NL) and 0 or zm[(rot_pc + 6) * 120 + k]
+            local new_zm = (new_pc == EMPTY or new_pc == SP or new_pc == NL) and 0 or zm[(new_pc + 6) * 120 + k]
+            dmh = dmh + new_zm - old_zm
         end
-    else
-        local dest = A8 <= j and j <= H8 and -Q or -p -- promotion -> queen
-        for k = 1, 120 do
-            if k == r then
-                nb[k] = dest
-                if has_hashes then edit_hash(k, dest) end
-            elseif k == s then
-                nb[k] = EMPTY
-                if has_hashes then edit_hash(k, EMPTY) end
-            else
-                local v = b[121 - k]
-                if v < 0 then
-                    nb[k] = -v
-                elseif v > 6 then
-                    nb[k] = v
-                else
-                    nb[k] = -v
-                end
-            end
+        add_edit(r, dest)
+        add_edit(s, EMPTY)
+        if p == K and (j - i == 2 or i - j == 2) then
+            local rook_from = j < i and A1 or H1
+            add_edit(121 - rook_from, EMPTY)
+            add_edit(121 - kp, -R)
         end
         if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
-            local epk = 121 - (j + S)
-            nb[epk] = EMPTY -- en passant
-            if has_hashes then edit_hash(epk, EMPTY) end
+            add_edit(121 - (j + S), EMPTY) -- en passant
         end
     end
     -- Thread king indices: child own king = mirror of parent's enemy king;
@@ -1354,24 +1342,11 @@ local function tp_set(key, depth, score, gamma, move)
     ttM[s] = move
 end
 
--- Probe the TT. Returns (score, depth, move, slot) when an entry exists, else
--- nil. The slot is `key % TT_SIZE + 1` (already computed here) so the caller's
--- bound-check can reuse it instead of recomputing the modulo.
-local tt_probe = 0 -- F2 measurement: total probes (via tp_get)
+-- F2 measurement counters. The probe itself is inlined in bound()/search()
+-- (item 5); these keep sunfish.tt_stats accurate.
+local tt_probe = 0 -- F2 measurement: total probes
 local tt_hit = 0   -- F2 measurement: probes that found a matching full key
 local tt_slot_hit = 0 -- F2 measurement: probes whose slot was occupied (any key)
-local function tp_get(key)
-    tt_probe = tt_probe + 1
-    local s = key % TT_SIZE + 1
-    if ttK[s] ~= -1 then
-        tt_slot_hit = tt_slot_hit + 1
-        if ttK[s] == key then
-            tt_hit = tt_hit + 1
-            return ttS[s], ttD[s], ttM[s], s
-        end
-    end
-    return nil
-end
 
 -------------------------------------------------------------------------------
 -- Search logic
@@ -1423,35 +1398,33 @@ local m_move = Position.move
 local move_stack = {}
 local ply = 0 -- current recursion depth (incremented per bound() entry)
 
-local function move_greater(a, b)
-    if a ~= b then
-        if a > b then return true end
-        if a < b then return false end
-        local ai, aj = move_from(a), move_to(a)
-        local bi, bj = move_from(b), move_to(b)
-        if ai ~= bi then
-            return ai > bi
-        else
-            return aj < bj
-        end
-    end
-    return false
-end
+-- The packed-move layout (value in the high bits via VAL_SCALE = 2^14, coords
+-- in the low 14 bits with max 119*128+119 = 15351 < 16384) makes a plain
+-- integer comparison sort by value first, then by coordinates — exactly the
+-- old `move_greater` ordering. move_set_val stores a full (val+VAL_BIAS)*VAL_SCALE
+-- delta per entry, so same-node moves never differ by less than VAL_SCALE and
+-- the i/j tie-break is unreachable on the search path. The comparator is
+-- therefore dead code; the heap sort below compares packed ints directly.
+-- NOTE: raw `a > b` on the whole integer reverses the tie-break order for
+-- entries that differ only in the coordinate bits (< VAL_SCALE apart), but no
+-- two moves of one node do, so the searched order is byte-identical.
 
--- In-place heap sort of buf[1..n] descending by `move_greater`.
+-- In-place heap sort of buf[1..n] descending by packed-integer value.
 -- Classic max-heap + extract-to-end produces ASCENDING; for descending we build
 -- a MIN-heap (smallest at root) and extract to the end, so the largest lands
--- first. The comparator is inverted for the heap property.
+-- first. The comparator is inverted for the heap property. Comparisons are
+-- inline raw `>` on the packed ints (no function calls; see the note above on
+-- why the integer order matches the removed move_greater).
 local function move_sort(buf, n)
     -- build min-heap (root is the smallest)
     for start = math_floor(n / 2), 1, -1 do
         local root = start
         while root * 2 <= n do
             local child = root * 2
-            if child < n and move_greater(buf[child], buf[child + 1]) then
+            if child < n and buf[child] > buf[child + 1] then
                 child = child + 1
             end
-            if move_greater(buf[root], buf[child]) then
+            if buf[root] > buf[child] then
                 buf[root], buf[child] = buf[child], buf[root]
                 root = child
             else
@@ -1466,10 +1439,10 @@ local function move_sort(buf, n)
         local m = endpos - 1
         while root * 2 <= m do
             local child = root * 2
-            if child < m and move_greater(buf[child], buf[child + 1]) then
+            if child < m and buf[child] > buf[child + 1] then
                 child = child + 1
             end
-            if move_greater(buf[root], buf[child]) then
+            if buf[root] > buf[child] then
                 buf[root], buf[child] = buf[child], buf[root]
                 root = child
             else
@@ -1507,7 +1480,7 @@ local function bound(pos, gamma, depth, maxn)
         return pos.score
     end
 
-    if math_abs(pos.score) >= MATE_VALUE then
+    if pos.score >= MATE_VALUE or pos.score <= -MATE_VALUE then
         return pos.score
     end
 
@@ -1518,12 +1491,30 @@ local function bound(pos, gamma, depth, maxn)
     -- move is found), and the terminal-score check above catches
     -- already-decided positions.
     local key = m_key(pos)
-    local es, ed, em, ed_slot = tp_get(key)
-    local had_entry = es ~= nil
-    if had_entry and ed >= depth and (
-            es < ttG[ed_slot] and es < gamma or
-                    es >= ttG[ed_slot] and es >= gamma) then
-        return es, em
+    -- Inlined TT probe (item 5): the flat arrays are read directly with the
+    -- slot computed once, and only after the full-key verify — no 4-value
+    -- tp_get return, no ttD/ttS/ttG reads on a miss. The F2 measurement
+    -- counters (tt_probe/tt_slot_hit/tt_hit) are kept so sunfish.tt_stats
+    -- stays accurate. `ed` is also read by the store-site guard below, so it
+    -- is declared here.
+    local s = key % TT_SIZE + 1
+    tt_probe = tt_probe + 1
+    local had_entry = false
+    local ed = -1
+    if ttK[s] ~= -1 then
+        tt_slot_hit = tt_slot_hit + 1
+        if ttK[s] == key then
+            tt_hit = tt_hit + 1
+            had_entry = true
+            ed = ttD[s]
+            if ed >= depth then
+                local es = ttS[s]
+                local eg = ttG[s]
+                if es < eg and es < gamma or es >= eg and es >= gamma then
+                    return es, ttM[s]
+                end
+            end
+        end
     end
 
     -- Generate pseudo-legal moves and filter out those that leave our own king
@@ -1706,7 +1697,7 @@ local function search(pos, maxn)
         -- Budget-aware stop: break early when bound() aborted mid-depth (the
         -- flag is set at the per-node check point) or the depth completed the
         -- budget. The last completed depth's fail-high move is already captured.
-        if budget_exhausted or nodes >= maxn or math_abs(score) >= MATE_VALUE then
+        if budget_exhausted or nodes >= maxn or score >= MATE_VALUE or score <= -MATE_VALUE then
             break
         end
     end
@@ -1726,7 +1717,12 @@ local function search(pos, maxn)
         end
         rootmove = nil
     end
-    local _, _, ttmove = tp_get(m_key(pos))
+    local ttmove
+    local tk = m_key(pos)
+    local tslot = tk % TT_SIZE + 1
+    if ttK[tslot] == tk then
+        ttmove = ttM[tslot]
+    end
     if ttmove ~= nil then
         if m_is_legal(pos, ttmove, rk, rnch, rchk, rpin, rpdir, rpg, root_b) then
             return ttmove, score

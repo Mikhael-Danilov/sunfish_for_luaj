@@ -55,6 +55,19 @@
   ~16% CPU-time win (mean). All gates green (suites + oracle + perft +
   stockfish selfplay). Two perft-caught bugs fixed (block-beyond-checker,
   ep-capture-of-checker). See the pin/check section below.
+- [x] Micro batch (9-item review): items 1/2/5/6/7/9 **SHIPPED** (inline
+  `move_greater`, sentinel-padded target tables, `PACKED_ZERO_VAL`, inline TT
+  probe, ternary rotate branch, `math_abs` removal, inline `edit_hash`);
+  3/4/8 rejected. Behavior-identical (invariant `27/153/287/1498/3030/10026`,
+  `b8c6`); ~5% CPU-time win on the full benchmark. `verify_invariant.lua`
+  updated to the current sequence. See the "Micro batch" section.
+- [x] Item-3 reverify: flattening `ray_squares` confirmed **NOT faster** under
+  CPU time (base won 4/6, mod ~3.5% slower) — the wall-clock rejection was
+  correct. See the "Item-3 reverify" section.
+- [x] Make/unmake experiment: classic make/unmake is **incompatible with the
+  rotation model**; the viable copy+sparse-edit `move()` is **MERGED** as
+  behavior-identical (perf-neutral to small win: 10-round A/B ~5.5%, 6-round
+  confirm a tie). See the "Make/unmake experiment" section.
 
 > **Measurement caveat**: all numbers before the CPU-time correction used LuaJ
 > `os.clock()` = `System.currentTimeMillis()` (wall-clock, verified in the OsLib
@@ -983,6 +996,123 @@ release build add a `sunfish.set_verbose(flag)`.
 node invariant 27/197/411/1818/4036/15803 + suites), D alongside, then E's
 instrumentation before any structural rewrite, and F2/F1 as their own A/Bs.
 
+## Micro batch (9-item review): items 1/2/5/6/7/9 SHIPPED, 3/4/8 rejected
+
+A 9-item external optimization proposal was reviewed against the source and
+implemented as a behavior-identical batch. Verdicts per item:
+
+| # | Item | Verdict | Notes |
+|---|------|---------|-------|
+| 1 | Inline `move_greater` into `move_sort` | **SHIPPED** | `119*128+119 = 15351 < 2^14` makes plain integer comparison order by value then coordinates. `move_set_val` stores a full `(val+VAL_BIAS)*VAL_SCALE` delta, so same-node moves never differ by `< VAL_SCALE` and the i/j tie-break is unreachable on the search path. Removes the comparator function call from every heap op. |
+| 2 | Sentinel-pad `knight_targets`/`king_targets`/`pawn_caps` | **SHIPPED** | Built with 0 sentinels to fixed bounds (8/8/2); `genMoves`/`attacked` loop `for c=1,MAX` + `break` on 0. Removes the `#` and the bound re-read from the per-square loops. Same class of win as the Phase-9 sentinel rays. |
+| 3 | Flatten `ray_squares` to 1D (`t*8+di`) | **REJECTED** | Already A/B'd slower: the Post-Phase-9 "flattened rays" and the earlier "flat attack tables" both lost under LuaJ's per-cell Java-call cost (the multiply + single get vs two gets nets out negative). **Reverified under CPU time (see below)** — confirmed the rejection is real, not a wall-clock artifact. |
+| 4 | Inline `move_pack`/`move_from`/`move_to`/`move_val` wholesale | **REJECTED** (slice SHIPPED) | `move_pack`/`move_val` are already local upvalues; the arithmetic is already hoisted (`VAL_SCALE`/`VAL_BIAS`, Phase-10 item 7). The one worthwhile slice — precompute `PACKED_ZERO_VAL` and inline the zero-value pack into `genMoves` — shipped. `move_from`/`move_to` inlining would duplicate arithmetic at 9 sites for ~1 call/genMoves saved; not worth it. |
+| 5 | Inline the TT probe in `bound()` | **SHIPPED** | Replaces the 4-value `tp_get` return + unconditional `ttS/ttD/ttG` reads with a slot computed once and lazy reads after the `ttK[s] == key` verify. `tp_get` deleted; F2 counters preserved. The `search()` TT fallback probe is also inlined. Same shape as the not-shipped ttinline, but standalone it's a clean behavior-identical micro-win. |
+| 6 | Ternary rotate branch (`(v==98 or v==99) and v or -v`) | **SHIPPED** | Byte-identical for all 120 codes (0 is truthy in Lua, pieces/padding are the only codes). Replaces the 3-way `if/elseif/else` in `rotate()` + both `move()` mirror loops. |
+| 7 | Replace `math_abs` with `x==2 or x==-2` | **SHIPPED** | 5 sites: `is_legal`/`move()` castling checks, `bound()` mate check, `search()` break. `math_abs` was already a local upvalue, but it's still a call per node; the OR form is exact for integers. |
+| 8 | Hoist `attacked` to a standalone `is_attacked(i,b)` | **REJECTED** | Premise is stale: the method dispatch is already hoisted via upvalues, and the pin/check rewrite cut `attacked()` to ~3.5k calls/search (king-move 98.9%). The remaining `:` overhead is noise, and the standalone form breaks the `self:ensure_arr()` fallback for public paths. |
+| 9 | Inline `zc()` into `edit_hash` in `move()` | **SHIPPED** | Inlines the two `zflat`/`zmirror` contributions per edit with the same `(pc+6)*120 + sq` indexing as `key()`. Fires only on the ~2 edited squares per move (the proposal's "120 calls/move" overstates it), but it's free and provably identical. |
+
+**Validation (all green):** node invariant `27/153/287/1498/3030/10026` + root
+`b8c6` (the post-F1/F3/pin-check baseline); suites 14+15+21 on luajit, lua5.1,
+and LuaJ; oracle 40/40; `attacked()` profile unchanged (3,578 calls, king-move
+98.9%).
+
+**CPU-time A/B** (cold `ai_move` via `/usr/bin/time` `User time`, sequential
+cold JVMs): bare cold-search rounds were a dead tie within noise (base mean
+~7.4s vs mod ~7.6s across 7 rounds), but the full `bench_sunfish.lua`
+(cold `ai_move` + new/move/store/coords) favored mod: base 48.49/49.06 (mean
+48.78) vs mod 48.01/44.44 (mean 46.23) — **~5% CPU win**, matching the plan's
+lesson that per-node micro-op removal shows up weakly on this loaded VM but the
+direction is real. Behavior is byte-identical (same move/score/node counts).
+
+### Housekeeping in the same commit
+
+- **`benchmarks/verify_invariant.lua`** updated to the current F1/F3 sequence
+  (`27/153/287/1498/3030/10026`, `b8c6`) — it was asserting the pre-F1/F3
+  sequence and reporting "INVARIANT BROKEN" by design (a documented open item).
+- **Verifier regex bug fixed**: the `Score (%d+)/(%d+)` pattern dropped depths
+  whose aspiration window had a negative bound (`Score 0(-1/0)`), silently
+  MISSING depths 2/4 even against the correct sequence. Now matches optional
+  leading minus on both window values.
+
+### Item-3 reverify: CPU-time A/B of the flat `ray_squares` variant
+
+Item 3 (flatten `ray_squares[i][di]` to a 1D `ray_flat[i*8+di]`) was rejected
+on the strength of two **wall-clock** measurements (the pre-Phase-6 "flat
+attack tables" reversion and the Post-Phase-9 "flattened rays" non-ship). Per
+the measurement caveat, that evidence was load-contaminated — so the rejection
+was re-verified under the CPU-time discipline (`/usr/bin/time` `User time`,
+cold sequential JVMs, alternating order).
+
+The variant: `ray_flat` built once from `ray_squares`; the three hot walkers
+(`attacked()`'s rook/bishop loops, `genMoves`' slider loop,
+`compute_check_pins`) use `ray_flat[ib+di]` instead of `ray_squares[i][di]`.
+All other code identical.
+
+**Gate (all green, behavior-identical):** node invariant
+`27/153/287/1498/3030/10026` + `b8c6`; suites 14+15+21; oracle 40/40.
+
+**Cold `ai_move` CPU-time A/B (6 alternating rounds, User time):**
+
+| Variant | rounds (s) | mean |
+|---------|-----------|------|
+| base (nested) | 7.31, 4.96, 6.41, 8.81, 6.22, 10.65 | **7.39** |
+| mod (flat) | 7.31, 6.70, 7.01, 9.51, 8.79, 6.59 | **7.65** |
+
+**Verdict: base won 4/6 rounds; mod ~3.5% slower on average — the flat form
+does NOT pay.** The `move` microbenchmark is a tie within resolution noise
+(base ~4.8ms vs mod ~4.8ms for 3000 iters). This confirms the rejection is
+real, not a wall-clock artifact: the extra `*8 + di` multiply + single-get
+nets out against the saved table-get under LuaJ's interpreter, exactly the
+mechanism the "flat attack tables" and "flattened rays" notes described. The
+rejection stands, now on CPU-time evidence.
+
+### Make/unmake experiment: copy+sparse-edit move() MERGED (perf-neutral to small win)
+
+The plan's "make/unmake rewrite" thread was prototyped and A/B'd under the
+CPU-time discipline. The classic make/unmake (mutate the parent board, unmake
+after the child returns) is **incompatible with the rotation model** — the
+child is a rotated frame, so "unmaking" would need a full re-rotate. The
+viable variant keeps the copy model but changes *how* the rotated child is
+built: instead of the single-pass 120-cell loop with a per-cell
+`if/elseif/else` branch + interleaved edit/hash handling, `move()` now:
+
+1. Copies the parent's 120-cell board into the child's board with the pure
+   rotation mapping (`nb[k] = (v==98 or v==99) and v or -v`) — a straight,
+   branch-per-cell copy;
+2. Applies the sparse edits (moved piece, emptied origin, castling rook, ep
+   capture) as a few direct overwrites;
+3. Computes the dual-hash deltas only for the edited squares.
+
+The public path still allocates a fresh board per call (no shared scratch, so
+no aliasing); the pooled search path reuses the pooled board via `pool_alloc`.
+All special cases preserved: promotion inference (`-Q` for ANY piece to rank
+8, verified), castling rook, ep capture, king-index + flag threading.
+
+**Gate (all green, behavior-identical):** node invariant
+`27/153/287/1498/3030/10026` + `b8c6`; suites 14+15+21 on luajit, lua5.1, and
+LuaJ; oracle 40/40; perft 21/21.
+
+**CPU-time A/B (cold `ai_move`, User time, alternating cold JVMs):**
+
+Initial 10-round temp A/B: base 7.77, 6.06, 8.04, 6.14, 7.57, 6.92, 5.31, 8.04,
+6.99, 7.77 (mean 6.92) vs mod 7.39, 5.93, 4.97, 7.40, 7.65, 5.83, 5.97, 6.85,
+8.07, 6.10 (mean 6.54) — mod won 7/10, **~5.5%**.
+
+Final repo-confirm 6-round A/B (HEAD pre-make/unmake vs merged): base 6.65,
+6.74, 5.98, 7.17, 6.03, 7.57 (mean 6.69) vs mod 6.39, 6.69, 7.54, 7.37, 6.68,
+5.77 (mean 6.74) — mod won 4/6, **dead tie**.
+
+**Verdict: MERGED as behavior-identical.** The copy + sparse-edit construction
+is at worst perf-neutral and likely a small (0-5%) win — the two A/Bs bracket
+it: the 10-round temp run favored mod ~5.5%, the 6-round repo confirm is a
+tie. Under the established discipline, a behavior-identical change that is
+perf-neutral-or-better and passes every gate ships; the 120-cell copy remains
+the dominant per-node cost. The deeper make/unmake (no per-move copy at all)
+stays blocked by the rotation model — only a frame-flip redesign (dropping
+rotation per ply) removes the copy, and that stays out of scope.
+
 ## Full next phase: E instrumentation, F1/F2/F3, micro batch, rebench (SHIPPED: F1 + F3; DEFERRED: B, E-rewrite, F2)
 
 The plan's open threads (E, F1, F2, F3) plus two spotted micro-wins were
@@ -1112,12 +1242,11 @@ correction:
 ### Cumulative search state at HEAD (after this phase)
 
 The search now runs depth 6 at **~10k nodes** (budget stop + aspiration):
-27/153/287/1498/3030/10026, root move `a8b6`, score 41. The F3 node-count win
-(15.8k → 10k) plus the per-node F1 abort is the ~22% CPU-time win over the
-pre-phase baseline. `verify_invariant.lua` still asserts the OLD
-(27/197/411/1818/4036/15803) invariant — it now reports "INVARIANT BROKEN" by
-design (node counts legitimately changed); the verifier should be updated to the
-new sequence when the next behavior-identical batch needs the guard.
+27/153/287/1498/3030/10026, root move `b8c6`, score 41 (score 0 on the
+current pin/check baseline; the `a8b6`/score-41 reading was the pre-pin-check
+search). The F3 node-count win (15.8k → 10k) plus the per-node F1 abort is the
+~22% CPU-time win over the pre-phase baseline. `verify_invariant.lua` now
+asserts this exact sequence (updated in the micro batch commit).
 
 ### Pin/check-aware legality: SHIPPED (the E decision, now implemented)
 
@@ -1172,19 +1301,18 @@ threading are all removed. The E instrumentation stays for future profiling.
 
 ### Remaining open items (for a future phase)
 
-- **Make/unmake rewrite**: the pin/check rewrite removed the dominant
-  `attacked()` cost, so make/unmake is now lower value; revisit only if a
-  future profile shows the remaining king-move/castling `attacked()` calls
-  matter.
+- **Deeper make/unmake (no per-move 120-cell copy)**: the copy+sparse-edit
+  `move()` shipped, but the classic make/unmake (mutate the parent board, no
+  copy) is blocked by the rotation model — the child is a rotated frame, so
+  unmaking needs a full re-rotate. Only a frame-flip redesign (dropping
+  rotation per ply) removes the 120-cell copy; that stays out of scope.
 - **F2 depth-preferred + TT_SIZE bump**: revisit only if node budgets rise
   enough to approach TT saturation.
 - **LMR**: stays parked (the Phase-6 rejection reason — extra depth costing
   more than node savings — is unchanged; the per-node cost is now lower, so a
   re-A/B is reasonable at some point).
-- **`verify_invariant.lua`**: still asserts the pre-F1/F3 sequence
-  (27/197/411/1818/4036/15803) and reports "INVARIANT BROKEN"; update to the
-  F1/F3 sequence (27/153/287/1498/3030/10026) when the next
-  behavior-identical batch needs the guard.
+- **`verify_invariant.lua`**: now asserts the current F1/F3/pin-check sequence
+  (27/153/287/1498/3030/10026, `b8c6`) — updated in the micro batch commit.
 
 
 ## Phases

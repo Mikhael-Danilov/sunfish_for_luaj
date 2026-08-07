@@ -15,27 +15,30 @@
 -- depth-by-depth node counts. Run with SUNFISH_VERBOSE=1 (see the header).
 local sunfish = require("sunfish")
 
--- Post-ep-fix baseline: the en-passant undo fix removed bogus ep moves, so the
--- per-depth node counts dropped (depth 5: 11653 -> 4036) and the search now
--- reaches depth 6 (15803 nodes) instead of stopping at the depth-5 node cap.
+-- Current baseline (post-F1 budget stop + F3 aspiration, and the
+-- pin/check-aware legality rewrite): the search now runs depth 6 at ~10k
+-- nodes instead of the pre-F1/F3 15,803. Node counts legitimately changed, so
+-- this is the invariant every behavior-identical batch must preserve.
 local EXPECTED = {
     { depth = 1, nodes = 27,   score = 99 },
-    { depth = 2, nodes = 197,  score = 0 },
-    { depth = 3, nodes = 411,  score = 99 },
-    { depth = 4, nodes = 1818, score = 0 },
-    { depth = 5, nodes = 4036, score = 40 },
-    { depth = 6, nodes = 15803, score = 0 },
+    { depth = 2, nodes = 153,  score = 0 },
+    { depth = 3, nodes = 287,  score = 99 },
+    { depth = 4, nodes = 1498, score = 0 },
+    { depth = 5, nodes = 3030, score = 40 },
+    { depth = 6, nodes = 10026, score = 0 },
 }
--- The invariant root move (post-ep-fix baseline): a8b6.
-local EXPECTED_MOVE = "a8b6"
+-- The invariant root move (current baseline): b8c6.
+local EXPECTED_MOVE = "b8c6"
 
 local captured = {}
 local orig_print = print
 local function capture(...)
     -- The engine prints: "Searched %d nodes. Depth %d. Score %d(%d/%d)"
-    -- capture depth (cap1) and score (cap2); nodes is the first field.
+    -- The window bounds can be negative (F3 aspiration re-search), so allow
+    -- an optional leading minus. capture depth (cap1) and score (cap2);
+    -- nodes is the first field.
     local s = tostring(select(1, ...))
-    local d, sc = s:match("Depth (%d+)%. Score (%d+)%((%d+)")
+    local d, sc = s:match("Depth (%d+)%. Score (%d+)%((-?%d+)/(%-?%d+)")
     local nodes = s:match("Searched (%d+) nodes")
     if d and nodes then
         captured[tonumber(d)] = { depth = tonumber(d), nodes = tonumber(nodes), score = tonumber(sc) }
