@@ -1552,6 +1552,29 @@ estimate sunfish's Elo. Design notes (matching the benchmark taste):
 
 Usage: `python3 benchmarks/elo_vs_stockfish.py [--nodes ...] [--plies 60] [--book ...]`
 
+**Measured result (baseline, 2026-08-10, committed defaults: 8 levels × 8-FEN book ×
+both colors, 1 game per combination, luajit engine, Stockfish 18 via `go nodes N`):**
+
+```
+   nodes  ~sf_elo    W    D    L    pts   score sunfish~
+      20     1455    2   11    3    7.5   0.469     1434
+      50     1595    3   11    2    8.5   0.531     1616
+     100     1700    8    6    2   11.0   0.688     1837
+     300     1867    6    7    3    9.5   0.594     1933
+    1000     2050    6    4    6    8.0   0.500     2050
+    3000     2217    7    1    8    7.5   0.469     2195
+   10000     2400    7    1    8    7.5   0.469     2378
+   30000     2567    6    3    7    7.5   0.469     2545
+
+Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 2001
+```
+
+The response curve has the expected shape — sunfish >50% against the weakest levels,
+~50% at the 1000-node crossover, tailing to ~47% at the strongest — so the harness is
+behaving. Caveats as designed: the absolute value (≈2000) inherits the anchor curve's
+uncertainty (a 300-node Stockfish still plays weak moves like `a2a3`, so the low end of
+the anchor is optimistic, which inflates the fit); the per-level sample is 16 games.
+
 ## Key risks (covered by existing tests)
 
 - `board` nil on internal positions -> `ensure_board` at every public return.
