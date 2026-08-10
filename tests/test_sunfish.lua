@@ -99,6 +99,21 @@ describe("sunfish.ai_move", function()
     end)
 end)
 
+describe("sunfish.set_nodes", function()
+    it("tunes the node budget at runtime", function()
+        sunfish.set_nodes(2000)
+        local game = sunfish.new()
+        local co = coroutine.create(function() return sunfish.ai_move(game) end)
+        local ok, ng, mv, score = coroutine.resume(co)
+        while ok and coroutine.status(co) == "suspended" do
+            ok, ng, mv, score = coroutine.resume(co)
+        end
+        assert_true(ok, "ai_move must run under a custom node budget")
+        assert_true(score ~= nil)
+        sunfish.set_nodes(1000) -- restore the default for other tests
+    end)
+end)
+
 describe("sunfish store_data / restore_data", function()
     it("round-trips a position", function()
         local game = sunfish.new()

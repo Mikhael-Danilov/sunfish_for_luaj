@@ -1562,3 +1562,49 @@ Usage: `python3 benchmarks/elo_vs_stockfish.py [--nodes ...] [--plies 60] [--boo
   (`slot.key == key`) -> no wrong entries, collisions only cost a missed lookup.
 - `king_sensitive` short-circuit must not misclassify: only skips `attacked()`
   for moves that provably can't change king safety (verified by oracle 40/40).
+
+## Reliable endgames: DTM scoring, draw rules, material eval
+
+Implemented per the reviewed endgame plan (heuristics + dynamic budget, no
+tablebases — pure-Lua TBs are GC-heavy under LuaJ). Commits `321a222` (phases
+1-5) and `9aa0134` (material threading):
+
+- **Distance-to-mate**: `bound()` gains a `ply` param; the terminal mate is
+  `-(MATE_VALUE - ply)`; the bound-entry mate band and the root search stop are
+  ply-aware (the search stops on a `MATE_BAND` score, which the old flat
+  `>= MATE_VALUE` missed — it let a found mate keep deepening into
+  pathologies). TT mate scores are stored/retrieved re-anchored to the node's
+  ply, so transpositions reached at different distances stay consistent.
+- **State threading**: `piece_count`, `fifty`, and `material` are primitives
+  threaded through `move()`/`rotate()`/pooling like `_king`/`_bh`. Public
+  positions derive them from the board. `material` is the standing balance
+  from the side-to-move's perspective; captures add the captured piece's value.
+- **Draw rules before the TT probe, never cached** (path-dependent scores
+  would poison transpositions): 50-move (`fifty >= 100`), repetition (a `path`
+  table of hashes threaded through `bound()`, pushed/popped around each
+  recursive call), and insufficient material (K vs K, K+minor vs K).
+  NOTE: the 50-move check can fire on a deep quiet line in a won endgame
+  before the search sees the mate — a known limitation, not yet tuned.
+- **Endgame eval** (`piece_count <= 4`): `CORNER_DIST` precomputed (Chebyshev
+  to the nearest corner); the leaf score adds `material` (so a queen-up KQK is
+  ~+900, not ~0) plus a king-corraling gradient. This fixed the engine hanging
+  the queen: the conversion gate went from 25% mate / 3 queen-blunder draws to
+  40% mate / 0 draws.
+- **Dynamic budget** in `search()`: x4 at <= 4 pieces, x2 at <= 6. The
+  32-piece start position is unaffected (invariant 27/153/287/1008, root d7d5).
+- **Null-move stays unconditional** (a `piece_count <= 4` guard was tried but
+  it shifted the odd/even-depth horizon, collapsing won positions to draws at
+  even depth; the guard was reverted). NOTE: null-move's false high in sparse
+  positions is a known contributor to the conversion gap.
+
+**Honest limits (measured)**: the engine keeps material and avoids blunders,
+but cannot reliably *mate* within the 1000-4000 node budget — KQK/KRK mates
+need ~20+ plies, far beyond the search horizon, so it shuffles (KQK 40%, KRK
+25% conversion vs a random defender). Reaching the 95% target needs either a
+tiny KQK/KRK/KPK tablebase or far deeper endgame search. The draw-holding
+suite (K+P vs K defender) holds 100% so far.
+
+**New tests**: DTM band assertions (mate-in-1 = `MATE_VALUE - 1`, KRK),
+draw-rule tests (K vs K, K+B vs K, K+N vs K, fifty=99), `sunfish.set_nodes`
+smoke. New benchmark: `benchmarks/endgame_conversion.py` (conversion rate +
+draw-holding; fails only below a regression floor of 12.5%, aspirational 95%).

@@ -204,4 +204,59 @@ describe("endgame: pawn promotion", function()
     end)
 end)
 
+describe("endgame: distance-to-mate scoring", function()
+    it("scores a mate in 1 at MATE_VALUE - 1", function()
+        -- KQK: Kf6 Qg7 vs Kh8, white to move, mate in one.
+        local g = newpos({ f6 = "K", g7 = "Q", h8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, sunfish.MATE_VALUE - 1, "mate-in-1 must score MATE_VALUE - 1")
+        assert_true(sunfish.is_checkmate(ng))
+    end)
+
+    it("scores a KRK mate in 1 at MATE_VALUE - 1", function()
+        -- KRK: Kg6 Rd7 vs Kh8, white to move, mate in one.
+        local g = newpos({ g6 = "K", d7 = "R", h8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, sunfish.MATE_VALUE - 1, "KRK mate-in-1 must score MATE_VALUE - 1, got " .. tostring(sc))
+        assert_true(sunfish.is_checkmate(ng))
+    end)
+
+    it("gives the search a gradient: a near-mate scores higher than a distant one", function()
+        -- The king-corraling endgame eval must produce a nonzero score even
+        -- when the mate is not immediately visible at the search horizon.
+        local g = newpos({ e1 = "K", d3 = "Q", h8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_true(sc > 0, "a winning KQK must have a positive gradient, got " .. tostring(sc))
+    end)
+end)
+
+describe("endgame: draw rules", function()
+    it("K vs K is a draw", function()
+        local g = newpos({ e1 = "K", e8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, 0, "K vs K must score 0")
+    end)
+
+    it("K+B vs K is a draw", function()
+        local g = newpos({ e1 = "K", c4 = "B", e8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, 0, "K+B vs K must score 0")
+    end)
+
+    it("K+N vs K is a draw", function()
+        local g = newpos({ e1 = "K", c4 = "N", e8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, 0, "K+N vs K must score 0")
+    end)
+
+    it("the 50-move rule fires at fifty >= 100", function()
+        -- K+R vs K is a win, but with the clock at 99 half-moves the search
+        -- must see the immediate 50-move draw and not claim a win.
+        local g = newpos({ e1 = "K", d2 = "R", e8 = "k" })
+        g.fifty = 99
+        local ng, mv, sc = ai_move(g)
+        assert_equal(sc, 0, "fifty=99 must draw, got " .. tostring(sc))
+    end)
+end)
+
 harness.finish()

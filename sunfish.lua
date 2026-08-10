@@ -1737,10 +1737,8 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- This gives the search the monotonic drive toward a mating net that the
     -- material+PST score alone lacks. Non-endgame leaves are untouched.
     if depth <= 0 and pos.piece_count <= 4 then
-        if false then end
         ply_buf = ply_buf - 1
-        local e = pos.score + endgame_eval(pos)
-        return e
+        return pos.score + endgame_eval(pos)
     end
 
     -- At depth <= 0 the loop below breaks at the first move_val < 150 (the
