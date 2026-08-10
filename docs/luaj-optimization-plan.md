@@ -1558,22 +1558,30 @@ both colors, 1 game per combination, luajit engine, Stockfish 18 via `go nodes N
 ```
    nodes  ~sf_elo    W    D    L    pts   score sunfish~
       20     1455    2   11    3    7.5   0.469     1434
-      50     1595    3   11    2    8.5   0.531     1616
-     100     1700    8    6    2   11.0   0.688     1837
-     300     1867    6    7    3    9.5   0.594     1933
-    1000     2050    6    4    6    8.0   0.500     2050
-    3000     2217    7    1    8    7.5   0.469     2195
-   10000     2400    7    1    8    7.5   0.469     2378
-   30000     2567    6    3    7    7.5   0.469     2545
+      50     1595    0   11    5    5.5   0.344     1482
+     100     1700    3    6    7    6.0   0.375     1611
+     300     1867    2    7    7    5.5   0.344     1755
+    1000     2050    0    4   12    2.0   0.125     1712
+    3000     2217    0    1   15    0.5   0.031     1620
+   10000     2400    0    1   15    0.5   0.031     1803
+   30000     2567    0    3   13    1.5   0.094     2173
 
-Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 2001
+Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 1593
 ```
 
-The response curve has the expected shape — sunfish >50% against the weakest levels,
-~50% at the 1000-node crossover, tailing to ~47% at the strongest — so the harness is
-behaving. Caveats as designed: the absolute value (≈2000) inherits the anchor curve's
-uncertainty (a 300-node Stockfish still plays weak moves like `a2a3`, so the low end of
-the anchor is optimistic, which inflates the fit); the per-level sample is 16 games.
+The response curve has the expected shape — sunfish scores best against the weakest
+levels (0.469 at 20 nodes, and its only 7 wins all come at 20–300 nodes), then tails
+off to ~0.03–0.09 at the strongest — so the harness is behaving. Caveats as designed:
+the absolute value inherits the anchor curve's uncertainty (a 300-node Stockfish still
+plays weak moves like `a2a3`, so the low end of the anchor is optimistic); the per-level
+sample is 16 games; and sunfish is weaker as black (1 win vs 6 as white), which may
+reflect bridge parity handling worth a second look.
+
+> **Harness bug fixed after the first run (2026-08-10):** the per-level W/D/L tallies
+> counted `res` (white-perspective) directly against sunfish's color, so games where
+> sunfish played black had white's result misattributed to sunfish. The first run
+> reported a fitted Elo of 2001 from the corrupted table; the correct value (above,
+> from the per-game labels and the fixed counting) is **1593**.
 
 ## Key risks (covered by existing tests)
 

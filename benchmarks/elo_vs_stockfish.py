@@ -539,6 +539,9 @@ def main():
                         res, ply, sc = play_game(sf, bridge, fen, args.plies, color)
                     finally:
                         sf.close()
+                    # res is white-perspective: a "1-0" is a win for white.
+                    # Convert to sunfish's perspective by sunfish's color so the
+                    # per-level tallies (and the Elo fit) match the per-game label.
                     r = results[nodes]
                     if res == "1-0":
                         r["w" if color == "w" else "l"] += 1
@@ -575,6 +578,8 @@ def main():
               f"{pts:>6.1f} {score:>7.3f} {elo:>8.0f}")
         fit_data.append((n, w, d, l))
 
+    # Fit sunfish Elo against the anchor curve, where Stockfish's Elo is
+    # anchored at sf_elo_anchor(nodes). The fitted R_sf is sunfish's Elo.
     r_fit, _ = fit_elo(fit_data)
     print(f"\nFitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): "
           f"{r_fit:.0f}")
