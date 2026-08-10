@@ -123,6 +123,42 @@ matters, single-file engine, all gates stay green). Specifically weigh:
    the right oracle, or should we move to Stockfish-verified mate-in-N suites
    (fixed positions with known DTM) that directly test the mating gradient?
 
+## What was tried (and reverted): the KQK/KRK DTM tablebase generator
+
+An offline retrograde DTM generator (`benchmarks/gen_endgame_tb.py`) was
+attempted per the root-only microtablebase design (byte-string tables, index
+`sk64*4096 + wk64*64 + pc64`, values 0..120 DTM / 250 draw, probed only at
+the root, never touching the TT or `bound()`). It is NOT committed — the
+generator produced a wrong table and was removed; the working tree is back at
+the last green state.
+
+**What worked:**
+- The table design and the move tables (king/slider moves per square,
+  capture-legality: the weak king may not capture an adjacent-defended piece,
+  self-check rules) are correct.
+- The mated-state seeding is verified: `Kf6 Qg7 vs Kh8` (weak to move,
+  checkmated) returns DTM 0.
+
+**What failed:** the retrograde propagation resolves only the 16 mate-in-1
+strong states, then stalls — the full closure to DTM 2, 3, ... never happens.
+Four different retrograde formulations were tried and all stalled identically
+(queue + unknown-child countdown; done-flag variants with draw-child
+propagation; iterative-layer expansion with per-pass count recompute). Every
+one resolved the same 16 DTM-1 states and nothing deeper, and no weak state
+ever had all its strong children resolved. The identical failure across four
+independent formulations points to a bug in the **child-graph structure
+itself** (weak-to-move child encoding or reverse-adjacency direction), not in
+the propagation loop. Root-cause debugging was not completed.
+
+**Recommendation for whoever picks this up:** before trusting any retrograde,
+validate the child graph against python-chess's legal moves on a small sample
+(e.g. 100 random states per side: does `children()` produce exactly the legal
+moves with correct child IDs, and does every strong state have at least one
+weak parent via the reverse adjacency?). The Lua-side probe design (SQ64,
+recognize_tb, tb_root_move, the fifty-move guard, no-TT-touching) is fully
+independent of the generator and ready to implement once a correct table
+exists.
+
 ## Constraints and current architecture (all verified against the code)
 
 - **Runtime**: LuaJ 3.0.2 interpreter on Android. No bit32, no bitwise
