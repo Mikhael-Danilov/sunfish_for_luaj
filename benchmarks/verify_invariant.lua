@@ -16,17 +16,17 @@
 local sunfish = require("sunfish")
 
 -- Current baseline (post promotion-expansion + auto-queen-removal bug fixes,
--- default NODES_SEARCHED = 1000): the budget-aware stop cuts the search off
--- mid-depth 4 at 1007 nodes, so only depths 1-4 are reached. The depth-6
--- 10026-node sequence of the old 10k default no longer applies; set_nodes(10000)
--- restores it. Node counts legitimately changed (budget default + the
--- auto-queen fix altered the position hash for non-pawn pieces reaching rank
--- 8), so this is the invariant every behavior-identical batch must preserve.
+-- default NODES_SEARCHED = 1000, plus endgame draw rules): the budget-aware
+-- stop cuts the search off mid-depth 4 at 1008 nodes, so only depths 1-4 are
+-- reached. Node counts legitimately changed (budget default, the auto-queen
+-- fix, and the 50-move/repetition/insufficient-material draw checks that now
+-- return draw scores before the TT probe), so this is the invariant every
+-- behavior-identical batch must preserve.
 local EXPECTED = {
     { depth = 1, nodes = 27,   score = 99 },
     { depth = 2, nodes = 153,  score = 0 },
     { depth = 3, nodes = 287,  score = 99 },
-    { depth = 4, nodes = 1007, score = 40 },
+    { depth = 4, nodes = 1008, score = 40 },
 }
 -- The invariant root move (current baseline): d7d5.
 local EXPECTED_MOVE = "d7d5"

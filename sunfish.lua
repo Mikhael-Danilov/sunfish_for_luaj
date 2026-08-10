@@ -10,6 +10,7 @@ local string_format = string.format
 
 local NODES_SEARCHED = 1000
 local MATE_VALUE = 30000
+local MATE_BAND = MATE_VALUE - 256 -- scores above |this| are distance-to-mate
 local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
 -- Yield tuning: the search yields periodically so the caller can poll. Under
@@ -356,6 +357,24 @@ for a = 1, 120 do
     end
 end
 
+-- CORNER_DIST[sq]: Chebyshev distance from 1-based square `sq` to the nearest
+-- board corner (0 for padding). Precomputed once so the endgame eval's
+-- king-corraling gradient needs no per-node math.
+local CORNER_DIST = {}
+for i = 0, 119 do
+    if is_on_board[i] then
+        local sq = i + 1
+        local r, f = math_floor(sq / 10), sq % 10 -- 1-based row/col in 2..9
+        local d1 = math.max(math_abs(r - 9), math_abs(f - 2)) -- A1 corner (row 9, col 2)
+        local d2 = math.max(math_abs(r - 9), math_abs(f - 9)) -- H1 (row 9, col 9)
+        local d3 = math.max(math_abs(r - 2), math_abs(f - 2)) -- A8 (row 2, col 2)
+        local d4 = math.max(math_abs(r - 2), math_abs(f - 9)) -- H8 (row 2, col 9)
+        CORNER_DIST[sq] = math.min(d1, d2, d3, d4)
+    else
+        CORNER_DIST[i + 1] = 0
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Transposition-table key (integer, cached per Position)
 --
@@ -430,8 +449,10 @@ end
 local Position = {}
 Position.__index = Position -- metatable dispatch is ~5x faster than copying methods in LuaJ
 
--- Public constructor: accepts a string board (backward compatible).
-function Position.new(board, score, wc, bc, ep, kp)
+-- Public constructor: accepts a string board (backward compatible). `fifty`
+-- and `piece_count` default to 0 / derived-from-board; the search path threads
+-- them explicitly via from_array.
+function Position.new(board, score, wc, bc, ep, kp, fifty, piece_count)
     local self = setmetatable({}, Position)
     self.board = board
     self.score = score
@@ -439,6 +460,8 @@ function Position.new(board, score, wc, bc, ep, kp)
     self.bc = bc
     self.ep = ep
     self.kp = kp
+    self.fifty = fifty or 0
+    self.piece_count = piece_count
     return self
 end
 
@@ -452,8 +475,9 @@ end
 --            after a pure rotation)
 --   _fh    = flag hash (wc/bc/ep/kp terms)
 -- These avoid the up-to-120-square scans/hash passes on every fresh search
--- position.
-function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh)
+-- position. `fifty` (half-move clock) and `piece_count` are threaded the same
+-- way for the endgame draw rules and endgame eval.
+function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh, fifty, piece_count)
     local self = setmetatable({}, Position)
     self._b = b
     self.score = score
@@ -466,6 +490,8 @@ function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh)
     self._bh = bh
     self._mh = mh
     self._fh = fh
+    self.fifty = fifty or 0
+    self.piece_count = piece_count or 0
     return self
 end
 
@@ -518,6 +544,8 @@ local function pool_free_pos(self)
     self.bc = nil
     self.ep = nil
     self.kp = nil
+    self.fifty = nil
+    self.piece_count = nil
     if #pool_free < POOL_CAP then
         pool_free[#pool_free + 1] = self
     end
@@ -600,6 +628,17 @@ function Position:ensure_board()
         self.board = table.concat(parts)
     end
     return self.board
+end
+
+-- Count pieces on the board array (one-time cost for public positions; the
+-- search path threads `piece_count` through move()/rotate() instead).
+local function count_pieces(b)
+    local n = 0
+    for i = 1, 120 do
+        local v = b[i]
+        if v ~= EMPTY and v ~= SP and v ~= NL then n = n + 1 end
+    end
+    return n
 end
 
 function Position:genMoves(out, start)
@@ -823,6 +862,37 @@ function Position:eking_index()
         end
     end
     return k
+end
+
+-- Is the material insufficient for a checkmate (K vs K, K+B vs K, K+N vs K)?
+-- Scans the board for minor pieces; only called when piece_count <= 3.
+local function insufficient_material(pos)
+    local b = pos:ensure_arr()
+    local minor = 0
+    for i = 1, 120 do
+        local v = b[i]
+        if v == KN or v == -KN or v == B or v == -B then
+            minor = minor + 1
+        elseif v == P or v == -P or v == R or v == -R or v == Q or v == -Q then
+            return false -- any pawn/rook/queen can mate
+        end
+    end
+    return minor <= 1 -- 0 minors = K vs K; 1 minor = K+minor vs K
+end
+
+-- King-corraling gradient for endgames (piece_count <= 4): drives the enemy
+-- king toward the nearest corner and brings the own king closer. Symmetric by
+-- construction (perspective = side to move), so no side-splitting is needed.
+-- Added to the leaf score so the search prefers positions that squeeze the
+-- enemy king into a mating net.
+local function endgame_eval(pos)
+    local ek = pos._eking or pos:eking_index()
+    local ok = pos._king or pos:king_index()
+    if not (ek and ok) then return 0 end
+    local bonus = -10 * CORNER_DIST[ek]
+    local kr, kf = math_floor(ok / 10), ok % 10
+    local ekr, ekf = math_floor(ek / 10), ek % 10
+    return bonus - 2 * math.max(math_abs(kr - ekr), math_abs(kf - ekf))
 end
 
 -- Pin/check detection (replaces king_sensitive): computes, for the side to
@@ -1114,6 +1184,9 @@ function Position:rotate(pooled)
     -- mirror relation). Flags swap wc/bc and mirror kp (ep is cleared above).
     local fh = flag_hash(self.bc, self.wc, 0, kp)
     local bh, mh = self._mh, self._bh
+    -- Rotation is a null move: the half-move clock and piece count persist.
+    local n_fifty = self.fifty
+    local n_pieces = self.piece_count
     if pooled then
         child._b = nb
         child.score = -self.score
@@ -1126,9 +1199,11 @@ function Position:rotate(pooled)
         child._bh = bh
         child._mh = mh
         child._fh = fh
+        child.fifty = n_fifty
+        child.piece_count = n_pieces
         return child
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh)
+    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh, n_fifty, n_pieces)
 end
 
 -- Zobrist contribution of a piece code at a square, for a hash table (zflat or
@@ -1265,6 +1340,16 @@ function Position:move(move, val, pooled)
         bh = (self._mh + dbh) % 4294967296
         mh = (self._bh + dmh) % 4294967296
     end
+    -- Thread the half-move clock and piece count: a capture or pawn move
+    -- resets the fifty counter; an ep capture removes a second piece.
+    local is_capture = q < 0 or (p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY)
+    local n_fifty = (q < 0 or p == P) and 0 or self.fifty + 1
+    local n_pieces = self.piece_count
+    if q < 0 then
+        n_pieces = n_pieces - 1
+    elseif is_capture then
+        n_pieces = n_pieces - 1 -- en passant: the pawn at j+S is removed
+    end
     if pooled then
         -- Reuse the pooled object: set the new frame fields on it.
         child._b = nb
@@ -1278,9 +1363,11 @@ function Position:move(move, val, pooled)
         child._bh = bh
         child._mh = mh
         child._fh = fh
+        child.fifty = n_fifty
+        child.piece_count = n_pieces
         return child
     end
-    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek, bh, mh, fh)
+    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek, bh, mh, fh, n_fifty, n_pieces)
 end
 
 function Position:value(move, b)
@@ -1407,7 +1494,7 @@ local m_move = Position.move
 -- sorted moves. Buffers are indexed by search depth, so each frame reads/writes
 -- its own region; no clear needed (explicit count).
 local move_stack = {}
-local ply = 0 -- current recursion depth (incremented per bound() entry)
+local ply_buf = 0 -- current recursion depth (incremented per bound() entry)
 
 -- The packed-move layout (value in the high bits via VAL_SCALE = 2^17, coords
 -- in the low 17 bits with max 119*128+119+promo < 2^17) makes a plain integer
@@ -1457,7 +1544,13 @@ local function move_sort(buf, n)
     end
 end
 
-local function bound(pos, gamma, depth, maxn)
+-- bound(pos, gamma, depth, maxn, ply, path): negamax fail-soft search. `ply` is
+-- the distance from the root, used for distance-to-mate scoring (the terminal
+-- mate score shrinks as the mate gets closer, giving the search a gradient to
+-- drive toward the shortest mate). `path` is a table of the Zobrist hashes on
+-- the current line (for repetition detection); it is passed by reference and
+-- pushed/popped by the caller around recursive bound() calls.
+local function bound(pos, gamma, depth, maxn, ply, path)
     nodes = nodes + 1
     -- Countdown-based yield: one decrement + compare per node (vs a modulo),
     -- and a coroutine switch only every YIELD_QUANTUM nodes.
@@ -1483,8 +1576,33 @@ local function bound(pos, gamma, depth, maxn)
         return pos.score
     end
 
-    if pos.score >= MATE_VALUE or pos.score <= -MATE_VALUE then
-        return pos.score
+    -- Ply-aware mate band: a threaded pos.score in the mate band is a
+    -- distance-to-mate score, so the threshold must shrink as the mate gets
+    -- closer (a score of MATE_VALUE - 5 at ply 10 is a near mate, not a
+    -- static evaluation to return unchanged).
+    if pos.score >= MATE_VALUE - ply then return pos.score end
+    if pos.score <= -(MATE_VALUE - ply) then return pos.score end
+
+    -- Draw rules, checked BEFORE the TT probe. The 50-move and repetition
+    -- scores are path-dependent (they depend on HOW this position was reached):
+    -- caching them in the TT would poison a transposition reached via a
+    -- non-repeating path, so they are returned here and never stored.
+    if pos.fifty >= 100 then
+        if depth >= 8 then io.stderr:write("DBG fifty-draw depth=" .. depth .. "\n") end
+        return 0
+    end
+    local key = m_key(pos)
+    for i = #path, 1, -1 do
+        if path[i] == key then
+            if depth >= 8 then io.stderr:write("DBG repetition depth=" .. depth .. " pathlen=" .. #path .. "\n") end
+            return 0 -- repetition draw
+        end
+    end
+    -- Insufficient material (K vs K, K+B vs K, K+N vs K) is position-static
+    -- and safe to cache, but kept in the same pre-TT block for uniformity.
+    if pos.piece_count <= 3 and insufficient_material(pos) then
+        if depth >= 8 then io.stderr:write("DBG insufficient depth=" .. depth .. "\n") end
+        return 0
     end
 
     -- Look up the transposition table BEFORE move generation. A usable entry
@@ -1493,7 +1611,6 @@ local function bound(pos, gamma, depth, maxn)
     -- with no legal moves never stores a TT entry (we only store after a legal
     -- move is found), and the terminal-score check above catches
     -- already-decided positions.
-    local key = m_key(pos)
     -- Inlined TT probe: the flat arrays are read directly with the slot
     -- computed once, and only after the full-key verify. `ed` is also read by
     -- the store-site guard below, so it is declared here.
@@ -1511,6 +1628,15 @@ local function bound(pos, gamma, depth, maxn)
                 local es = ttS[s]
                 local eg = ttG[s]
                 if es < eg and es < gamma or es >= eg and es >= gamma then
+                    -- TT stores mate scores as distance-from-the-storing-node;
+                    -- re-anchor them to this node's ply so the DTM is
+                    -- path-length-independent.
+                    if es >= MATE_BAND then
+                        es = es - ply
+                    elseif es <= -MATE_BAND then
+                        es = es + ply
+                    end
+                    if depth >= 8 then io.stderr:write("DBG tt-hit depth=" .. depth .. " es=" .. es .. " ed=" .. ed .. "\n") end
                     return es, ttM[s]
                 end
             end
@@ -1521,11 +1647,11 @@ local function bound(pos, gamma, depth, maxn)
     -- in check. If no legal move exists the position is checkmate or stalemate.
     -- genMoves writes packed moves into this frame's per-ply buffer; we filter
     -- in place (nlegal <= k, so compaction never overwrites an unread entry).
-    ply = ply + 1
-    local buf = move_stack[ply]
+    ply_buf = ply_buf + 1
+    local buf = move_stack[ply_buf]
     if not buf then
         buf = {}
-        move_stack[ply] = buf
+        move_stack[ply_buf] = buf
     end
     local pe = m_genMoves(pos, buf, 1)
     local nlegal = 0
@@ -1540,10 +1666,12 @@ local function bound(pos, gamma, depth, maxn)
         end
     end
     if nlegal == 0 then
-        ply = ply - 1
+        ply_buf = ply_buf - 1
         if m_in_check(pos) then
-            return -MATE_VALUE -- checkmate: side to move loses
+            if depth >= 8 then io.stderr:write("DBG terminal-mate depth=" .. depth .. " ply=" .. ply .. "\n") end
+            return -(MATE_VALUE - ply) -- distance-to-mate
         else
+            if depth >= 8 then io.stderr:write("DBG terminal-stalemate depth=" .. depth .. "\n") end
             return 0 -- stalemate
         end
     end
@@ -1556,11 +1684,15 @@ local function bound(pos, gamma, depth, maxn)
     local nullscore = pos.score
     if depth > 0 then
         null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
-        nullscore = -bound(null_child, 1 - gamma, depth - 3, maxn)
+        -- The null move is a pass: it does not reset fifty/repetition state,
+        -- and the position hash is pushed so a repetition through it is caught.
+        path[#path + 1] = key
+        nullscore = -bound(null_child, 1 - gamma, depth - 3, maxn, ply + 1, path)
+        path[#path] = nil
         pool_free_pos(null_child) -- the null-move child is dead after this node
     end
     if nullscore >= gamma then
-        ply = ply - 1
+        ply_buf = ply_buf - 1
         return nullscore
     end
 
@@ -1570,6 +1702,17 @@ local function bound(pos, gamma, depth, maxn)
     -- pos:value() O(N log N) times.
     for k = 1, nlegal do
         buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
+    end
+
+    -- Endgame leaf: for sparse positions (<= 4 pieces), return the threaded
+    -- score plus the king-corraling gradient instead of searching children.
+    -- This gives the search the monotonic drive toward a mating net that the
+    -- material+PST score alone lacks. Non-endgame leaves are untouched.
+    if depth <= 0 and pos.piece_count <= 4 then
+        if false then end
+        ply_buf = ply_buf - 1
+        local e = pos.score + endgame_eval(pos)
+        return e
     end
 
     -- At depth <= 0 the loop below breaks at the first move_val < 150 (the
@@ -1599,7 +1742,9 @@ local function bound(pos, gamma, depth, maxn)
         local move = buf[k]
         local mv = move_val(move)
         local child = m_move(pos, move, mv, true) -- pooled
-        local score = -bound(child, 1 - gamma, depth - 1, maxn)
+        path[#path + 1] = key -- the child's line = this node's hash + the child
+        local score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+        path[#path] = nil
         pool_free_pos(child) -- the child is dead after its subtree returns
         if score > best then
             best = score
@@ -1611,21 +1756,42 @@ local function bound(pos, gamma, depth, maxn)
     end
 
     if depth <= 0 and best < nullscore then
-        ply = ply - 1
+        ply_buf = ply_buf - 1
         return nullscore
     end
 
     if not had_entry or depth >= ed and best >= gamma then
-        tp_set(key, depth, best, gamma, bmove)
+        -- Store mate scores anchored to THIS node's ply so a transposition
+        -- reached at a different distance re-anchors correctly on retrieval.
+        local tt_score = best
+        if tt_score >= MATE_BAND then
+            tt_score = tt_score + ply
+        elseif tt_score <= -MATE_BAND then
+            tt_score = tt_score - ply
+        end
+        tp_set(key, depth, tt_score, gamma, bmove)
     end
-    ply = ply - 1
+    ply_buf = ply_buf - 1
+    if depth >= 8 and (best == 0 or math.abs(best) < 1000) then
+        io.stderr:write("DBG bound-return depth=" .. depth .. " best=" .. best .. " gamma=" .. gamma .. " nlegal=" .. nlegal .. "\n")
+    end
     return best, bmove
 end
 
 local function search(pos, maxn)
     maxn = maxn or NODES_SEARCHED
+    -- Dynamic node budget: endgame branching factors are tiny, so spend more
+    -- nodes when few pieces remain (LuaJ is slow, but sparse positions are
+    -- cheap to search). The 32-piece start position is unaffected.
+    local pc = pos.piece_count
+    if pc <= 4 then
+        maxn = maxn * 4
+    elseif pc <= 6 then
+        maxn = maxn * 2
+    end
     nodes = 0
     budget_exhausted = false
+    local path = {} -- repetition-detection line hashes (starts empty at root)
     tt_probe, tt_hit, tt_slot_hit = 0, 0, 0
     acnt_probe, acnt_king, acnt_touch, acnt_ep, acnt_castle = 0, 0, 0, 0, 0
     if TIME_BUDGET > 0 then
@@ -1657,7 +1823,7 @@ local function search(pos, maxn)
         while lower < upper - 3 do
             local gamma = math_floor((lower + upper + 1) / 2)
             local mv
-            score, mv = bound(pos, gamma, depth, maxn)
+            score, mv = bound(pos, gamma, depth, maxn, 0, path)
             assert(score)
             if score >= gamma then
                 lower = score
@@ -1676,7 +1842,7 @@ local function search(pos, maxn)
             while nlower < nupper - 3 do
                 local ngamma = math_floor((nlower + nupper + 1) / 2)
                 local nmv
-                score, nmv = bound(pos, ngamma, depth, maxn)
+                score, nmv = bound(pos, ngamma, depth, maxn, 0, path)
                 assert(score)
                 if score >= ngamma then
                     nlower = score
@@ -1695,8 +1861,11 @@ local function search(pos, maxn)
 
         -- Budget-aware stop: break early when bound() aborted mid-depth (the
         -- flag is set at the per-node check point) or the depth completed the
-        -- budget. The last completed depth's fail-high move is already captured.
-        if budget_exhausted or nodes >= maxn or score >= MATE_VALUE or score <= -MATE_VALUE then
+        -- budget. Also break on a mate-band score: with distance-to-mate the
+        -- score tops out at MATE_VALUE - 1 (mate in 1), so the old flat
+        -- `>= MATE_VALUE` never fired and the search kept deepening into
+        -- pathologies. The last completed depth's fail-high move is captured.
+        if budget_exhausted or nodes >= maxn or score >= MATE_BAND or score <= -MATE_BAND then
             break
         end
     end
@@ -1811,6 +1980,7 @@ local game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)
 
 function sunfish.new()
     game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)
+    game.piece_count = 32
     return game
 end
 
@@ -1832,6 +2002,12 @@ function sunfish.restore_data(dta)
     for k,v in pairs(dta) do
         game[k] = v
     end
+    -- Public positions carry no threaded counters: derive piece_count from the
+    -- board and default fifty to 0 (the serialized shape never stores them).
+    if not game.piece_count then
+        game.piece_count = count_pieces(game:ensure_arr())
+    end
+    game.fifty = game.fifty or 0
     return game
 end
 
