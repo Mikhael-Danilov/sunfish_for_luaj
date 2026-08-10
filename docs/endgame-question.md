@@ -159,6 +159,80 @@ recognize_tb, tb_root_move, the fifty-move guard, no-TT-touching) is fully
 independent of the generator and ready to implement once a correct table
 exists.
 
+## A working, validated canonical KRK/KQK solver: `bkm.lua`
+
+`bkm.lua` (repo root) is a self-contained, algorithmic (not tablebase-string)
+KRK/KQK solver in the spirit of Bratko–Kopec–Michie. It canonicalizes the
+state as `(strong king, strong piece, weak king, side to move)`, builds the
+full `64*64*64*2 = 524288`-state graph, and computes **exact DTM in plies** by
+retrograde minimax with a BKM-style distance tuple for tie-breaking
+(edge-dist · 128 + king-dist · 16 + piece-dist). Capture of the rook/queen by
+the lone king is an immediate draw, as in the game.
+
+**API:** `bkm.square/alg`, `bkm.solver("R"|"Q")` (cached), then
+`solver:evaluate/is_win/dtm(wk,pc,bk,stm)`, `solver:bkm_score(...)`, and
+`solver:best_move{wk,pc,bk,stm}` returning `{from,to,piece[,capture]}`.
+`best_move` for the strong side picks a minimal-DTM mating move; for the weak
+side it maximizes delay (or captures the piece / draws when available);
+returns `nil` for terminal states (DTM-0 mate or stalemate) and INVALID states.
+
+### Validation (exhaustive, against an independent oracle)
+
+`benchmarks/gen_bkm_oracle.py` builds an independent retrograde DTM table for
+R and Q (bitboard-based, same game graph) and dumps it to
+`/tmp/bkm_oracle/oracle_{R,Q}.bin`. `benchmarks/validate_bkm.py` dumps the
+Lua solver's full 524288-state table and diffs **status and DTM byte-for-byte**
+against the oracle; `benchmarks/validate_bkm_moves.py` replays a random sample
+of `best_move`s through python-chess to check legality and the DTM
+decrement/increment semantics.
+
+Results (identical on LuaJIT and lua5.1):
+
+| Check | KRK | KQK |
+|---|---|---|
+| full-table status+DTM diff vs oracle | 0 mismatches / 524288 | 0 / 524288 |
+| wins / draws / invalid | 376868 / 22244 / 125176 | 345404 / 23048 / 155836 |
+| best_move legality + DTM semantics (4000 states/piece) | 0 mismatches | 0 mismatches |
+
+This closes the exact gap the reverted generator hit: the retrograde closure
+completes (the stalled DTM-1-only propagation is gone), and the child graph is
+independently confirmed. The earlier "only the 16 mate-in-1 states resolve"
+diagnosis was correct about the symptom; `bkm.lua` uses the countdown-on-weak-
+states formulation that does complete.
+
+### Known API footgun
+
+`solver.encode/decode` are plain functions (call with `.`, not `:`), while
+`bkm_score`/`evaluate`/`is_win`/`dtm`/`best_move` are `:` methods. Also,
+`solver.dtm` is a *method* that shadows the raw DTM array, so the array is
+only reachable via `solver:evaluate(...)`.
+
+### Benchmark (build is one-time, cached)
+
+| op | LuaJ (target) | LuaJIT | lua5.1 |
+|---|---|---|---|
+| KRK build | ~47 s | 0.48 s | 5.8 s |
+| KQK build | ~34 s | 0.64 s | 6.6 s |
+| evaluate (524288) | 55–136 k/s | 66–113 M/s | 0.8–1.4 M/s |
+| best_move (strong) | 0.7–2.2 k/s | 110–147 k/s | 14 k/s |
+
+`benchmarks/bench_bkm.lua` (honors `BENCH_SCALE`; run under LuaJ via
+`BENCH_SCALE=0.02 benchmarks/run_luaj.sh benchmarks/bench_bkm.lua`). For
+in-engine use, build each solver once per process (they are cached) and probe
+at the root; a single `evaluate` is ~0.9–1.4 µs on LuaJIT, ~7–18 µs on lua5.1,
+~180 µs on LuaJ — cheap enough to call per root move, expensive to call per
+node under LuaJ.
+
+### Notes / caveats
+
+- The example in the original spec (`Kb6 Qh1 vs Ka8`, KQK) is **not a legal
+  state**: the queen on h1 already attacks a8, so white-to-move is in check
+  (the solver reports INVALID). The KRK analog (`Kb6 Rh1 vs Ka8`) is legal and
+  `best_move` correctly returns `h1 h8` (`Rh8#`, mate-in-1).
+- The canonical 0..63 encoding here is independent of the engine's 120-cell
+  board; `bkm.lua` is a standalone module and does not touch `sunfish.lua`.
+
+
 ## Constraints and current architecture (all verified against the code)
 
 - **Runtime**: LuaJ 3.0.2 interpreter on Android. No bit32, no bitwise

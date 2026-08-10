@@ -89,6 +89,24 @@ helpers used by search and move validation.
 Stockfish is used as a reference during development (see `.reference/`, not
 committed); it is not required to run the tests.
 
+## KRK / KQK endgame solver (`bkm.lua`)
+
+`bkm.lua` (repo root) is a standalone, validated canonical KRK/KQK solver
+(Bratko–Kopec–Michie-style): exact DTM in plies over the full 524288-state
+graph, with `solver:best_move` for optimal mating / optimal delaying moves.
+Independent oracle validation (`benchmarks/gen_bkm_oracle.py` +
+`benchmarks/validate_bkm.py`) matches the full table byte-for-byte, and
+`benchmarks/validate_bkm_moves.py` verifies `best_move` legality and DTM
+semantics through python-chess. See `docs/endgame-question.md` for the
+validation table and LuaJ/LuaJIT/lua5.1 benchmarks.
+
+```sh
+luajit benchmarks/bench_bkm.lua        # benchmark build/evaluate/best_move
+python3 benchmarks/gen_bkm_oracle.py /tmp/bkm_oracle  # one-time oracle tables
+python3 benchmarks/validate_bkm.py luajit /tmp/bkm_oracle      # full-table diff
+python3 benchmarks/validate_bkm_moves.py luajit 4000 ... /tmp/bkm_oracle
+```
+
 ## Notes on the engine's API (verified by the tests)
 
 - **Rotation semantics**: the engine rotates the board after every move. `sunfish.move`
