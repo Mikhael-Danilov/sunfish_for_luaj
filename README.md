@@ -107,6 +107,39 @@ python3 benchmarks/validate_bkm.py luajit /tmp/bkm_oracle      # full-table diff
 python3 benchmarks/validate_bkm_moves.py luajit 4000 ... /tmp/bkm_oracle
 ```
 
+## KRK / KQK lightweight mover (`bkm_light.lua`)
+
+`bkm_light.lua` is a lightweight Bratko–Kopec–Michie-style KRK/KQK mover with
+no large precomputed tables and constant tiny memory (~50 KB vs ~8 MB for the
+full solver). It is the constrained-environment alternative to `bkm.lua`: it
+plays legal, terminating KRK/KQK games (validated against the same oracle), but
+mates are heuristic, not DTM-optimal (typically a few plies slower).
+
+The engine can use it as a **fast path for K+R vs K / K+Q vs K**: when enabled,
+`sunfish.ai_move` answers these endgames instantly without running the search.
+
+```sh
+# one-shot via env
+SUNFISH_USE_BKM_LIGHT=1 luajit your_app.lua
+
+# at runtime
+sunfish.set_use_bkm_light(true)   -- returns the previous value
+sunfish.set_use_bkm_light(false)  -- back to the full search (default)
+```
+
+Validation and benchmarks:
+
+```sh
+luajit benchmarks/bench_bkm_light.lua          # memory + throughput vs bkm.lua
+BENCH_SCALE=0.1 benchmarks/run_luaj.sh benchmarks/bench_bkm_light_luaj.lua  # under LuaJ
+python3 benchmarks/validate_bkm_light_moves.py luajit 3000 ... /tmp/bkm_oracle
+luajit tests/test_bkm_light_integration.lua    # sunfish fast-path integration
+luajit tests/selfplay_bkm_light.lua 150 7      # full-game stress (legal + mate)
+```
+
+The fast path uses `mate_plies = 1` (immediate mate only): a deeper forced-mate
+search is ~12x slower under LuaJ and buys little over the heuristic mover.
+
 ## Notes on the engine's API (verified by the tests)
 
 - **Rotation semantics**: the engine rotates the board after every move. `sunfish.move`

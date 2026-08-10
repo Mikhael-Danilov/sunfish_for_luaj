@@ -21,6 +21,15 @@ local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k sl
 -- ceiling (no coroutine switches).
 local YIELD_QUANTUM = 256
 local YIELD_ENABLED = true
+
+-- KRK/KQK endgame fast path: when the position is exactly K+R vs K or K+Q vs K
+-- and USE_BKM_LIGHT is enabled, ai_move answers instantly via the lightweight
+-- bkm_light mover (constant tiny memory, no search) instead of running the
+-- full search. Off by default: the search already plays these endgames well,
+-- and the fast path only helps constrained environments that want instant,
+-- deterministic KRK/KQK play. The exact tablebase solver (bkm.lua) stays a
+-- standalone module; bkm_light is the no-memory alternative.
+local USE_BKM_LIGHT = os.getenv("SUNFISH_USE_BKM_LIGHT") == "1"
 -- Gate the per-depth search progress print. Under LuaJ (and Android log
 -- routing) the unconditional print/string_format is expensive; SUNFISH_VERBOSE=1
 -- enables it for debugging, otherwise search runs silent.
@@ -1957,6 +1966,10 @@ local sunfish = {}
 
 sunfish.MATE_VALUE = MATE_VALUE
 
+-- Optional KRK/KQK lightweight mover (loaded lazily, only when the fast path
+-- is enabled, so the default build never pays the require cost).
+local bkm_light
+
 -- Tunable yield behavior for the search coroutine (see the YIELD_QUANTUM
 -- comment near the top of the file). Pass enable=false to disable yields
 -- entirely (throughput ceiling; only safe where the caller never polls).
@@ -1973,6 +1986,14 @@ end
 -- what a responsiveness deadline wants on the Android RPD layer.
 function sunfish.set_time_budget(seconds)
     TIME_BUDGET = seconds or 0
+end
+
+-- Toggle the KRK/KQK lightweight fast path at runtime (default off, or on via
+-- SUNFISH_USE_BKM_LIGHT=1). Returns the previous value.
+function sunfish.set_use_bkm_light(enabled)
+    local prev = USE_BKM_LIGHT
+    USE_BKM_LIGHT = enabled and true or false
+    return prev
 end
 
 -- Node budget per ai_move search (default NODES_SEARCHED). Raise for stronger
@@ -2074,7 +2095,140 @@ function sunfish.move(game, mv)
     return false
 end
 
+------------------------------------------------------------------------------
+-- KRK/KQK lightweight fast path (bkm_light)
+--
+-- Detects the exact material signature K+R vs K / K+Q vs K (piece_count == 3,
+-- no pawns/minors on either side) and, when the fast path is enabled, answers
+-- ai_move directly with the bkm_light mover. The mover uses 0..63 coordinates
+-- (a1 = 0); the engine frame is 1-based with A1 = 92, so squares are converted
+-- through render()/parse(). The strong side (king + rook/queen) and the lone
+-- king are detected symmetrically regardless of which color is to move.
+------------------------------------------------------------------------------
+
+-- Returns the bkm_light-friendly state { wk, pc, bk, stm } for a K+R/K+Q vs K
+-- position, or nil if the material is not one of those (or kings are missing).
+--
+-- The engine frame always renders the side to move as uppercase, so after a
+-- strong-side move the position is rotated and the *lone* king is uppercase.
+-- We therefore detect the material symmetrically: find the king that owns the
+-- rook/queen (the strong side), wherever it is, and set stm from which color
+-- is uppercase (to move).
+local function krk_kqk_state(game)
+    local b = game:ensure_arr()
+    local k1, k2        -- the two kings (frame indices)
+    local pc, pc_code   -- the single rook/queen (frame index + code)
+    local pc_color      -- sign of the rook/queen's color
+
+    for i = 1, 120 do
+        local v = b[i]
+        if v == K or v == -K then
+            if k1 then k2 = i else k1 = i end
+        elseif v == R or v == Q or v == -R or v == -Q then
+            if pc then return nil end -- more than one strong piece
+            pc = i
+            pc_code = v
+            pc_color = (v > 0) and 1 or -1
+        elseif v == P or v == -P or v == KN or v == -KN or v == B or v == -B then
+            return nil -- pawns/minors/extra rooks/queens: not KRK/KQK
+        end
+    end
+
+    if not (k1 and k2 and pc) then
+        return nil
+    end
+
+    -- The strong king is the one on the same color as the rook/queen.
+    local sk, lk
+    if b[k1] * pc_color > 0 then
+        sk, lk = k1, k2
+    else
+        sk, lk = k2, k1
+    end
+
+    -- Side to move: in this frame the uppercase side is to move. The strong
+    -- side (sk) is uppercase when b[sk] > 0.
+    local stm = (b[sk] > 0) and 0 or 1
+
+    local bkm = require("bkm_light")
+    return {
+        wk  = bkm.square(render(sk)),
+        pc  = bkm.square(render(pc)),
+        bk  = bkm.square(render(lk)),
+        stm = stm,
+        _piece = math.abs(pc_code) == R and "R" or "Q",
+    }
+end
+
+-- bkm_light's cycle-breaker history is module-global; it must be reset when a
+-- new game starts, otherwise history from a previous game changes the moves in
+-- the current one (and can push a fine position into a long detour). The fast
+-- path tracks the expected successor state (after the rotation that game:move
+-- performs) and resets only when the next call is NOT that successor — i.e. a
+-- new game or a non-fast-path move happened in between.
+--
+-- bkm uses 0..63 (a1=0); the engine frame is 1-based (A1=92). A move from
+-- frame square i to j produces a rotated child whose piece lands at 121-j, so
+-- the successor's coordinate is the mirror of j. We keep the successor key in
+-- bkm coordinates and compare against the next call's state.
+local last_bkm_succ = nil
+
+-- The engine rotates the board after every move, so the child frame is the
+-- mirror of the parent: every square mirrors (a1<->h8, etc.). After a strong
+-- move from (wk,pc,bk) with the piece moving to `to`, the child state in bkm
+-- coordinates is the mirror of all three squares, with the moved piece at the
+-- mirror of `to`. Compute that as the expected successor key.
+local function bkm_successor_key(st, mv)
+    local bkm = require("bkm_light")
+    local to_frame = parse(bkm.alg(mv.to))
+    local sq = bkm.square(render(121 - to_frame))  -- mirror of the destination
+    local mwk = 63 - st.wk                         -- mirror of the strong king
+    local mpc = 63 - st.pc                         -- mirror of the old piece sq
+    local mbk = 63 - st.bk                         -- mirror of the weak king
+    if mv.piece == "K" and mv.from == st.wk then
+        return (sq * 64 + mpc) * 64 + mbk
+    elseif mv.piece ~= "K" and mv.from == st.pc then
+        return (mwk * 64 + sq) * 64 + mbk
+    else
+        -- weak king moved (stm=1 reply): its mirror is the destination
+        return (mwk * 64 + mpc) * 64 + sq
+    end
+end
+
 function sunfish.ai_move(game)
+    if USE_BKM_LIGHT and game.piece_count == 3 then
+        local st = krk_kqk_state(game)
+        if st then
+            local bkm = require("bkm_light")
+            local key = (st.wk * 64 + st.pc) * 64 + st.bk
+            if last_bkm_succ ~= key then
+                bkm.reset_history()
+            end
+            -- mate_plies = 1: immediate mate only. Deeper forced-mate search is
+            -- ~12x slower under LuaJ (per-node strong_moves enumeration) and
+            -- buys little over the heuristic mover, so keep it at the cheap
+            -- default for the constrained target.
+            local mv = bkm.best_move(st, st._piece, { mate_plies = 1 })
+            if mv then
+                -- Convert the bkm_light move back to engine frame squares.
+                -- bkm uses 0..63 (a1=0); parse() maps a coordinate back to the
+                -- 1-based frame index. The packed move is in the current frame
+                -- (game:move() rotates internally), so the UCI string uses the
+                -- real coordinates, not the mirrored ones the search path uses.
+                local from = parse(bkm.alg(mv.from))
+                local to = parse(bkm.alg(mv.to))
+                last_bkm_succ = bkm_successor_key(st, mv)
+                local ng = game:move(from * 128 + to + PACKED_ZERO_VAL)
+                ng:ensure_board()
+                local mvstr = render(from) .. render(to)
+                return ng, mvstr, 0
+            end
+        end
+    end
+
+    -- Fell through to the search: the fast-path successor tracking is stale.
+    last_bkm_succ = nil
+
     local move, score = search(game)
 
     assert(score)
