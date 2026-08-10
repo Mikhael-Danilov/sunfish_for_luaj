@@ -1,7 +1,7 @@
 -- sunfish.lua, a human transpiler work of https://github.com/thomasahle/sunfish
 -- Code License: BSD
 
--- Localize global functions for massive performance gains in Luaj interpreter mode
+-- Localize global functions for performance in LuaJ interpreter mode
 local math_floor = math.floor
 local math_abs = math.abs
 local string_sub = string.sub
@@ -12,14 +12,12 @@ local NODES_SEARCHED = 1000
 local MATE_VALUE = 30000
 local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
--- Yield tuning. The search runs inside a coroutine (the Android RPD loop and
--- the test harness drive it) and yields periodically so the caller can poll.
--- Under LuaJ each coroutine.yield() is a JVM context hop (~330 switches per
--- 10k search at the old hardcoded 30-node quantum), so a bigger countdown
--- quantum is measurably faster (~33% at 256, ~41% at 1024; no-yield ~56%).
--- YIELD_QUANTUM is a tunable; the Android layer can lower it for
--- responsiveness or raise it for throughput. YIELD_ENABLED lets the
--- benchmark harness measure the uncapped ceiling (no coroutine switches).
+-- Yield tuning: the search yields periodically so the caller can poll. Under
+-- LuaJ each coroutine.yield() is a JVM context hop, so a bigger countdown
+-- quantum is measurably faster (~33% at 256, ~41% at 1024). YIELD_QUANTUM is a
+-- tunable; the Android layer can lower it for responsiveness or raise it for
+-- throughput. YIELD_ENABLED lets the benchmark harness measure the uncapped
+-- ceiling (no coroutine switches).
 local YIELD_QUANTUM = 256
 local YIELD_ENABLED = true
 -- Gate the per-depth search progress print. Under LuaJ (and Android log
@@ -72,11 +70,6 @@ local initial = '         \n' .. --   0 -  9
 local EMPTY, P, KN, B, R, Q, K = 0, 1, 2, 3, 4, 5, 6
 local NL, SP = 98, 99
 
--- Packed move encoding. A move is a single integer instead of a {i, j, val}
--- table: value semantics (no aliasing), and genMoves allocates one number per
--- pseudo-legal move instead of one 3-cell table. Layout:
---   low 14 bits  : from-square i * 128 + to-square j   (i,j in 0..119)
---   high bits    : signed sort value, biased by VAL_BIAS (2^22)
 -- Packed move layout (pure arithmetic; no bit32/bitwise ops, per the LuaJ
 -- constraint):
 --   bits 0-6   : to-square j            move_to:    v % 128
@@ -434,12 +427,8 @@ do
     zob_kp[121] = 0 -- mirror of the no-kp sentinel (121 - 0)
 end
 
--- The old string-keyed maps (is_upper_map/is_lower_map/swap_map) are replaced
--- by the integer codes: p >= 1 means our piece, p < 0 means enemy, -p is the
--- enemy's piece type.
-
 local Position = {}
-Position.__index = Position -- Using a Metatable is ~5x faster in luaj than loop-copying methods!
+Position.__index = Position -- metatable dispatch is ~5x faster than copying methods in LuaJ
 
 -- Public constructor: accepts a string board (backward compatible).
 function Position.new(board, score, wc, bc, ep, kp)
@@ -554,11 +543,6 @@ end
 -- this is O(1) for them; public positions (built from strings) fall back to
 -- the full 120-pass, which also populates the three hashes so their children
 -- become incremental.
---
--- NOTE: this was previously reverted because a pre-existing `_b` corruption
--- (stale ep from the null-move rotate) made a cached board hash unsafe. That
--- bug is now fixed (rotate() clears ep, is_legal guards the ep capture), so the
--- cached hash is safe again — see the doc's "En-passant undo bug" note.
 function Position:key()
     local k = self._key
     if not k then
@@ -630,18 +614,13 @@ function Position:genMoves(out, start)
         local p = b[i]
         if p >= P and p <= K then
             if p == P then
-                -- Pawn: single push, double push, captures, ep.
-                -- Off-board squares are padding (SP=99/NL=98), never EMPTY, so
-                -- b[j] == EMPTY inherently rejects them — no is_on_board_1
-                -- guard needed. The double push is confined to rank-2 pawns
-                -- (i >= A1+N) whose j2 is always on board.
+                -- Pawn: single push, double push, captures, ep. Off-board
+                -- squares are padding (SP=99/NL=98), never EMPTY, so the
+                -- b[j] == EMPTY checks inherently reject them; the double push
+                -- is confined to rank-2 pawns whose j2 is always on board.
                 local j = i + N
                 if b[j] == EMPTY then
                     move_idx = emit_pawn(moves, move_idx, i, j)
-                    -- Double push: original allows it whenever i >= A1+N and
-                    -- the intermediate square is empty (the single push above
-                    -- already verified b[i+N]==EMPTY). The last-rank special
-                    -- case (e.g. a pawn on e1) is preserved.
                     if i >= A1 + N then
                         local j2 = i + 2 * N
                         if b[j2] == EMPTY then
@@ -649,7 +628,7 @@ function Position:genMoves(out, start)
                         end
                     end
                 end
-                -- Captures (diagonals). En passant when the target is empty but is ep.
+                -- Captures (diagonals); en passant when the target is empty but is ep.
                 -- pawn_caps is sentinel-padded to 2 (0 terminates).
                 local pc = pawn_caps[i]
                 for c = 1, 2 do
@@ -761,12 +740,9 @@ function Position:attacked(i, b, ptag)
         if b[sq] == -KN then return true end
     end
 
-    -- Pawn attacks: an enemy pawn attacks square i along one diagonal. The
-    -- engine rotates the board after every move, so the enemy pawn's "forward"
-    -- can point toward index 0 (white frame) or index 119 (black frame).
-    -- Checking both diagonals is safe: in a legal position an enemy pawn can
-    -- only be on one diagonal from i, and the other can't be occupied by a
-    -- pawn (it would be behind the pawn).
+    -- Pawn attacks: the engine rotates after every move, so an enemy pawn's
+    -- "forward" can point toward index 0 (white frame) or 119 (black frame);
+    -- checking both diagonals is safe in a legal position.
     local pc = pawn_caps[i]
     for c = 1, 2 do
         local sq = pc[c]
@@ -774,8 +750,8 @@ function Position:attacked(i, b, ptag)
         if b[sq] == -P then return true end
     end
 
-    -- Sliding pieces (rook, bishop, queen): walk the 8 precomputed rays.
-    -- Rook rays (di 1..4) attack with -R/-Q; bishop rays (di 5..8) with -B/-Q.
+    -- Sliding pieces: walk the 8 precomputed rays. Rook rays (di 1..4) attack
+    -- with -R/-Q; bishop rays (di 5..8) with -B/-Q.
     for di = 1, 4 do
         local ray = ray_squares[i][di]
         local c = 1
@@ -956,10 +932,7 @@ function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
     local q = b[j]
 
     -- Standard chess has no king captures, and no piece may land on the own
-    -- king. A move onto either king is illegal. (The own-king case was missed:
-    -- only q == -K was rejected, so a move like h1e1 with the king on e1
-    -- overwrote the king and was wrongly accepted — caught by the selfplay
-    -- correctness gate.)
+    -- king. A move onto either king is illegal.
     if q == K or q == -K then
         return false
     end
@@ -969,14 +942,12 @@ function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
     end
 
     -- King move: destination (and castling intermediate square) must not be
-    -- attacked. This is the x-ray-correct slow path — a king may not step into
-    -- a square attacked by a slider even if a piece currently shields it.
+    -- attacked — the x-ray-correct slow path, since a king may not step into a
+    -- square attacked by a slider even if a piece currently shields it.
     if p == K then
         if j - i == 2 or i - j == 2 then
-            -- Castling. Replicate the original construction exactly: i emptied,
-            -- between holds the KING, j holds the ROOK (the original put K at j
-            -- then overwrote j with R), and the rook's origin square is left
-            -- untouched. Attack-tests between and j.
+            -- Castling: i emptied, between holds the KING, j holds the ROOK,
+            -- rook origin untouched. Attack-test between and j.
             local between = j < i and i - 1 or i + 1
             b[i] = EMPTY
             b[between] = K
@@ -1023,10 +994,8 @@ function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
                 return false
             end
         end
-        -- En-passant: removing the captured pawn can expose a pin/check. The
-        -- ep square j is on the pin line only for the rare horizontal case; the
-        -- diagonal ep removes a pawn that could be the pinning slider. Run the
-        -- mutate/undo slow path for correctness.
+        -- En-passant: removing the captured pawn can expose a pin/check, so
+        -- run the mutate/undo slow path for correctness.
         local is_ep = p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY
         if is_ep then
             b[i] = EMPTY
@@ -1136,10 +1105,9 @@ function Position:rotate(pooled)
     if ok and ek then nk = 121 - ek end
     if ek and ok then nek = 121 - ok end
     -- rotate() is a NULL move (no pawn pushed): the en-passant target must be
-    -- cleared, not mirrored from the parent. Mirroring a stale `ep` makes
-    -- genMoves emit bogus ep captures and is_legal's undo corrupts the board
-    -- (a phantom pawn leaks into the pooled child). kp mirrors correctly (it is
-    -- a king-past-square, not an ep flag).
+    -- cleared, not mirrored from the parent (a stale `ep` would let genMoves
+    -- emit bogus ep captures and is_legal's undo would corrupt the pooled
+    -- child). kp mirrors correctly — it is a king-past-square, not an ep flag.
     local ep, kp = 0, 121 - self.kp
     -- Dual-hash threading (item 2): a pure rotation maps the board hash to the
     -- parent's mirror hash, and vice versa (rotate twice = identity on the
@@ -1206,16 +1174,12 @@ function Position:move(move, val, pooled)
         ep = i + N
     end
 
-    -- Build the rotated child board as a straight copy + sparse edits (the
-    -- "make/unmake" experiment: measured ~5.5% faster than the single-pass
-    -- rotate loop under LuaJ — the per-cell branch + interleaved edit/hash
-    -- handling in the old loop costs more than a copy + a few overwrites).
-    -- The moved-to square (j) becomes 121-j in the new frame (negated piece
-    -- code = opposite color); the moved-from square (i) becomes 121-i and is
-    -- emptied. Castling: the rook origin (A1/H1) is emptied and the rook lands
-    -- on 121-kp. Promotion: any piece landing on rank 8 becomes a negated
-    -- queen (the engine's promotion inference). En passant: the captured pawn
-    -- at j+S is emptied.
+    -- Build the rotated child board as a straight copy + sparse edits: the
+    -- moved-to square (j) becomes 121-j in the new frame (negated piece code =
+    -- opposite color), the moved-from square (i) becomes 121-i and is emptied.
+    -- Castling: the rook origin (A1/H1) empties and the rook lands on 121-kp.
+    -- Promotion: pawns reaching rank 8 promote to the encoded piece (queen for
+    -- a table-path move). En passant: the captured pawn at j+S is emptied.
     -- `pooled` (search path) reuses a pooled Position + board; otherwise a
     -- fresh object + table is allocated (public API / tests).
     local child, nb
@@ -1249,24 +1213,19 @@ function Position:move(move, val, pooled)
     if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
         nb[121 - (j + S)] = EMPTY -- en passant
     end
-    -- Dual-hash threading (item 2): the child is the rotated parent plus sparse
-    -- edits, so child._bh = parent._mh + sum(edit deltas) and child._mh =
-    -- parent._bh + sum(edit deltas). The child board already has the edits;
-    -- here we only accumulate the hash deltas for the edited squares so key()
-    -- stays O(1). Each edit at child square k replaces the pure-rotation value
-    -- rot_pc = -parent[121-k] with the actual new_pc. Only meaningful when the
-    -- parent already carries hashes (search path); public positions leave them
-    -- nil and key() falls back to the 120-pass.
+    -- Dual-hash threading: the child is the rotated parent plus sparse edits,
+    -- so child._bh = parent._mh + sum(edit deltas) and child._mh =
+    -- parent._bh + sum(edit deltas). Each edit at child square k replaces the
+    -- pure-rotation value rot_pc = -parent[121-k] with the actual new_pc. Only
+    -- meaningful when the parent already carries hashes (search path); public
+    -- positions leave them nil and key() falls back to the 120-pass.
     local zf, zm = zflat, zmirror
     local dbh, dmh = 0, 0
     local has_hashes = self._bh ~= nil and self._mh ~= nil
     if has_hashes then
-        -- Accumulate the Zobrist deltas for the edited squares inline. The
-        -- old `add_edit` closure was a per-call LuaClosure allocation on every
-        -- search child; the module-level `zc` helper (created once) + inline
-        -- arithmetic is behavior-identical. Each edit at child square k
-        -- replaces the pure-rotation value rot_pc = -parent[121-k] with the
-        -- actual new_pc.
+        -- Accumulate the Zobrist deltas for the edited squares inline: the
+        -- module-level `zc` helper (created once) avoids a per-call closure on
+        -- every search child.
         local rot_r = -b[121 - r]
         dbh = dbh + zc(zf, dest, r) - zc(zf, rot_r, r)
         dmh = dmh + zc(zm, dest, r) - zc(zm, rot_r, r)
@@ -1355,8 +1314,8 @@ function Position:value(move, b)
     end
 
     if p == P then
-        -- Promotion: value the encoded promotion piece (packed path), else queen
-        -- for a table-path pawn reaching the last rank.
+        -- Promotion: value the encoded promotion piece (packed path), else
+        -- queen for a table-path pawn reaching the last rank.
         if promo ~= 0 then
             score = score + pst[promo][j] - pst[P][j]
         elseif A8 <= j and j <= H8 then
@@ -1379,10 +1338,9 @@ local ttS = {}
 local ttG = {}
 local ttM = {}
 
--- Pre-size the five parallel arrays at module load. Lua tables grow
--- incrementally; without this the first search pays several rehashes while
--- filling up to TT_SIZE integer keys *during the timed region*. Filling with
--- sentinels (ttK = -1) allocates the array part once; a probe verifies
+-- Pre-size the arrays at module load: filling with sentinels (ttK = -1)
+-- allocates the array part once, so the first search doesn't rehash while
+-- filling up to TT_SIZE keys *during the timed region*. A probe verifies
 -- ttK[s] == key, so the sentinel can never be a false match (keys are >= 0).
 for s = 1, TT_SIZE do
     ttK[s] = -1
@@ -1401,11 +1359,11 @@ local function tp_set(key, depth, score, gamma, move)
     ttM[s] = move
 end
 
--- F2 measurement counters. The probe itself is inlined in bound()/search()
--- (item 5); these keep sunfish.tt_stats accurate.
-local tt_probe = 0 -- F2 measurement: total probes
-local tt_hit = 0   -- F2 measurement: probes that found a matching full key
-local tt_slot_hit = 0 -- F2 measurement: probes whose slot was occupied (any key)
+-- F2 measurement counters (kept so sunfish.tt_stats stays accurate); the probe
+-- itself is inlined in bound()/search().
+local tt_probe = 0
+local tt_hit = 0
+local tt_slot_hit = 0
 
 -------------------------------------------------------------------------------
 -- Search logic
@@ -1441,39 +1399,27 @@ local m_move = Position.move
 -- genMoves writes packed moves into a caller-provided array and returns the
 -- end index; bound() filters/sorts in place on a module-level reusable buffer.
 -- No `#` (LuaJ's rawlen is a binary search), no table.sort null-scan, no tail
--- clear -- the explicit count says exactly how many entries are live. Entries
--- beyond the count are stale but never read. This removes the per-node list
--- table allocation that the earlier scratch-pooling attempt could not (it
--- relied on `#`, whose bookkeeping overhead made it slower).
+-- clear — the explicit count says exactly how many entries are live. Entries
+-- beyond the count are stale but never read.
 --
--- The comparator is `move_greater` below (value desc via packed integer,
--- tie-break i desc / j asc). Written as a plain heap sort with an explicit
--- count so we never need `#` or a nil boundary.
-
 -- Per-depth move buffers: each bound() frame needs its own buffer because the
 -- recursion overwrites shared storage while the outer frame still iterates its
--- sorted moves. Buffers are indexed by search depth (bounded ~10-20 plies),
--- so each frame reads/writes its own region; no clear needed (explicit count).
+-- sorted moves. Buffers are indexed by search depth, so each frame reads/writes
+-- its own region; no clear needed (explicit count).
 local move_stack = {}
 local ply = 0 -- current recursion depth (incremented per bound() entry)
 
--- The packed-move layout (value in the high bits via VAL_SCALE = 2^14, coords
--- in the low 14 bits with max 119*128+119 = 15351 < 16384) makes a plain
--- integer comparison sort by value first, then by coordinates — exactly the
--- old `move_greater` ordering. move_set_val stores a full (val+VAL_BIAS)*VAL_SCALE
--- delta per entry, so same-node moves never differ by less than VAL_SCALE and
--- the i/j tie-break is unreachable on the search path. The comparator is
--- therefore dead code; the heap sort below compares packed ints directly.
--- NOTE: raw `a > b` on the whole integer reverses the tie-break order for
--- entries that differ only in the coordinate bits (< VAL_SCALE apart), but no
--- two moves of one node do, so the searched order is byte-identical.
+-- The packed-move layout (value in the high bits via VAL_SCALE = 2^17, coords
+-- in the low 17 bits with max 119*128+119+promo < 2^17) makes a plain integer
+-- comparison sort by value first, then by coordinates. move_set_val stores a
+-- full (val+VAL_BIAS)*VAL_SCALE delta per entry, so same-node moves never
+-- differ by less than VAL_SCALE and the coordinate tie-break is unreachable on
+-- the search path; the heap sort below compares packed ints directly.
 
 -- In-place heap sort of buf[1..n] descending by packed-integer value.
 -- Classic max-heap + extract-to-end produces ASCENDING; for descending we build
 -- a MIN-heap (smallest at root) and extract to the end, so the largest lands
--- first. The comparator is inverted for the heap property. Comparisons are
--- inline raw `>` on the packed ints (no function calls; see the note above on
--- why the integer order matches the removed move_greater).
+-- first. Comparisons are inline raw `>` on the packed ints (no function calls).
 local function move_sort(buf, n)
     -- build min-heap (root is the smallest)
     for start = math_floor(n / 2), 1, -1 do
@@ -1524,12 +1470,10 @@ local function bound(pos, gamma, depth, maxn)
     end
 
     -- Budget-aware stop (F1): the depth loop only checks nodes >= maxn between
-    -- depths, so a depth can overshoot the budget (depth 6 runs 15.8k vs
-    -- NODES_SEARCHED=10k). Abort here at the per-node check point instead: when
-    -- the budget is exhausted, set the flag and unwind to search(), which breaks
-    -- out of the depth loop. The position's score is returned (the caller never
-    -- uses the depth-6 result when the budget aborted — search() keeps the last
-    -- completed depth's fail-high move).
+    -- depths, so a depth can overshoot the budget. Abort here at the per-node
+    -- check point instead: set the flag and unwind to search(), which breaks
+    -- out of the depth loop. The caller never uses a mid-depth-aborted result —
+    -- search() keeps the last completed depth's fail-high move.
     if nodes >= maxn and maxn > 0 then
         budget_exhausted = true
         return pos.score
@@ -1550,12 +1494,9 @@ local function bound(pos, gamma, depth, maxn)
     -- move is found), and the terminal-score check above catches
     -- already-decided positions.
     local key = m_key(pos)
-    -- Inlined TT probe (item 5): the flat arrays are read directly with the
-    -- slot computed once, and only after the full-key verify — no 4-value
-    -- tp_get return, no ttD/ttS/ttG reads on a miss. The F2 measurement
-    -- counters (tt_probe/tt_slot_hit/tt_hit) are kept so sunfish.tt_stats
-    -- stays accurate. `ed` is also read by the store-site guard below, so it
-    -- is declared here.
+    -- Inlined TT probe: the flat arrays are read directly with the slot
+    -- computed once, and only after the full-key verify. `ed` is also read by
+    -- the store-site guard below, so it is declared here.
     local s = key % TT_SIZE + 1
     tt_probe = tt_probe + 1
     local had_entry = false
@@ -1625,7 +1566,8 @@ local function bound(pos, gamma, depth, maxn)
 
     local best, bmove = -3 * MATE_VALUE, nil
 
-    -- Cache calculated move values so the sort doesn't repeatedly call `pos:value()` $O(N \log N)$ times
+    -- Cache calculated move values so the sort doesn't repeatedly call
+    -- pos:value() O(N log N) times.
     for k = 1, nlegal do
         buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
     end
@@ -1634,8 +1576,7 @@ local function bound(pos, gamma, depth, maxn)
     -- tail is never searched), so filter to the >= 150 subset BEFORE sorting:
     -- the searched set and order are unchanged, but the heap sort only sees the
     -- kept subset (leaves are a large fraction of nodes). Compaction is in
-    -- place (nlegal <= k, never overwrites an unread entry); the kept count is
-    -- exact so no `#` or tail-clear is needed.
+    -- place (nlegal <= k, never overwrites an unread entry).
     local sort_n = nlegal
     if depth <= 0 then
         local keep = 0
@@ -1693,10 +1634,9 @@ local function search(pos, maxn)
     local score
     -- The move to return: the last fail-high (score >= gamma) bound call at the
     -- deepest completed depth. Capturing it directly avoids the post-loop TT
-    -- re-probe, whose root slot can be overwritten by a deeper transposition
-    -- (the `(pass)` UX artifact). Falls back to the re-probe when no bound call
-    -- failed high (e.g. the very first call at depth 1 returns a bound score
-    -- below gamma with no move yet).
+    -- re-probe, whose root slot can be overwritten by a deeper transposition.
+    -- Falls back to the re-probe when no bound call failed high (e.g. the very
+    -- first call at depth 1 returns a bound score below gamma with no move yet).
     local rootmove
 
     -- F3 (aspiration): after depth 1, start the root window at the previous
@@ -1761,12 +1701,11 @@ local function search(pos, maxn)
         end
     end
 
-    -- Validate the root move before returning it. The TT can return a move
+    -- Validate the root move before returning it: the TT can return a move
     -- stored for a different transposition (the root slot can be overwritten
-    -- by a deeper search), and a full-key collision would make it illegal here.
-    -- The correctness gate (selfplay, stockfish-validated) caught exactly this:
-    -- an illegal h1e1 was returned. Fall back to nil (engine passes) if the
-    -- move isn't legal. ensure_arr() materializes _b for public positions.
+    -- by a deeper search), and a full-key collision would make it illegal
+    -- here. Fall back to nil (engine passes) if the move isn't legal.
+    -- ensure_arr() materializes _b for public positions.
     local root_b = pos:ensure_arr()
     local rk = m_king_index(pos)
     local rnch, rchk, rnpin, rpin, rpdir, rpg = compute_check_pins(root_b, rk)
@@ -1907,10 +1846,8 @@ function sunfish.move(game, mv)
     local promoChar = #mv >= 5 and string_sub(mv, 5, 5) or nil
     local promoCode = promoChar and ({ q = Q, r = R, b = B, n = KN })[promoChar] or nil
     -- Validate ONE user move instead of building the whole legal_moves() list:
-    -- generate pseudo-legal moves, find the matching packed move (by from/to and,
-    -- for promotions, the piece), and run is_legal on only that move. This keeps
-    -- sunfish.move snappy under LuaJ (legal_moves filters every pseudo-move
-    -- through is_legal + attacked()).
+    -- generate pseudo-legal moves, find the matching packed move (by from/to
+    -- and, for promotions, the piece), and run is_legal on only that move.
     local pseudo = {}
     local pe = game:genMoves(pseudo, 1)
     local b = game:ensure_arr()
