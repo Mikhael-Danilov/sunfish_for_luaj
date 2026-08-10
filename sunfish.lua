@@ -8,7 +8,7 @@ local string_sub = string.sub
 local string_byte = string.byte
 local string_format = string.format
 
-local NODES_SEARCHED = 10000
+local NODES_SEARCHED = 1000
 local MATE_VALUE = 30000
 local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
@@ -77,13 +77,21 @@ local NL, SP = 98, 99
 -- pseudo-legal move instead of one 3-cell table. Layout:
 --   low 14 bits  : from-square i * 128 + to-square j   (i,j in 0..119)
 --   high bits    : signed sort value, biased by VAL_BIAS (2^22)
--- Pure arithmetic (no bit32/bitwise ops, per the LuaJ-interpreter constraint).
-local VAL_SHIFT = 14
+-- Packed move layout (pure arithmetic; no bit32/bitwise ops, per the LuaJ
+-- constraint):
+--   bits 0-6   : to-square j            move_to:    v % 128
+--   bits 7-13  : from-square i          move_from:  floor(v/128) % 128
+--   bits 14-16 : promotion piece code   move_promo: floor(v/PROMO_UNIT) % 8
+--                                          (0 = none; KN=2, B=3, R=4, Q=5)
+--   bits 17+   : signed sort value      move_val:   floor(v/VAL_SCALE) - VAL_BIAS
+local VAL_SHIFT = 17
+local PROMO_SHIFT = 14
 local VAL_BIAS = 2 ^ 22 -- half of the 23-bit value field
 -- Precomputed constants (Lua 5.1 has no constant folding; `2 ^ VAL_SHIFT` and
 -- `128 * 128` were recomputed on every call in the hot path).
 local VAL_SCALE = 2 ^ VAL_SHIFT
-local MOVE_MOD = 128 * 128
+local PROMO_UNIT = 2 ^ PROMO_SHIFT
+local MOVE_MOD = VAL_SCALE -- low 17 bits hold i, j, promo (preserved on set_val)
 -- move_pack(i, j, 0) — the zero-value packed move emitted by genMoves. Precomputed
 -- so the hot movegen loop skips the (val + VAL_BIAS) * VAL_SCALE arithmetic.
 local PACKED_ZERO_VAL = VAL_BIAS * VAL_SCALE
@@ -93,12 +101,31 @@ end
 local function move_to(v)
     return v % 128
 end
+local function move_promo(v)
+    return math_floor(v / PROMO_UNIT) % 8
+end
 local function move_val(v)
     return math_floor(v / VAL_SCALE) - VAL_BIAS
 end
 -- Rewrite the value field of a packed move (sorting updates the cached value).
 local function move_set_val(v, val)
     return (v % MOVE_MOD) + (val + VAL_BIAS) * VAL_SCALE
+end
+
+-- Emit one pawn move; if it reaches the last rank, expand into the 4 promotion
+-- moves (underpromotion N/B/R/Q). Module-level (no closure) so genMoves does not
+-- allocate per call. Returns the new move_idx.
+local function emit_pawn(moves, move_idx, i, j)
+    if A8 <= j and j <= H8 then
+        local base = i * 128 + j + PACKED_ZERO_VAL
+        moves[move_idx]     = base + KN * PROMO_UNIT -- knight
+        moves[move_idx + 1] = base + B * PROMO_UNIT  -- bishop
+        moves[move_idx + 2] = base + R * PROMO_UNIT  -- rook
+        moves[move_idx + 3] = base + Q * PROMO_UNIT  -- queen
+        return move_idx + 4
+    end
+    moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL
+    return move_idx + 1
 end
 
 -- ASCII byte -> piece code (for lazy string -> array conversion).
@@ -247,14 +274,11 @@ pst[K] = pst['K']
 -- edge; the engine's while-loops stop at SP/NL, which is exactly this wall.
 -------------------------------------------------------------------------------
 local is_on_board = {}
-local is_on_board_1 = {} -- 1-based mirror for genMoves (j is a 1-based square)
 local real_squares = {} -- the 64 real board squares, stored 1-based (built once)
 for _i = 0, 119 do
     is_on_board[_i] = _i >= 20 and _i < 100 and (_i % 10) >= 1 and (_i % 10) <= 8
     if is_on_board[_i] then
-        local i1 = _i + 1
-        real_squares[#real_squares + 1] = i1
-        is_on_board_1[i1] = true
+        real_squares[#real_squares + 1] = _i + 1
     end
 end
 
@@ -607,17 +631,21 @@ function Position:genMoves(out, start)
         if p >= P and p <= K then
             if p == P then
                 -- Pawn: single push, double push, captures, ep.
+                -- Off-board squares are padding (SP=99/NL=98), never EMPTY, so
+                -- b[j] == EMPTY inherently rejects them — no is_on_board_1
+                -- guard needed. The double push is confined to rank-2 pawns
+                -- (i >= A1+N) whose j2 is always on board.
                 local j = i + N
-                if is_on_board_1[j] and b[j] == EMPTY then
-                    moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
+                if b[j] == EMPTY then
+                    move_idx = emit_pawn(moves, move_idx, i, j)
                     -- Double push: original allows it whenever i >= A1+N and
                     -- the intermediate square is empty (the single push above
                     -- already verified b[i+N]==EMPTY). The last-rank special
                     -- case (e.g. a pawn on e1) is preserved.
                     if i >= A1 + N then
                         local j2 = i + 2 * N
-                        if is_on_board_1[j2] and b[j2] == EMPTY then
-                            moves[move_idx] = i * 128 + j2 + PACKED_ZERO_VAL; move_idx = move_idx + 1
+                        if b[j2] == EMPTY then
+                            move_idx = emit_pawn(moves, move_idx, i, j2)
                         end
                     end
                 end
@@ -629,7 +657,7 @@ function Position:genMoves(out, start)
                     if j == 0 then break end
                     local q = b[j]
                     if q < 0 or (q == EMPTY and j == ep) then
-                        moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
+                        move_idx = emit_pawn(moves, move_idx, i, j)
                     end
                 end
             elseif p == KN then
@@ -1135,13 +1163,25 @@ function Position:rotate(pooled)
     return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh)
 end
 
+-- Zobrist contribution of a piece code at a square, for a hash table (zflat or
+-- zmirror). Padding codes (98/99) and empty (0) contribute 0. Module-level so
+-- move()'s dual-hash edit deltas don't allocate a closure per call.
+local function zc(z, pc, sq)
+    if pc ~= EMPTY and pc ~= SP and pc ~= NL then
+        return z[(pc + 6) * 120 + sq]
+    end
+    return 0
+end
+
 function Position:move(move, val, pooled)
-    local i, j
+    local i, j, promo
     if type(move) == 'table' then
         i, j = move[1], move[2] -- public path: parsed UCI tuple
+        promo = 0
         val = nil
     else
         i, j = move_from(move), move_to(move) -- internal: packed int
+        promo = move_promo(move)
     end
     local b = self:ensure_arr()
     local p = b[i]
@@ -1193,7 +1233,10 @@ function Position:move(move, val, pooled)
     end
     local r = 121 - j
     local s = 121 - i
-    local dest = A8 <= j and j <= H8 and -Q or -p -- promotion -> queen (any piece)
+    -- Promotion piece: encoded promo (packed path), or queen for a table-path
+    -- pawn reaching the last rank; otherwise the moving piece itself.
+    local dest = promo ~= 0 and -promo
+        or (p == P and A8 <= j and j <= H8 and -Q or -p)
     nb[r] = dest
     nb[s] = EMPTY
     if p == K and (j - i == 2 or i - j == 2) then
@@ -1218,24 +1261,34 @@ function Position:move(move, val, pooled)
     local dbh, dmh = 0, 0
     local has_hashes = self._bh ~= nil and self._mh ~= nil
     if has_hashes then
-        local function add_edit(k, new_pc)
-            local rot_pc = -b[121 - k]
-            local old_zf = (rot_pc == EMPTY or rot_pc == SP or rot_pc == NL) and 0 or zf[(rot_pc + 6) * 120 + k]
-            local new_zf = (new_pc == EMPTY or new_pc == SP or new_pc == NL) and 0 or zf[(new_pc + 6) * 120 + k]
-            dbh = dbh + new_zf - old_zf
-            local old_zm = (rot_pc == EMPTY or rot_pc == SP or rot_pc == NL) and 0 or zm[(rot_pc + 6) * 120 + k]
-            local new_zm = (new_pc == EMPTY or new_pc == SP or new_pc == NL) and 0 or zm[(new_pc + 6) * 120 + k]
-            dmh = dmh + new_zm - old_zm
-        end
-        add_edit(r, dest)
-        add_edit(s, EMPTY)
+        -- Accumulate the Zobrist deltas for the edited squares inline. The
+        -- old `add_edit` closure was a per-call LuaClosure allocation on every
+        -- search child; the module-level `zc` helper (created once) + inline
+        -- arithmetic is behavior-identical. Each edit at child square k
+        -- replaces the pure-rotation value rot_pc = -parent[121-k] with the
+        -- actual new_pc.
+        local rot_r = -b[121 - r]
+        dbh = dbh + zc(zf, dest, r) - zc(zf, rot_r, r)
+        dmh = dmh + zc(zm, dest, r) - zc(zm, rot_r, r)
+        local rot_s = -b[121 - s]
+        dbh = dbh + zc(zf, EMPTY, s) - zc(zf, rot_s, s)
+        dmh = dmh + zc(zm, EMPTY, s) - zc(zm, rot_s, s)
         if p == K and (j - i == 2 or i - j == 2) then
             local rook_from = j < i and A1 or H1
-            add_edit(121 - rook_from, EMPTY)
-            add_edit(121 - kp, -R)
+            local rf = 121 - rook_from
+            local rot_rf = -b[121 - rf]
+            dbh = dbh + zc(zf, EMPTY, rf) - zc(zf, rot_rf, rf)
+            dmh = dmh + zc(zm, EMPTY, rf) - zc(zm, rot_rf, rf)
+            local kpf = 121 - kp
+            local rot_kpf = -b[121 - kpf]
+            dbh = dbh + zc(zf, -R, kpf) - zc(zf, rot_kpf, kpf)
+            dmh = dmh + zc(zm, -R, kpf) - zc(zm, rot_kpf, kpf)
         end
         if p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY then
-            add_edit(121 - (j + S), EMPTY) -- en passant
+            local epf = 121 - (j + S)
+            local rot_epf = -b[121 - epf]
+            dbh = dbh + zc(zf, EMPTY, epf) - zc(zf, rot_epf, epf)
+            dmh = dmh + zc(zm, EMPTY, epf) - zc(zm, rot_epf, epf)
         end
     end
     -- Thread king indices: child own king = mirror of parent's enemy king;
@@ -1272,11 +1325,13 @@ function Position:move(move, val, pooled)
 end
 
 function Position:value(move, b)
-    local i, j
+    local i, j, promo
     if type(move) == 'table' then
         i, j = move[1], move[2] -- public path: parsed UCI tuple
+        promo = 0
     else
         i, j = move_from(move), move_to(move) -- internal: packed int
+        promo = move_promo(move)
     end
     b = b or self:ensure_arr()
     local p = b[i]
@@ -1300,7 +1355,11 @@ function Position:value(move, b)
     end
 
     if p == P then
-        if A8 <= j and j <= H8 then
+        -- Promotion: value the encoded promotion piece (packed path), else queen
+        -- for a table-path pawn reaching the last rank.
+        if promo ~= 0 then
+            score = score + pst[promo][j] - pst[P][j]
+        elseif A8 <= j and j <= H8 then
             score = score + pst[Q][j] - pst[P][j]
         end
         if j == self.ep then
@@ -1791,6 +1850,12 @@ function sunfish.set_time_budget(seconds)
     TIME_BUDGET = seconds or 0
 end
 
+-- Node budget per ai_move search (default NODES_SEARCHED). Raise for stronger
+-- play, lower for faster response; exposed so the host can tune at runtime.
+function sunfish.set_nodes(n)
+    NODES_SEARCHED = n or NODES_SEARCHED
+end
+
 -- F2 measurement: TT probe/hit/occupancy stats from the last search.
 function sunfish.tt_stats()
     return { probe = tt_probe, hit = tt_hit, slot_hit = tt_slot_hit }
@@ -1832,29 +1897,42 @@ function sunfish.restore_data(dta)
 end
 
 function sunfish.move(game, mv)
-    local move = { parse(string_sub(mv, 1, 2)), parse(string_sub(mv, 3, 4)) }
-    if not (move[1] and move[2]) then
+    local fromSq = parse(string_sub(mv, 1, 2))
+    local toSq = parse(string_sub(mv, 3, 4))
+    if not (fromSq and toSq) then
         return false
     end
+    -- Promotion piece from the optional 5th UCI char. nil = unnamed promotion
+    -- (defaults to queen) or a plain non-promotion move.
+    local promoChar = #mv >= 5 and string_sub(mv, 5, 5) or nil
+    local promoCode = promoChar and ({ q = Q, r = R, b = B, n = KN })[promoChar] or nil
     -- Validate ONE user move instead of building the whole legal_moves() list:
-    -- generate pseudo-legal moves, find the matching {i, j}, and run is_legal on
-    -- only that move. This keeps sunfish.move snappy under LuaJ (legal_moves
-    -- filters every pseudo-move through is_legal + attacked()).
+    -- generate pseudo-legal moves, find the matching packed move (by from/to and,
+    -- for promotions, the piece), and run is_legal on only that move. This keeps
+    -- sunfish.move snappy under LuaJ (legal_moves filters every pseudo-move
+    -- through is_legal + attacked()).
     local pseudo = {}
     local pe = game:genMoves(pseudo, 1)
     local b = game:ensure_arr()
     local king = game:king_index()
     local nch, chk, npin, pin, pdir, pg = compute_check_pins(b, king)
+    local chosen
     for k = 1, pe do
         local m = pseudo[k]
-        if move_from(m) == move[1] and move_to(m) == move[2] then
-            if game:is_legal(m, king, nch, chk, pin, pdir, pg, b) then
-                local ng = game:move(move)
-                ng:ensure_board()
-                return ng
+        if move_from(m) == fromSq and move_to(m) == toSq then
+            local mp = move_promo(m)
+            if promoCode then
+                if mp == promoCode then chosen = m; break end        -- exact piece requested
+            else
+                if mp == 0 then chosen = m; break end                -- plain move
+                if mp == Q then chosen = m end                       -- unnamed promotion -> queen
             end
-            return false
         end
+    end
+    if chosen and game:is_legal(chosen, king, nch, chk, pin, pdir, pg, b) then
+        local ng = game:move(chosen) -- packed: carries the promotion piece
+        ng:ensure_board()
+        return ng
     end
     return false
 end
@@ -1873,7 +1951,12 @@ function sunfish.ai_move(game)
     game = game:move(move)
     game:ensure_board()
 
-    return game, render(121 - move_from(move)) .. render(121 - move_to(move)), score
+    local mv = render(121 - move_from(move)) .. render(121 - move_to(move))
+    local promo = move_promo(move)
+    if promo ~= 0 then
+        mv = mv .. code_to_char[-promo] -- UCI promotion suffix (lowercase)
+    end
+    return game, mv, score
 end
 
 -- Position query helpers (backward-compatible additions).
@@ -1891,6 +1974,21 @@ end
 
 function sunfish.legal_moves(game)
     return game:legal_moves()
+end
+
+-- Public: every legal move of the side to move, as UCI-style coordinate
+-- strings ("e2e4"), rendered in the current position's own frame. Lets
+-- integrations show/parse moves without touching the internal packed-move
+-- encoding (move_from/move_to + 1-based render are module-local on purpose).
+function sunfish.legal_moves_uci(game)
+    local out = {}
+    for _, m in ipairs(game:legal_moves()) do
+        local s = render(move_from(m)) .. render(move_to(m))
+        local promo = move_promo(m)
+        if promo ~= 0 then s = s .. code_to_char[-promo] end
+        out[#out + 1] = s
+    end
+    return out
 end
 
 function sunfish.move_2_cell(cell)

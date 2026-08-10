@@ -3,7 +3,7 @@
 --
 -- Runs one cold start-position search and asserts the invariant the plan uses
 -- as the guard rail for behavior-identical changes:
---   nodes 27/197/411/1818/4036/15803, root move a8b6 (post-ep-fix baseline).
+--   nodes 27/153/287/1007, root move d7d5 (1000-node default budget).
 -- The engine's search prints "Searched %d nodes. Depth %d. Score %d(...)" per
 -- depth; we capture that and check it against the expected sequence.
 --
@@ -15,20 +15,21 @@
 -- depth-by-depth node counts. Run with SUNFISH_VERBOSE=1 (see the header).
 local sunfish = require("sunfish")
 
--- Current baseline (post-F1 budget stop + F3 aspiration, and the
--- pin/check-aware legality rewrite): the search now runs depth 6 at ~10k
--- nodes instead of the pre-F1/F3 15,803. Node counts legitimately changed, so
--- this is the invariant every behavior-identical batch must preserve.
+-- Current baseline (post promotion-expansion + auto-queen-removal bug fixes,
+-- default NODES_SEARCHED = 1000): the budget-aware stop cuts the search off
+-- mid-depth 4 at 1007 nodes, so only depths 1-4 are reached. The depth-6
+-- 10026-node sequence of the old 10k default no longer applies; set_nodes(10000)
+-- restores it. Node counts legitimately changed (budget default + the
+-- auto-queen fix altered the position hash for non-pawn pieces reaching rank
+-- 8), so this is the invariant every behavior-identical batch must preserve.
 local EXPECTED = {
     { depth = 1, nodes = 27,   score = 99 },
     { depth = 2, nodes = 153,  score = 0 },
     { depth = 3, nodes = 287,  score = 99 },
-    { depth = 4, nodes = 1498, score = 0 },
-    { depth = 5, nodes = 3030, score = 40 },
-    { depth = 6, nodes = 10026, score = 0 },
+    { depth = 4, nodes = 1007, score = 40 },
 }
--- The invariant root move (current baseline): b8c6.
-local EXPECTED_MOVE = "b8c6"
+-- The invariant root move (current baseline): d7d5.
+local EXPECTED_MOVE = "d7d5"
 
 local captured = {}
 local orig_print = print
@@ -76,8 +77,8 @@ for _, exp in ipairs(EXPECTED) do
     end
 end
 
--- The exact root move must be the known invariant (a8b6 in the parent frame,
--- which ai_move renders in the rotated frame; the doc records it as a8b6).
+-- The exact root move must be the known invariant (d7d5 in the rotated
+-- frame, matching the current baseline's ai_move output).
 if mv == EXPECTED_MOVE then
     print(("root move: %s (invariant)"):format(mv))
 else

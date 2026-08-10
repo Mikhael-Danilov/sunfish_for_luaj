@@ -134,10 +134,9 @@ describe("endgame: legal move counts", function()
     end)
 
     it("KPK: e7 pawn allows promotion and king moves", function()
-        -- python-chess gives 9 (4 promotion pieces); the engine generates one
-        -- e7e8 promotion move (auto-queen) + 5 king moves = 6.
+        -- python-chess gives 9: 4 promotion moves (N/B/R/Q) + 5 king moves.
         local g = newpos({ e1 = "K", e7 = "P", h8 = "k" })
-        assert_equal(#sunfish.legal_moves(g), 6)
+        assert_equal(#sunfish.legal_moves(g), 9)
     end)
 
     it("starting position has 20 legal moves", function()

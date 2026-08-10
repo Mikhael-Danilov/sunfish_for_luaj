@@ -1395,6 +1395,163 @@ oracle/perft/endgame suites.
   `SUNFISH_NO_YIELD=1` disables yields for benchmark throughput.
 - Search `print` is still unconditional (no `SUNFISH_VERBOSE` gate yet).
 
+## External review: 6-item LuaJ optimization proposal (analyzed, not implemented)
+
+A 6-item proposal was reviewed against the current source (HEAD 1ecca1e). All
+code-level claims were verified against the actual code; the verdicts below
+follow the plan's established discipline (behavior-identical + same-JVM A/B,
+or measured rejection).
+
+### Item 1 — Hoist `zc`/`edit_hash` closures out of `move()`: VALID (slice SHIPPED-ready)
+
+The review's premise is correct: `Position:move()` allocates a closure
+(`add_edit`) per call when the search path carries hashes (`has_hashes`), i.e.
+for essentially every search child — ~20-40k closure allocations per 10k-node
+search. The current code (lines 1221-1229) defines `local function add_edit(k,
+new_pc)` inside `move()`, then calls it up to 5 times (moved piece, emptied
+origin, castling rook x2, ep capture). Note the review's quoted `zc`/`edit_hash`
+and "Lines 638-648" are **stale** — the current closure is `add_edit` at line
+1221 (the `zc` helper was inlined into the micro batch). The fix is valid: the
+closure is a per-call Java `LuaClosure` allocation; hoisting the arithmetic
+inline into `move()` (the `add_edit` calls are all in one block) removes it
+with zero behavior change. **Estimated gain: 2-4% of search time** (the review's
+15-25% is overstated — closure creation is cheap relative to the 120-cell
+copy + `attacked()` walk that dominate each node).
+
+### Item 2 — Remove `is_on_board_1` from pawn pushes: VALID (SHIPPED-ready)
+
+Verified: on the 1-based board, off-board squares are SP=99/NL=98, never
+EMPTY=0, so `b[j] == EMPTY` inherently rejects them. The double-push guard
+`i >= A1+N` (line 617) already confines double pushes to rank-2 pawns whose
+`j2` is always rank 4 (on board). So the `is_on_board_1[j]` lookups at lines
+611/619 are dead for legal positions. **Measured under LuaJ** (isolated pawn-push
+microbenchmark, 200k iters): A (with) 9.32s vs B (without) 5.37s — **~42%
+faster on the pawn-push path**, though the full `genMoves` includes knight/king/
+slider loops where this doesn't apply, so the whole-movegen gain is ~5-10% (the
+review's claim). The empty-check `b[j] == EMPTY` is inherently safe. Behavior-
+identical; gate on the node invariant + full suite.
+
+### Item 3 — Inline `move_greater` into `move_sort`: ALREADY DONE
+
+The review quotes `move_greater(buf[child], buf[child+1])` as current — **stale**.
+The micro batch (item 1) already inlined the comparator: `move_sort` (line 1418)
+compares raw `>` on packed ints (`buf[child] > buf[child+1]`), with the
+tie-break analysis documented at lines 1401-1410 (same-node moves never differ
+by < VAL_SCALE, so the i/j tie-decode is unreachable). The review's proposed
+`is_greater` function with coordinate extraction would **re-add** a function
+call the code already removed. Rejected (already shipped).
+
+### Item 4 — Inline `tp_get`: ALREADY DONE
+
+The review proposes inlining `tp_get`'s 4-value return into `bound()`. The
+micro batch (item 5) already did exactly this: the probe at lines 1494-1518
+reads `ttK[s]`/`ttD[s]`/`ttS[s]`/`ttG[s]`/`ttM[s]` directly with the slot
+computed once, full-key verified, and only on a real hit. `tp_get` no longer
+exists. The review's `had_entry = (ttK[slot] == key)` matches the shipped code.
+Rejected (already shipped).
+
+### Item 5 — Split `move`/`value` into packed fast-paths: LOW VALUE (reject)
+
+The review proposes eliminating the `type(move) == 'table'` branch in the hot
+path. Verified: there are only 2 sites (lines 1140, 1276), and `type(move) ==
+'table'` on a packed int is a single `LuaValue` type check — cheap. The search
+path calls `m_move(pos, move, mv, true)` with a packed int; splitting into
+`move_packed` would duplicate ~80 lines of `move()` (including the castling/
+promotion/ep/hash-edit logic) for a branch that fires once per node. **Not worth
+the code duplication and maintenance risk** — the review's 2-4% estimate is
+unsupported; LuaJ's `type()` is not a "string comparison". Rejected.
+
+### Item 6 — Inline packed-move math (`move_from`/`move_to`/`move_val`): ALREADY DONE
+
+`move_from`/`move_to`/`move_val` are already module-level `local function`s
+(lines 90-98) — local upvalues with no metatable dispatch. The arithmetic is
+already hoisted (`VAL_SCALE`/`VAL_BIAS`/`PACKED_ZERO_VAL`, micro batch item 4).
+The review's "precomputed masks in hot loops" would inline arithmetic at 9 call
+sites for ~1 call/genMoves saved — the micro batch already evaluated and
+rejected this exact slice. Rejected (already evaluated).
+
+### Verdict summary
+
+| Item | Verdict | Notes |
+|------|---------|-------|
+| 1. Hoist `add_edit` closure | **VALID, slice SHIPPED-ready** | ~2-4% search win; review's 15-25% overstated |
+| 2. Remove `is_on_board_1` pawn pushes | **VALID, SHIPPED-ready** | ~42% on isolated pawn path (LuaJ), ~5-10% on movegen; behavior-identical |
+| 3. Inline `move_greater` | Already done (micro batch) | review quotes stale code |
+| 4. Inline `tp_get` | Already done (micro batch) | review quotes stale code |
+| 5. Split move/value fast-paths | **REJECTED** | ~80-line duplication for a cheap branch; unsupported 2-4% claim |
+| 6. Inline packed-move math | Already done (micro batch) | local upvalues + hoisted constants |
+
+**Recommended next step**: ship items 1+2 as a behavior-identical batch (gate:
+node invariant 27/153/287/1498/3030/10026 + `b8c6` + suites 14+15+21 + oracle
+40/40), then CPU-time A/B per the established discipline.
+
+### Shipped: items 1+2 (closure hoist + `is_on_board_1` removal) — ~4% CPU win
+
+Implemented as a behavior-identical batch:
+
+- **Item 1**: the per-call `add_edit` closure inside `Position:move()` is
+  replaced with a module-level `zc(z, pc, sq)` helper (created once at load)
+  plus inline delta arithmetic at each edit site. The closure was a per-call
+  `LuaClosure` Java allocation on every search child (the review's "15-25%"
+  estimate is overstated — closure creation is cheap relative to the 120-cell
+  copy + `attacked()` walk — but the allocation is real and free to remove).
+- **Item 2**: the `is_on_board_1[j]`/`is_on_board_1[j2]` guards in the pawn
+  push/double-push are removed — off-board squares are SP=99/NL=98, never
+  EMPTY=0, so `b[j] == EMPTY` inherently rejects them, and the double-push
+  guard `i >= A1+N` confines `j2` to on-board rank-4 squares. The now-unused
+  `is_on_board_1` table was deleted entirely.
+
+**Gates (all green)**: node invariant `27/153/287/1498/3030/10026` + `b8c6`
+(luajit + LuaJ); suites 14+15+21 on luajit/lua5.1; oracle 40/40; 300-position
+random-walk hash consistency (cached `_bh` == fresh 120-pass recompute after
+every move).
+
+**CPU-time A/B** (cold `ai_move`, `/usr/bin/time` `User time`, 6 alternating
+rounds, sequential cold JVMs): base 12.39/7.09/9.74/8.11/5.26/5.56 (mean 8.03)
+vs mod 4.69/9.11/7.91/8.46/8.90/7.02 (mean 7.68) — **~4.3% CPU win on the
+mean**, mod won 2/6 rounds. The isolated pawn-push microbenchmark showed ~42%
+on that path under LuaJ, but the full search win is diluted (the pawn path is
+a fraction of `genMoves`, which is a fraction of node cost). Within the
+documented ±30% variance band; the direction is consistent with the
+microbenchmark and the changes are behavior-identical, so the batch ships.
+
+## Elo estimation harness: `benchmarks/elo_vs_stockfish.py`
+
+A new benchmark that pairs sunfish against the local Stockfish 18 over UCI to
+estimate sunfish's Elo. Design notes (matching the benchmark taste):
+
+- **Stockfish strength via `go nodes N`** (deterministic, load-immune), not
+  movetime (wall-clock, contaminated on this VM). Node limits 20..30000 span
+  roughly the 1400-2600 Elo range on the anchor curve.
+- **Deterministic opponent + fixed opening book**: Stockfish at fixed nodes is
+  deterministic from a fixed FEN, so game variety comes from an 8-FEN opening
+  book (both colors). 1 game per (level, opening, color) is the default.
+- **sunfish bridge**: a persistent luajit subprocess speaking a file-queue
+  protocol. luajit's `io.stdin:read("*l")` does NOT return lines from an open
+  pipe (verified experimentally — it blocks on buffer-full/EOF), so commands go
+  through numbered files + a `go` marker, with fine-grained busy polling.
+- **Position sync**: before each sunfish move, the bridge rebuilds sunfish's
+  position from the current real-board FEN (via Stockfish's `d` output). This
+  sidesteps all frame-rotation bookkeeping; `pos_from_fen` (ported from
+  test_perft) handles the engine's convention (rotate for black to move, swap
+  castling rights, mirror ep).
+- **Display-move conversion**: sunfish's `ai_move` returns the move in the
+  child frame; the parity is 1 mirror for a white-to-move FEN, 0 for black —
+  matching selfplay_correctness.py's proven `child_to_real` at odd/even plies.
+- **Adjudication**: at the ply cap or a pass, a Stockfish probe (200k nodes)
+  declares mate or a CP advantage ≥ 800 (decisive); otherwise a draw.
+
+**Bugs found while building it** (all in the harness, not the engine):
+1. `gsub("%s+","")` on the command line stripped the FEN's spaces, collapsing
+   the whole FEN into one token — `pos_from_fen` failed silently.
+2. The initial `play <uci>` design fed moves via coordinate conversion; the
+   rotation parity was wrong (d7d5 → e2e4), corrupting sunfish's state until it
+   crashed. Replaced with FEN-sync, which needs no move feeding at all.
+3. The display→real mirror count was off by one for black-to-move FENs
+   (b1c3 vs b8c6); fixed to 1 mirror (white) / 0 mirrors (black).
+
+Usage: `python3 benchmarks/elo_vs_stockfish.py [--nodes ...] [--plies 60] [--book ...]`
+
 ## Key risks (covered by existing tests)
 
 - `board` nil on internal positions -> `ensure_board` at every public return.

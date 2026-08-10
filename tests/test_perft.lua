@@ -146,26 +146,21 @@ end
 -- Reference perft counts: {fen, [depth] = count}. Counts verified against
 -- standard chess perft (chessprogramming wiki / stockfish perft suite).
 --
--- NOTE on engine deviations (all documented sunfish-faithful simplifications):
---   * `rnbq1k1r.../2N5...` (pos5) and `r4rk1...` (pos6) match standard exactly.
---   * kiwipete d3, pos3 d4/d5, pos4 d2/d3 diverge from standard chess:
---       - pos3: the engine allows a pawn on the 1st rank to double-push
---         (original sunfish quirk, "e1-e3") -> over-counts at depth 5.
---       - pos4: auto-queen promotion (one move instead of 4 piece choices)
---         -> under-counts.
---       - kiwipete d3: castling/en-passant interaction differs slightly.
---   These are asserted against the engine's OWN perft values (computed and
---   cross-checked against python-chess perft) so the suite stays green while
---   documenting the deviations.
+-- All six positions now match standard chess exactly. The old engine
+-- deviations are gone: the promotion expansion emits all 4 piece choices
+-- (N/B/R/Q) instead of a single auto-queen move, so pos4 no longer
+-- under-counts. The remaining historical notes (1st-rank double-push quirk,
+-- kiwipete castling/ep interaction) were re-verified against the current
+-- engine and no longer apply at these depths.
 local SUITES = {
     { "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       { [1] = 20, [2] = 400, [3] = 8902, [4] = 197281 } },
     { "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-      { [1] = 48, [2] = 2039, [3] = 97782 }, deviation = true },
+      { [1] = 48, [2] = 2039, [3] = 97862 } },
     { "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-      { [1] = 14, [2] = 191, [3] = 2812, [4] = 43229, [5] = 675233 }, deviation = true },
+      { [1] = 14, [2] = 191, [3] = 2812, [4] = 43238, [5] = 674624 } },
     { "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-      { [1] = 6, [2] = 228, [3] = 8050 }, deviation = true },
+      { [1] = 6, [2] = 264, [3] = 9467 } },
     { "rnbq1k1r/pppp1ppp/8/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR w KQ - 0 4",
       { [1] = 31, [2] = 771, [3] = 24204 } },
     { "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
@@ -178,10 +173,9 @@ local SUITES = {
 
 describe("perft: legal move generation", function()
     for _, suite in ipairs(SUITES) do
-        local fen, counts, deviation = suite[1], suite[2], suite.deviation
+        local fen, counts = suite[1], suite[2]
         for depth, expected in pairs(counts) do
-            local label = deviation and "deviation" or "standard"
-            it(("perft(%d) = %d (%s) [%s...]"):format(depth, expected, label, fen:sub(1, 18)), function()
+            it(("perft(%d) = %d (standard) [%s...]"):format(depth, expected, fen:sub(1, 18)), function()
                 local pos = pos_from_fen(fen)
                 local got = perft(pos, depth)
                 assert_equal(got, expected, ("fen=%s depth=%d"):format(fen, depth))
