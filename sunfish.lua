@@ -70,6 +70,8 @@ local initial = '         \n' .. --   0 -  9
 -- direction constant N=-10 used throughout the engine.
 local EMPTY, P, KN, B, R, Q, K = 0, 1, 2, 3, 4, 5, 6
 local NL, SP = 98, 99
+-- Piece values for the material threading in move()/endgame_eval. Kings are 0.
+local PIECE_VAL = { [P] = 100, [KN] = 320, [B] = 330, [R] = 500, [Q] = 900, [K] = 0 }
 
 -- Packed move layout (pure arithmetic; no bit32/bitwise ops, per the LuaJ
 -- constraint):
@@ -477,7 +479,7 @@ end
 -- These avoid the up-to-120-square scans/hash passes on every fresh search
 -- position. `fifty` (half-move clock) and `piece_count` are threaded the same
 -- way for the endgame draw rules and endgame eval.
-function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh, fifty, piece_count)
+function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh, fifty, piece_count, material)
     local self = setmetatable({}, Position)
     self._b = b
     self.score = score
@@ -492,6 +494,7 @@ function Position.from_array(b, score, wc, bc, ep, kp, nk, nek, bh, mh, fh, fift
     self._fh = fh
     self.fifty = fifty or 0
     self.piece_count = piece_count or 0
+    self.material = material or 0
     return self
 end
 
@@ -546,6 +549,7 @@ local function pool_free_pos(self)
     self.kp = nil
     self.fifty = nil
     self.piece_count = nil
+    self.material = nil
     if #pool_free < POOL_CAP then
         pool_free[#pool_free + 1] = self
     end
@@ -639,6 +643,21 @@ local function count_pieces(b)
         if v ~= EMPTY and v ~= SP and v ~= NL then n = n + 1 end
     end
     return n
+end
+
+-- Material balance from the side-to-move's perspective (one-time cost for
+-- public positions; the search path threads `material` through move/rotate).
+local function count_material(b)
+    local m = 0
+    for i = 1, 120 do
+        local v = b[i]
+        if v >= P and v <= Q then
+            m = m + PIECE_VAL[v]
+        elseif v <= -P and v >= -Q then
+            m = m - PIECE_VAL[-v]
+        end
+    end
+    return m
 end
 
 function Position:genMoves(out, start)
@@ -880,16 +899,19 @@ local function insufficient_material(pos)
     return minor <= 1 -- 0 minors = K vs K; 1 minor = K+minor vs K
 end
 
--- King-corraling gradient for endgames (piece_count <= 4): drives the enemy
--- king toward the nearest corner and brings the own king closer. Symmetric by
--- construction (perspective = side to move), so no side-splitting is needed.
--- Added to the leaf score so the search prefers positions that squeeze the
--- enemy king into a mating net.
+-- Endgame eval (piece_count <= 4): the threaded pos.score accumulates only
+-- PST move deltas, so a queen-up KQK scores ~0. This adds the standing
+-- material balance (threaded `material`, from the side-to-move's perspective)
+-- plus a king-corraling gradient that drives the enemy king to the corner and
+-- brings the own king closer. Symmetric by construction (both terms flip sign
+-- with the frame), so no side-splitting is needed. Added to the leaf score so
+-- the search prefers positions that are winning AND squeeze the enemy king
+-- into a mating net.
 local function endgame_eval(pos)
     local ek = pos._eking or pos:eking_index()
     local ok = pos._king or pos:king_index()
     if not (ek and ok) then return 0 end
-    local bonus = -10 * CORNER_DIST[ek]
+    local bonus = pos.material - 10 * CORNER_DIST[ek]
     local kr, kf = math_floor(ok / 10), ok % 10
     local ekr, ekf = math_floor(ek / 10), ek % 10
     return bonus - 2 * math.max(math_abs(kr - ekr), math_abs(kf - ekf))
@@ -1187,6 +1209,7 @@ function Position:rotate(pooled)
     -- Rotation is a null move: the half-move clock and piece count persist.
     local n_fifty = self.fifty
     local n_pieces = self.piece_count
+    local n_mat = -self.material
     if pooled then
         child._b = nb
         child.score = -self.score
@@ -1201,9 +1224,10 @@ function Position:rotate(pooled)
         child._fh = fh
         child.fifty = n_fifty
         child.piece_count = n_pieces
+        child.material = n_mat
         return child
     end
-    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh, n_fifty, n_pieces)
+    return Position.from_array(nb, -self.score, self.bc, self.wc, ep, kp, nk, nek, bh, mh, fh, n_fifty, n_pieces, n_mat)
 end
 
 -- Zobrist contribution of a piece code at a square, for a hash table (zflat or
@@ -1345,10 +1369,13 @@ function Position:move(move, val, pooled)
     local is_capture = q < 0 or (p == P and ((j - i) == N + W or (j - i) == N + E) and q == EMPTY)
     local n_fifty = (q < 0 or p == P) and 0 or self.fifty + 1
     local n_pieces = self.piece_count
+    local n_mat = self.material
     if q < 0 then
         n_pieces = n_pieces - 1
+        n_mat = n_mat + PIECE_VAL[-q] -- capturing gains the piece's value
     elseif is_capture then
         n_pieces = n_pieces - 1 -- en passant: the pawn at j+S is removed
+        n_mat = n_mat + PIECE_VAL[P]
     end
     if pooled then
         -- Reuse the pooled object: set the new frame fields on it.
@@ -1365,9 +1392,10 @@ function Position:move(move, val, pooled)
         child._fh = fh
         child.fifty = n_fifty
         child.piece_count = n_pieces
+        child.material = -n_mat -- child is the opponent's frame: sign flips
         return child
     end
-    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek, bh, mh, fh, n_fifty, n_pieces)
+    return Position.from_array(nb, -score, bc, wc, 121 - ep, 121 - kp, nk, nek, bh, mh, fh, n_fifty, n_pieces, -n_mat)
 end
 
 function Position:value(move, b)
@@ -1977,10 +2005,13 @@ function sunfish.attacked_stats()
 end
 
 local game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)
+game.piece_count = 32
+game.material = 0
 
 function sunfish.new()
     game = Position.new(initial, 0, { true, true }, { true, true }, 0, 0)
     game.piece_count = 32
+    game.material = 0
     return game
 end
 
@@ -2002,10 +2033,14 @@ function sunfish.restore_data(dta)
     for k,v in pairs(dta) do
         game[k] = v
     end
-    -- Public positions carry no threaded counters: derive piece_count from the
-    -- board and default fifty to 0 (the serialized shape never stores them).
+    -- Public positions carry no threaded counters: derive piece_count and
+    -- material from the board and default fifty to 0 (the serialized shape
+    -- never stores them).
     if not game.piece_count then
         game.piece_count = count_pieces(game:ensure_arr())
+    end
+    if not game.material then
+        game.material = count_material(game:ensure_arr())
     end
     game.fifty = game.fifty or 0
     return game
