@@ -1616,20 +1616,17 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- caching them in the TT would poison a transposition reached via a
     -- non-repeating path, so they are returned here and never stored.
     if pos.fifty >= 100 then
-        if depth >= 8 then io.stderr:write("DBG fifty-draw depth=" .. depth .. "\n") end
         return 0
     end
     local key = m_key(pos)
     for i = #path, 1, -1 do
         if path[i] == key then
-            if depth >= 8 then io.stderr:write("DBG repetition depth=" .. depth .. " pathlen=" .. #path .. "\n") end
             return 0 -- repetition draw
         end
     end
     -- Insufficient material (K vs K, K+B vs K, K+N vs K) is position-static
     -- and safe to cache, but kept in the same pre-TT block for uniformity.
     if pos.piece_count <= 3 and insufficient_material(pos) then
-        if depth >= 8 then io.stderr:write("DBG insufficient depth=" .. depth .. "\n") end
         return 0
     end
 
@@ -1664,7 +1661,6 @@ local function bound(pos, gamma, depth, maxn, ply, path)
                     elseif es <= -MATE_BAND then
                         es = es + ply
                     end
-                    if depth >= 8 then io.stderr:write("DBG tt-hit depth=" .. depth .. " es=" .. es .. " ed=" .. ed .. "\n") end
                     return es, ttM[s]
                 end
             end
@@ -1696,10 +1692,8 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     if nlegal == 0 then
         ply_buf = ply_buf - 1
         if m_in_check(pos) then
-            if depth >= 8 then io.stderr:write("DBG terminal-mate depth=" .. depth .. " ply=" .. ply .. "\n") end
             return -(MATE_VALUE - ply) -- distance-to-mate
         else
-            if depth >= 8 then io.stderr:write("DBG terminal-stalemate depth=" .. depth .. "\n") end
             return 0 -- stalemate
         end
     end
@@ -1798,9 +1792,6 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         tp_set(key, depth, tt_score, gamma, bmove)
     end
     ply_buf = ply_buf - 1
-    if depth >= 8 and (best == 0 or math.abs(best) < 1000) then
-        io.stderr:write("DBG bound-return depth=" .. depth .. " best=" .. best .. " gamma=" .. gamma .. " nlegal=" .. nlegal .. "\n")
-    end
     return best, bmove
 end
 
