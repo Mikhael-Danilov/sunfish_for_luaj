@@ -441,7 +441,7 @@ class Stockfish:
 
 # --- game loop ---------------------------------------------------------------
 
-def play_game(sf, bridge, fen, plies, sf_color, book=None):
+def play_game(sf, bridge, fen, plies, sf_color, book=None, rng=None):
     """Play one game from `fen`. `sf_color` is 'w' or 'b' (the side Stockfish
     plays). Returns (result, ply_count, sunfish_last_score).
 
@@ -450,9 +450,9 @@ def play_game(sf, bridge, fen, plies, sf_color, book=None):
     This avoids all frame-conversion bookkeeping — the FEN is the ground
     truth and pos_from_fen handles the engine's rotation convention.
 
-    `book` (optional): dict of engine Zobrist key -> UCI move (from
-    zobrist_book.py). When the position's key is in the book, sunfish plays
-    the book move instead of searching.
+    `book` (optional): dict of engine Zobrist key -> [(uci_move, weight), ...]
+    (from load_book). When the position's key is in the book, sunfish plays a
+    weighted-random book move instead of searching (`rng` picks it).
     """
     moves = []
     turn = 'w' if fen.split()[1] == 'w' else 'b'
@@ -469,7 +469,7 @@ def play_game(sf, bridge, fen, plies, sf_color, book=None):
             fen_now = sf.fen(moves)
             if book is not None:
                 key = fen_key(fen_now)
-                bm = book.get(key)
+                bm = pick_book_move(book, key, rng)
                 if bm:
                     moves.append(bm)
                     turn = 'b' if turn == 'w' else 'w'
@@ -493,12 +493,31 @@ def fen_key(fen):
     return zobrist_key(codes, wc, bc, ep, kp, TABLES)
 
 
-def load_book(path):
-    """Load a binary opening book into {key32: uci_move}."""
+def load_book(path, rng=None):
+    """Load a binary opening book into {key32: [(uci_move, weight), ...]}.
+
+    Multiple entries per key are allowed (variety): each carries a weight,
+    and play_game picks one weighted-randomly using `rng`.
+    """
     book = {}
     for key, mv16, weight in book_read(path):
-        book[key] = poly_to_uci(mv16)
+        book.setdefault(key, []).append((poly_to_uci(mv16), max(weight, 1)))
     return book
+
+
+def pick_book_move(book, key, rng):
+    """Weighted-random pick among the book moves for `key`, or None."""
+    cands = book.get(key)
+    if not cands:
+        return None
+    total = sum(w for _, w in cands)
+    r = rng.randint(1, total)
+    acc = 0
+    for mv, w in cands:
+        acc += w
+        if r <= acc:
+            return mv
+    return cands[-1][0]
 
 
 def fit_elo(results):
@@ -602,7 +621,7 @@ def main():
                     sf = Stockfish(sf_path, nodes, fen)
                     try:
                         res, ply, sc = play_game(sf, bridge, fen, args.plies,
-                                                 color, book=moves_book)
+                                                 color, book=moves_book, rng=rng)
                     finally:
                         sf.close()
                     # `color` is the side Stockfish plays (play_game's sf_color);

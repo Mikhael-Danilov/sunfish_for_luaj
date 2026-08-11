@@ -1616,27 +1616,31 @@ Stockfish lines plus classic trap lines. The book is position-keyed by the
 engine's exact 32-bit Zobrist hash (a Python port, validated bit-for-bit
 against `Position:key()`), so lookups are transposition-safe. The harness
 gets a `--book-moves FILE` flag; at sunfish's turn, if the position's key is
-in the book, the book move is played instead of searching.
+in the book, sunfish plays a book move instead of searching.
 
-Two book sizes tested (A/B at 1000 nodes/move, 384 games each: 8 levels × 8
+**Variety:** positions can hold multiple candidate moves with weights
+(10/6/3/1 for the top-4 MultiPV moves); the harness picks one weighted-
+randomly per game (`rng` seeded by `--seed`). E.g. the standard start offers
+`e2e4` (~44%), `c2c3` (~28%), `d2d4` (~14%), plus occasional `c2c4`/`g1f3`/
+`g2g3` — same position, different first move game to game. Trap-line first
+plies are excluded so junk roots (e.g. Fool's-mate `1.f3`) never appear.
+
+Three book sizes tested (A/B at 1000 nodes/move, 384 games each: 8 levels × 8
 FENs × 2 colors × 3 games, same seed):
 
-| variant | entries | size | fitted Elo |
-|---|---|---|---|
-| baseline (no book) | — | — | **1919** |
-| small book (single line/start) | 136 | 2.2 kB | **1915** |
-| big book (MultiPV branch=2, plies=4, depth 12) | 788 | 12.6 kB | **1931** |
+| variant | positions | candidates | size | fitted Elo |
+|---|---|---|---|---|
+| baseline (no book) | — | — | — | **1919** |
+| small book (single line/start) | 136 | 136 | 2.2 kB | **1915** |
+| big book (MultiPV branch=2, plies=4, depth 12) | 788 | 788 | 12.6 kB | **1931** |
+| varied book (branch=3, plies=3, depth 10, weighted) | 355 | 1592 | 25.5 kB | not re-measured |
 
-**Verdict: no measurable gain** — both books land within the run-to-run noise
-band (±30-50 at this sample). The big book's +12 vs baseline is the right
-direction but not significant. The generator now supports `--branch N`
-(MultiPV top-N moves at each position, recursing into all of them), so the
-book covers the opponent's likely deviations; SF lines run after the trap
-lines so the stronger move wins on shared positions. At 1000 nodes sunfish
-already plays reasonable openings from the 8 harness starts, so the book
-doesn't avoid enough early blunders to move Elo. The infra remains useful for
-forcing specific openings or an engine-level book, but it is not an Elo lever
-at this strength.
+**Verdict: no measurable gain** — the deterministic books land within the
+run-to-run noise band (±30-50 at this sample). The varied book trades a bit
+of strength for move diversity (deliberately, for human play); its Elo was
+not re-measured since the deterministic books already bounded the effect.
+At 1000 nodes sunfish already plays reasonable openings from the 8 harness
+starts, so the book doesn't avoid enough early blunders to move Elo.
 
 ## Key risks (covered by existing tests)
 

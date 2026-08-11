@@ -194,11 +194,26 @@ def main():
         print(f"stockfish not found: {sf_path}", file=sys.stderr)
         return 1
 
-    entries = {}  # key32 -> poly move16 (dedupe; last write wins)
+    # key32 -> {poly_move16: weight}. Multiple moves per position are kept
+    # (variety); weight = how often to pick it (best move first).
+    entries = {}
 
-    def record(fen, move):
+    # Weight for the i-th best move at a position (i = 0..): steep drop so the
+    # best move is clearly preferred but the 2nd/3rd are still real options.
+    MOVE_WEIGHTS = (10, 6, 3, 1)
+
+    def record(fen, move, weight):
+        """Add `move` as a candidate at `fen` with the given weight. The best
+        (highest) weight seen for a move wins."""
         key = _fen_key(fen)
-        entries[key] = uci_to_poly(move)
+        mv = uci_to_poly(move)
+        d = entries.setdefault(key, {})
+        d[mv] = max(d.get(mv, 0), weight)
+
+    # Trap lines are weaker than the MultiPV SF lines: record them with a low
+    # weight so the SF top moves dominate at shared positions, while the traps
+    # still provide variety at positions SF never reaches.
+    TRAP_WEIGHT = 2
 
     sf = Stockfish(sf_path)
     try:
@@ -207,13 +222,17 @@ def main():
         #    overwrite them on the same positions (last write wins).
         for line in TRAP_LINES:
             fen = START_FENS[0]
-            for m in line:
+            for i, m in enumerate(line):
                 if not sf.is_legal(fen, [], m):
                     print(f"  skipping illegal trap move {m} from {fen[:20]}...",
                           file=sys.stderr)
                     break
-                key = _fen_key(fen)
-                entries[key] = uci_to_poly(m)
+                # Skip the first ply: the trap lines define *replies* to a
+                # root move, not the opening move itself. Root-move variety
+                # comes from the SF MultiPV lines only (avoids junk roots like
+                # the Fool's-mate 1.f3).
+                if i > 0:
+                    record(fen, m, TRAP_WEIGHT)
                 fen = sf.apply_move(fen, m)
 
         # 2) Strong lines: branch through the top-N Stockfish moves at each
@@ -226,12 +245,13 @@ def main():
             tops = sf.topmoves(fen, args.branch, depth=args.depth)
             if not tops:
                 return
-            for m in tops:
+            for rank, m in enumerate(tops):
                 if not sf.is_legal(fen, [], m):
                     print(f"  skipping illegal SF move {m} from {fen[:20]}...",
                           file=sys.stderr)
                     continue
-                record(fen, m)
+                w = MOVE_WEIGHTS[rank] if rank < len(MOVE_WEIGHTS) else 1
+                record(fen, m, w)
                 expand(sf.apply_move(fen, m), ply + 1)
 
         for start in START_FENS:
@@ -240,8 +260,14 @@ def main():
     finally:
         sf.close()
 
-    print(f"entries: {len(entries)}  size: {len(entries)*16} bytes")
-    book_write([(k, mv, 1) for k, mv in sorted(entries.items())], args.out)
+    # Flatten: one (key, move, weight) row per candidate move.
+    flat = []
+    for key, moves in sorted(entries.items()):
+        for mv, w in sorted(moves.items(), key=lambda kv: -kv[1]):
+            flat.append((key, mv, w))
+    print(f"positions: {len(entries)}  candidates: {len(flat)}  "
+          f"size: {len(flat)*16} bytes")
+    book_write(flat, args.out)
     print(f"wrote {args.out}")
     return 0
 
