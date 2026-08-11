@@ -556,26 +556,28 @@ def main():
                         res, ply, sc = play_game(sf, bridge, fen, args.plies, color)
                     finally:
                         sf.close()
-                    # res is white-perspective: a "1-0" is a win for white.
-                    # Convert to sunfish's perspective by sunfish's color so the
-                    # per-level tallies (and the Elo fit) match the per-game label.
+                    # `color` is the side Stockfish plays (play_game's sf_color);
+                    # sunfish plays the opposite color.
+                    sun_color = "b" if color == "w" else "w"
+                    # res is white-perspective: "1-0" = white won, "0-1" = black
+                    # won. Map to sunfish's perspective for the per-level tallies
+                    # (and the Elo fit) and for the per-game log line.
                     r = results[nodes]
                     if res == "1-0":
-                        r["w" if color == "w" else "l"] += 1
+                        r["w" if sun_color == "w" else "l"] += 1
                     elif res == "0-1":
-                        r["l" if color == "w" else "w"] += 1
+                        r["l" if sun_color == "w" else "w"] += 1
                     else:
                         r["d"] += 1
                     played += 1
-                    outcome = {"1-0": "1-0" if color == "w" else "0-1",
-                               "0-1": "0-1" if color == "w" else "1-0",
+                    outcome = {"1-0": "1-0" if sun_color == "w" else "0-1",
+                               "0-1": "0-1" if sun_color == "w" else "1-0",
                                "1/2-1/2": "1/2-1/2"}[res]
-                    # outcome is white-perspective; color is sunfish's color.
-                    sunfish_won = ((outcome == "1-0") == (color == "w")) and res != "1/2-1/2"
-                    sf_won = (res != "1/2-1/2") and not sunfish_won
+                    sunfish_won = outcome == "1-0"
+                    sf_won = outcome == "0-1"
                     label = "SUNFISH" if sunfish_won else ("SF" if sf_won else "draw")
                     print("... game %d/%d  sf@%d  sunfish=%s  %s  [%s]"
-                          % (played, total, nodes, color, outcome, label),
+                          % (played, total, nodes, sun_color, outcome, label),
                           file=sys.stderr)
         finally:
             bridge.close()
