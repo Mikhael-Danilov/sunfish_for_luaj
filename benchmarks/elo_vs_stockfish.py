@@ -24,7 +24,10 @@ Methodology notes (matching the repo's benchmark taste):
 
 Usage:
   python3 benchmarks/elo_vs_stockfish.py [--engine DIR] [--stockfish PATH]
-      [--games N] [--plies N] [--nodes LIST] [--book PATH] [--seed N]
+      [--sunfish-nodes N] [--games N] [--plies N] [--nodes LIST]
+      [--book PATH] [--seed N]
+
+  --sunfish-nodes  per-move node budget for sunfish's search (default 1000)
 
   --engine     dir containing sunfish.lua (default: repo root)
   --stockfish  path to the stockfish binary
@@ -224,6 +227,10 @@ while true do
             elseif line:sub(1, 4) == "time" then
                 sunfish.set_time_budget(tonumber(line:sub(6) or "0"))
                 print("READY")
+            elseif line:sub(1, 5) == "nodes" then
+                -- Per-move node budget for sunfish's search (default 1000).
+                sunfish.set_nodes(tonumber(line:sub(7) or "0"))
+                print("READY")
             elseif line == "ai_move" then
                 local ng, mv, sc = sunfish.ai_move(game)
                 if not mv then
@@ -298,6 +305,13 @@ class SunfishBridge:
 
     def set_time_budget(self, seconds):
         self._send_cmd("time " + str(seconds))
+        while True:
+            if self._readline() == "READY":
+                return
+
+    def set_nodes(self, nodes):
+        """Per-move node budget for sunfish's search (default 1000)."""
+        self._send_cmd("nodes " + str(nodes))
         while True:
             if self._readline() == "READY":
                 return
@@ -493,6 +507,8 @@ def main():
     ap.add_argument("--engine", default=os.getcwd())
     ap.add_argument("--stockfish",
                     default=".reference/stockfish/stockfish-ubuntu-x86-64-avx2")
+    ap.add_argument("--sunfish-nodes", type=int, default=1000,
+                    help="sunfish per-move node budget (default 1000)")
     ap.add_argument("--games", type=int, default=1,
                     help="games per (level, opening); deterministic opponent "
                          "+ fixed book => 1 per opening is enough")
@@ -531,6 +547,7 @@ def main():
     total = len(combos) * args.games
     with tempfile.TemporaryDirectory(prefix="sunfish_bridge_") as tmpdir:
         bridge = SunfishBridge(args.engine, tmpdir)
+        bridge.set_nodes(args.sunfish_nodes)
         try:
             for nodes, fen, color in combos:
                 for _ in range(args.games):

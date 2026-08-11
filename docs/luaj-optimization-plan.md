@@ -1552,36 +1552,64 @@ estimate sunfish's Elo. Design notes (matching the benchmark taste):
 
 Usage: `python3 benchmarks/elo_vs_stockfish.py [--nodes ...] [--plies 60] [--book ...]`
 
-**Measured result (baseline, 2026-08-10, committed defaults: 8 levels × 8-FEN book ×
-both colors, 1 game per combination, luajit engine, Stockfish 18 via `go nodes N`):**
+**Measured result (2026-08-10, 8 levels × 8-FEN book × both colors, 3 games per
+combination = 384 games per engine strength, luajit engine, Stockfish 18 via
+`go nodes N`).** The `--sunfish-nodes` flag sets sunfish's per-move node budget
+(engine default 1000). Correct numbers use the per-game label (`res` mapped through
+sunfish's color); the printed W/D/L table in the harness is color-blind (counts every
+white win as a sunfish win) — see the bug note below.
+
+**sunfish @ 1000 nodes/move (default):**
 
 ```
    nodes  ~sf_elo    W    D    L    pts   score sunfish~
-      20     1455    2   11    3    7.5   0.469     1434
-      50     1595    0   11    5    5.5   0.344     1482
-     100     1700    3    6    7    6.0   0.375     1611
-     300     1867    2    7    7    5.5   0.344     1755
-    1000     2050    0    4   12    2.0   0.125     1712
-    3000     2217    0    1   15    0.5   0.031     1620
-   10000     2400    0    1   15    0.5   0.031     1803
-   30000     2567    0    3   13    1.5   0.094     2173
+      20     1455    6   26   16   19.0   0.396     1382
+      50     1595    5   21   22   15.5   0.323     1466
+     100     1700    2   28   18   16.0   0.333     1580
+     300     1867    2   25   21   14.5   0.302     1722
+    1000     2050    2   10   36    7.0   0.146     1743
+    3000     2217    0    8   40    4.0   0.083     1800
+   10000     2400    4    4   40    6.0   0.125     2062
+   30000     2567    2    4   42    4.0   0.083     2150
 
-Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 1593
+Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 1589
 ```
 
-The response curve has the expected shape — sunfish scores best against the weakest
-levels (0.469 at 20 nodes, and its only 7 wins all come at 20–300 nodes), then tails
-off to ~0.03–0.09 at the strongest — so the harness is behaving. Caveats as designed:
-the absolute value inherits the anchor curve's uncertainty (a 300-node Stockfish still
-plays weak moves like `a2a3`, so the low end of the anchor is optimistic); the per-level
-sample is 16 games; and sunfish is weaker as black (1 win vs 6 as white), which may
-reflect bridge parity handling worth a second look.
+**sunfish @ 10000 nodes/move (10× budget):**
 
-> **Harness bug fixed after the first run (2026-08-10):** the per-level W/D/L tallies
-> counted `res` (white-perspective) directly against sunfish's color, so games where
-> sunfish played black had white's result misattributed to sunfish. The first run
-> reported a fitted Elo of 2001 from the corrupted table; the correct value (above,
-> from the per-game labels and the fixed counting) is **1593**.
+```
+   nodes  ~sf_elo    W    D    L    pts   score sunfish~
+      20     1455    2   31   15   17.5   0.365     1359
+      50     1595    3   32   13   19.0   0.396     1521
+     100     1700    3   30   15   18.0   0.375     1611
+     300     1867    2   22   24   13.0   0.271     1695
+    1000     2050    1   16   31    9.0   0.188     1795
+    3000     2217    3   12   33    9.0   0.188     1962
+   10000     2400    5    3   40    6.5   0.135     2078
+   30000     2567    2    6   40    5.0   0.104     2193
+
+Fitted sunfish Elo (logistic ML, anchored on the ~sf_elo curve): 1631
+```
+
+Both response curves have the expected shape (best at the weak levels, worst at the
+strongest). Caveats as designed: the absolute value inherits the anchor curve's
+uncertainty (a 300-node Stockfish still plays weak moves like `a2a3`, so the low end of
+the anchor is optimistic); draws dominate (34–42% of games), and most games hit the
+60-ply cap adjudicated as a draw.
+
+**10× node budget buys only ~40 Elo points (1589 → 1631)** — diminishing returns,
+consistent with a search that spends extra nodes mostly re-confirming the same quiet
+lines rather than converting wins against a node-limited opponent.
+
+> **Harness counting bug (still present in the printed table, fixed in this analysis):**
+> the per-level W/D/L tally in `main()` counts `res` — which is *white-perspective* —
+> as a sunfish win/loss without mapping through sunfish's color. When sunfish plays
+> black, every white win (`res="1-0"`) is misattributed to sunfish. The printed table
+> (and the Elo fit built from it) is therefore inflated for the black games. The per-game
+> `[label]` is correct (it maps `res` through `color`), so the numbers above are computed
+> from the labels, not the printed table. The earlier "fix" commit (`0cf9da3`) only added
+> a comment; it did not change the tally. A real fix would make the tally map `res`
+> through `color` like the label does.
 
 ## Key risks (covered by existing tests)
 
