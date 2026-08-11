@@ -116,6 +116,26 @@ class Stockfish:
                 m = line.split()[1]
                 return None if m == "(none)" else m
 
+    def topmoves(self, fen, branch, depth=12):
+        """The top `branch` moves for `fen` via MultiPV (deterministic at a
+        fixed depth). Returns a list of UCI moves (possibly shorter if the
+        position has fewer legal moves)."""
+        self._pos(fen, [])
+        self._send("setoption name MultiPV value %d" % branch)
+        self._send("go depth %d" % depth)
+        moves = []
+        while True:
+            line = self._readline()
+            if line.startswith("info"):
+                # info depth D multipv K score ... pv m1 m2 ...
+                if " pv " in line:
+                    mv = line.split(" pv ")[1].split()[0]
+                    if mv not in moves:
+                        moves.append(mv)
+            elif line.startswith("bestmove"):
+                break
+        return moves
+
     def fen_side(self, fen, moves):
         self._pos(fen, moves)
         self._send("d")
@@ -159,6 +179,9 @@ def main():
     ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--plies", type=int, default=8,
                     help="max plies of SF-generated lines to record per start")
+    ap.add_argument("--branch", type=int, default=1,
+                    help="MultiPV width: top-N moves to explore at each ply "
+                         "(1 = single best line, 3 = 3x branching)")
     ap.add_argument("--out", default="benchmarks/sunfish.bin")
     ap.add_argument("--stockfish",
                     default=".reference/stockfish/stockfish-ubuntu-x86-64-avx2")
@@ -173,27 +196,15 @@ def main():
 
     entries = {}  # key32 -> poly move16 (dedupe; last write wins)
 
+    def record(fen, move):
+        key = _fen_key(fen)
+        entries[key] = uci_to_poly(move)
+
     sf = Stockfish(sf_path)
     try:
-        # 1) Strong lines: from each start, play Stockfish against itself and
-        #    record position -> move for every ply (covers both colors).
-        for start in START_FENS:
-            fen = start
-            for _ in range(args.plies):
-                m = sf.bestmove(fen, [], depth=args.depth)
-                if m is None:
-                    break
-                # legality: the move must be legal from the current fen
-                if not sf.is_legal(fen, [], m):
-                    print(f"  skipping illegal SF move {m} from {fen[:20]}...",
-                          file=sys.stderr)
-                    break
-                key = _fen_key(fen)
-                entries[key] = uci_to_poly(m)
-                fen = sf.apply_move(fen, m)
-
-        # 2) Classic trap lines (explicit move sequences, from the standard
-        #    start position).
+        # 1) Classic trap lines (explicit move sequences, from the standard
+        #    start position). Run FIRST so the stronger SF lines below can
+        #    overwrite them on the same positions (last write wins).
         for line in TRAP_LINES:
             fen = START_FENS[0]
             for m in line:
@@ -204,6 +215,27 @@ def main():
                 key = _fen_key(fen)
                 entries[key] = uci_to_poly(m)
                 fen = sf.apply_move(fen, m)
+
+        # 2) Strong lines: branch through the top-N Stockfish moves at each
+        #    position (MultiPV), recording position -> move for every ply of
+        #    every branch. Covers both colors (SF plays both sides) and the
+        #    opponent's most-likely deviations.
+        def expand(fen, ply):
+            if ply >= args.plies:
+                return
+            tops = sf.topmoves(fen, args.branch, depth=args.depth)
+            if not tops:
+                return
+            for m in tops:
+                if not sf.is_legal(fen, [], m):
+                    print(f"  skipping illegal SF move {m} from {fen[:20]}...",
+                          file=sys.stderr)
+                    continue
+                record(fen, m)
+                expand(sf.apply_move(fen, m), ply + 1)
+
+        for start in START_FENS:
+            expand(start, 0)
 
     finally:
         sf.close()

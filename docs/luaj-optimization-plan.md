@@ -1609,31 +1609,34 @@ lines rather than converting wins against a node-limited opponent.
 > combo color) and using it consistently for the tally, the outcome mapping, and
 > the log line. Verified: table == labels == tally on a 48-game controlled run.
 
-### Opening book experiment (2026-08-11): no measurable Elo gain
+### Opening book experiments (2026-08-11): no measurable Elo gain
 
-Added a compact Zobrist-keyed opening book (benchmarks/sunfish.bin, 136 entries,
-2.2 kB) generated from strong Stockfish lines plus classic trap lines. The book
-is position-keyed by the engine's exact 32-bit Zobrist hash (a Python port,
-validated bit-for-bit against `Position:key()`), so lookups are transposition-
-safe. The harness gets a `--book-moves FILE` flag; at sunfish's turn, if the
-position's key is in the book, the book move is played instead of searching.
+Added a Zobrist-keyed opening book (benchmarks/sunfish.bin) generated from
+Stockfish lines plus classic trap lines. The book is position-keyed by the
+engine's exact 32-bit Zobrist hash (a Python port, validated bit-for-bit
+against `Position:key()`), so lookups are transposition-safe. The harness
+gets a `--book-moves FILE` flag; at sunfish's turn, if the position's key is
+in the book, the book move is played instead of searching.
 
-A/B at 1000 nodes/move, 384 games each (8 levels × 8 FENs × 2 colors × 3 games,
-same seed):
+Two book sizes tested (A/B at 1000 nodes/move, 384 games each: 8 levels × 8
+FENs × 2 colors × 3 games, same seed):
 
-| | fitted Elo |
-|---|---|
-| baseline (no book) | **1919** |
-| with book | **1915** |
+| variant | entries | size | fitted Elo |
+|---|---|---|---|
+| baseline (no book) | — | — | **1919** |
+| small book (single line/start) | 136 | 2.2 kB | **1915** |
+| big book (MultiPV branch=2, plies=4, depth 12) | 788 | 12.6 kB | **1931** |
 
-**Verdict: no measurable gain (−4 ± noise).** The book did convert losses to
-draws at the weakest level (sf@20: 26→33 draws, 11→6 losses) but also trimmed
-wins; the net Elo delta is within the run-to-run noise band (±30-50 at this
-sample). At 1000 nodes sunfish already plays reasonable openings from the 8
-harness starts, so replacing its first moves with Stockfish's choices doesn't
-avoid enough early blunders to matter. The book infra remains useful for future
-experiments (e.g. forcing specific openings, or an engine-level book for the
-Android target), but it is not an Elo lever at this strength.
+**Verdict: no measurable gain** — both books land within the run-to-run noise
+band (±30-50 at this sample). The big book's +12 vs baseline is the right
+direction but not significant. The generator now supports `--branch N`
+(MultiPV top-N moves at each position, recursing into all of them), so the
+book covers the opponent's likely deviations; SF lines run after the trap
+lines so the stronger move wins on shared positions. At 1000 nodes sunfish
+already plays reasonable openings from the 8 harness starts, so the book
+doesn't avoid enough early blunders to move Elo. The infra remains useful for
+forcing specific openings or an engine-level book, but it is not an Elo lever
+at this strength.
 
 ## Key risks (covered by existing tests)
 
