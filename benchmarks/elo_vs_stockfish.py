@@ -54,6 +54,11 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from zobrist_book import (  # noqa: E402
+    TABLES, book_read, poly_to_uci, pos_from_fen, zobrist_key,
+)
+
 DEFAULT_BOOK = [
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1",     # e4 e5
@@ -436,14 +441,19 @@ class Stockfish:
 
 # --- game loop ---------------------------------------------------------------
 
-def play_game(sf, bridge, fen, plies, sf_color):
+def play_game(sf, bridge, fen, plies, sf_color, book=None):
     """Play one game from `fen`. `sf_color` is 'w' or 'b' (the side Stockfish
     plays). Returns (result, ply_count, sunfish_last_score).
 
     Position sync: before each sunfish move, the bridge rebuilds sunfish's
     position from the current real-board FEN (via Stockfish's `d` output).
     This avoids all frame-conversion bookkeeping — the FEN is the ground
-    truth and pos_from_fen handles the engine's rotation convention."""
+    truth and pos_from_fen handles the engine's rotation convention.
+
+    `book` (optional): dict of engine Zobrist key -> UCI move (from
+    zobrist_book.py). When the position's key is in the book, sunfish plays
+    the book move instead of searching.
+    """
     moves = []
     turn = 'w' if fen.split()[1] == 'w' else 'b'
     last_score = 0
@@ -456,7 +466,15 @@ def play_game(sf, bridge, fen, plies, sf_color):
             moves.append(m)
         else:
             # sync sunfish to the real position, then let it move
-            bridge.set_fen(sf.fen(moves))
+            fen_now = sf.fen(moves)
+            if book is not None:
+                key = fen_key(fen_now)
+                bm = book.get(key)
+                if bm:
+                    moves.append(bm)
+                    turn = 'b' if turn == 'w' else 'w'
+                    continue
+            bridge.set_fen(fen_now)
             m, last_score = bridge.ai_move()
             if m is None:
                 # sunfish passes (decided): adjudicate the current position
@@ -468,6 +486,20 @@ def play_game(sf, bridge, fen, plies, sf_color):
 
 
 # --- Elo estimation ----------------------------------------------------------
+
+def fen_key(fen):
+    """The engine's 32-bit Zobrist key for a FEN position."""
+    codes, wc, bc, ep, kp = pos_from_fen(fen)
+    return zobrist_key(codes, wc, bc, ep, kp, TABLES)
+
+
+def load_book(path):
+    """Load a binary opening book into {key32: uci_move}."""
+    book = {}
+    for key, mv16, weight in book_read(path):
+        book[key] = poly_to_uci(mv16)
+    return book
+
 
 def fit_elo(results):
     """Maximum-likelihood fit of sunfish Elo vs the anchor curve.
@@ -509,6 +541,9 @@ def main():
                     default=".reference/stockfish/stockfish-ubuntu-x86-64-avx2")
     ap.add_argument("--sunfish-nodes", type=int, default=1000,
                     help="sunfish per-move node budget (default 1000)")
+    ap.add_argument("--book-moves", default=None,
+                    help="binary opening book (Zobrist key -> move); sunfish "
+                         "plays book moves when the position is in the book")
     ap.add_argument("--games", type=int, default=1,
                     help="games per (level, opening); deterministic opponent "
                          "+ fixed book => 1 per opening is enough")
@@ -533,14 +568,27 @@ def main():
     ADJUDICATE_NODES = args.adj_nodes
 
     node_levels = [int(x) for x in args.nodes.split(",")]
-    book = DEFAULT_BOOK
+    book_fens = DEFAULT_BOOK
     if args.book:
         with open(args.book) as f:
-            book = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+            book_fens = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
     rng = random.Random(args.seed)
-    combos = [(n, fen, color) for n in node_levels for fen in book for color in ("w", "b")]
+    combos = [(n, fen, color) for n in node_levels for fen in book_fens
+              for color in ("w", "b")]
     rng.shuffle(combos)
+
+    moves_book = None
+    if args.book_moves:
+        book_path = args.book_moves
+        if not os.path.isabs(book_path):
+            book_path = os.path.join(os.getcwd(), book_path)
+        if not os.path.exists(book_path):
+            print(f"book not found: {book_path}", file=sys.stderr)
+            return 1
+        moves_book = load_book(book_path)
+        print(f"# loaded opening book: {len(moves_book)} entries from {book_path}",
+              file=sys.stderr)
 
     results = {n: {"w": 0, "d": 0, "l": 0} for n in node_levels}
     played = 0
@@ -553,7 +601,8 @@ def main():
                 for _ in range(args.games):
                     sf = Stockfish(sf_path, nodes, fen)
                     try:
-                        res, ply, sc = play_game(sf, bridge, fen, args.plies, color)
+                        res, ply, sc = play_game(sf, bridge, fen, args.plies,
+                                                 color, book=moves_book)
                     finally:
                         sf.close()
                     # `color` is the side Stockfish plays (play_game's sf_color);

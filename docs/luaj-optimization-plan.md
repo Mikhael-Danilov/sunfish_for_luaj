@@ -1601,15 +1601,39 @@ the anchor is optimistic); draws dominate (34–42% of games), and most games hi
 consistent with a search that spends extra nodes mostly re-confirming the same quiet
 lines rather than converting wins against a node-limited opponent.
 
-> **Harness counting bug (still present in the printed table, fixed in this analysis):**
-> the per-level W/D/L tally in `main()` counts `res` — which is *white-perspective* —
-> as a sunfish win/loss without mapping through sunfish's color. When sunfish plays
-> black, every white win (`res="1-0"`) is misattributed to sunfish. The printed table
-> (and the Elo fit built from it) is therefore inflated for the black games. The per-game
-> `[label]` is correct (it maps `res` through `color`), so the numbers above are computed
-> from the labels, not the printed table. The earlier "fix" commit (`0cf9da3`) only added
-> a comment; it did not change the tally. A real fix would make the tally map `res`
-> through `color` like the label does.
+> **Harness counting bug (fixed in `58d4cde`):** the per-level W/D/L tally in
+> `main()` counted `res` — which is *white-perspective* — as a sunfish win/loss
+> without mapping through sunfish's color, because the combo `color` is the side
+> Stockfish plays. When sunfish played black, every white win (`res="1-0"`) was
+> misattributed to sunfish. Fixed by deriving `sun_color` (the opposite of the
+> combo color) and using it consistently for the tally, the outcome mapping, and
+> the log line. Verified: table == labels == tally on a 48-game controlled run.
+
+### Opening book experiment (2026-08-11): no measurable Elo gain
+
+Added a compact Zobrist-keyed opening book (benchmarks/sunfish.bin, 136 entries,
+2.2 kB) generated from strong Stockfish lines plus classic trap lines. The book
+is position-keyed by the engine's exact 32-bit Zobrist hash (a Python port,
+validated bit-for-bit against `Position:key()`), so lookups are transposition-
+safe. The harness gets a `--book-moves FILE` flag; at sunfish's turn, if the
+position's key is in the book, the book move is played instead of searching.
+
+A/B at 1000 nodes/move, 384 games each (8 levels × 8 FENs × 2 colors × 3 games,
+same seed):
+
+| | fitted Elo |
+|---|---|
+| baseline (no book) | **1919** |
+| with book | **1915** |
+
+**Verdict: no measurable gain (−4 ± noise).** The book did convert losses to
+draws at the weakest level (sf@20: 26→33 draws, 11→6 losses) but also trimmed
+wins; the net Elo delta is within the run-to-run noise band (±30-50 at this
+sample). At 1000 nodes sunfish already plays reasonable openings from the 8
+harness starts, so replacing its first moves with Stockfish's choices doesn't
+avoid enough early blunders to matter. The book infra remains useful for future
+experiments (e.g. forcing specific openings, or an engine-level book for the
+Android target), but it is not an Elo lever at this strength.
 
 ## Key risks (covered by existing tests)
 
