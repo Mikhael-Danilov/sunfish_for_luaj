@@ -2002,6 +2002,121 @@ function sunfish.set_nodes(n)
     NODES_SEARCHED = n or NODES_SEARCHED
 end
 
+-- ----------------------------------------------------------------------------
+-- Opening book (position-keyed, opt-in)
+--
+-- `set_book(path, seed)` loads a binary book of 16-byte entries:
+--   8B key   (the engine's 32-bit Zobrist key in the high half)
+--   2B move  (packed: from<<6|rank1<<3|to|rank2<<9|promo<<12; from/to are
+--             polyglot 0..63 a1=0 squares, promo is the ENGINE piece code
+--             2=N,3=B,4=R,5=Q, 0=none)
+--   2B weight, 2B learn(0), 2B pad(0)
+-- Positions may have multiple entries (variety): ai_move picks one weighted-
+-- randomly. `seed` makes the pick deterministic across runs; nil = use
+-- os.time(). Book moves are stored in REAL-board coordinates; ai_move maps
+-- them into the current engine frame (mirrored for black to move).
+-- ----------------------------------------------------------------------------
+local book_map = nil      -- key -> { n, moves[], weights[] }
+local book_rng = nil      -- deterministic MWC-style state {x, c}
+
+local function book_rnd()
+    if not book_rng then
+        local t = os.time()
+        book_rng = { x = t % 65536, c = math.floor(t / 65536) % 65536 }
+    end
+    local x, c = book_rng.x, book_rng.c
+    local t = x * 65539 + c
+    c = math.floor(t / 65536)
+    x = t % 65536
+    book_rng.x, book_rng.c = x, c
+    return x + c * 65536
+end
+
+local function book_pick(cands)
+    local n = cands.n
+    if n == 0 then return nil end
+    local total = 0
+    for i = 1, n do total = total + cands.weights[i] end
+    local r = book_rnd() % total + 1
+    local acc = 0
+    for i = 1, n do
+        acc = acc + cands.weights[i]
+        if r <= acc then return cands.moves[i] end
+    end
+    return cands.moves[n]
+end
+
+-- Polyglot-packed move -> (from, to, promo) in 0..63 a1=0 coordinates.
+local function poly_decode(mv16)
+    local f1 = math.floor(mv16 / 64) % 8
+    local r1 = math.floor(mv16 / 8) % 8
+    local f2 = mv16 % 8
+    local r2 = math.floor(mv16 / 512) % 8
+    local promo = math.floor(mv16 / 4096) % 8
+    return f1 + 8 * r1, f2 + 8 * r2, promo -- a1=0: rank*8 + file
+end
+
+function sunfish.set_book(path, seed)
+    if not path then
+        book_map = nil
+        return true
+    end
+    local f = io.open(path, "rb")
+    if not f then
+        return false, "cannot open " .. tostring(path)
+    end
+    local data = f:read("*a")
+    f:close()
+    book_map = {}
+    book_rng = nil
+    if seed then
+        book_rng = { x = seed % 65536, c = math.floor(seed / 65536) % 65536 }
+    end
+    local nentries = math.floor(#data / 16)
+    for i = 0, nentries - 1 do
+        local off = i * 16
+        -- 16-byte entry: 8B key64 (key32 in high half), 2B move, 2B weight,
+        -- 2B learn, 2B pad. Lua string.byte is 1-based; off is 0-based.
+        local key = 0
+        for j = 1, 4 do
+            key = key * 256 + string.byte(data, off + j)
+        end
+        local mv16 = string.byte(data, off + 9) * 256 + string.byte(data, off + 10)
+        local weight = string.byte(data, off + 11) * 256 + string.byte(data, off + 12)
+        if weight < 1 then weight = 1 end
+        local c = book_map[key]
+        if not c then
+            c = { n = 0, moves = {}, weights = {} }
+            book_map[key] = c
+        end
+        c.n = c.n + 1
+        c.moves[c.n] = mv16
+        c.weights[c.n] = weight
+    end
+    return true, nentries
+end
+
+-- Is the current position's side to move black? The engine frame renders the
+-- side to move uppercase at the bottom; a black-to-move frame is the real
+-- board mirrored. Detect by whether a positive (uppercase) piece sits in the
+-- bottom half vs top half of the board. Robust proxy: the side to move's king
+-- (or any of its pieces) is uppercase; we scan for the FIRST uppercase piece
+-- and use its rank.
+local function stm_is_black(game)
+    local b = game:ensure_arr()
+    for i = 1, 120 do
+        local v = b[i]
+        if v == P or v == KN or v == B or v == R or v == Q or v == K then
+            -- uppercase piece found: its row decides. rows 1..8 are frames
+            -- (row 0/9 sentinel). side-to-move at bottom = rows 6..8 for
+            -- white frame; black frame has it at rows 1..3.
+            local row = math.floor((i - 1) / 10)
+            return row < 5
+        end
+    end
+    return false
+end
+
 -- F2 measurement: TT probe/hit/occupancy stats from the last search.
 function sunfish.tt_stats()
     return { probe = tt_probe, hit = tt_hit, slot_hit = tt_slot_hit }
@@ -2196,6 +2311,46 @@ local function bkm_successor_key(st, mv)
 end
 
 function sunfish.ai_move(game)
+    -- Opening book (opt-in): if the position's Zobrist key is in the book,
+    -- play a weighted-random book move instead of searching. Book moves are
+    -- stored in real-board coordinates; map into the engine's current frame
+    -- (mirrored when black is to move) and validate legality.
+    if book_map then
+        local cands = book_map[game:key()]
+        if cands then
+            local mv16 = book_pick(cands)
+            if mv16 then
+                local from, to, promo = poly_decode(mv16)
+                -- real-board 1-based frame squares (parse uses A1=92)
+                local rfrom = 92 + (from % 8) - 10 * math.floor(from / 8)
+                local rto = 92 + (to % 8) - 10 * math.floor(to / 8)
+                local black = stm_is_black(game)
+                local f1, f2 = rfrom, rto
+                if black then f1, f2 = 121 - rfrom, 121 - rto end
+                local uci = render(f1) .. render(f2)
+                if promo ~= 0 then
+                    uci = uci .. code_to_char[-promo]
+                end
+                local ng = sunfish.move(game, uci)
+                if ng then
+                    -- Return the same frame convention as the search path:
+                    -- white-to-move -> child-frame (mirrored), black-to-move ->
+                    -- real-frame. The bridge's display_to_real(mv, rot) then
+                    -- recovers the real-board UCI (rot=1 white, 0 black).
+                    local s1, s2
+                    if black then
+                        s1, s2 = rfrom, rto
+                    else
+                        s1, s2 = 121 - rfrom, 121 - rto
+                    end
+                    local mvstr = render(s1) .. render(s2)
+                    if promo ~= 0 then mvstr = mvstr .. code_to_char[-promo] end
+                    return ng, mvstr, 0
+                end
+            end
+        end
+    end
+
     if USE_BKM_LIGHT and game.piece_count == 3 then
         local st = krk_kqk_state(game)
         if st then

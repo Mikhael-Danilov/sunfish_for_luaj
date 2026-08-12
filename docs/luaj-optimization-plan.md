@@ -1613,14 +1613,22 @@ lines rather than converting wins against a node-limited opponent.
 
 Added a Zobrist-keyed opening book (benchmarks/sunfish.bin) generated from
 Stockfish lines plus classic trap lines. The book is position-keyed by the
-engine's exact 32-bit Zobrist hash (a Python port, validated bit-for-bit
-against `Position:key()`), so lookups are transposition-safe. The harness
-gets a `--book-moves FILE` flag; at sunfish's turn, if the position's key is
-in the book, sunfish plays a book move instead of searching.
+engine's exact 32-bit Zobrist hash, so lookups are transposition-safe.
+
+**Engine API (2026-08-12):** the book is now wired into `sunfish.lua` itself:
+`sunfish.set_book(path, seed)` loads the binary book, and `ai_move` consults
+it before searching — a position whose Zobrist key (`Position:key()`) is in
+the book plays a weighted-random book move (real-board coordinates mapped
+into the engine frame; mirrored for black to move, validated via the
+existing `sunfish.move` legality check; falls through to search if the move
+isn't legal). The harness `--book-moves FILE` flag now pushes the book into
+the engine through the bridge instead of intercepting moves in Python.
+Covered by `tests/test_book.lua` (loads, disables, varied legal first moves,
+legal black reply).
 
 **Variety:** positions can hold multiple candidate moves with weights
-(10/6/3/1 for the top-4 MultiPV moves); the harness picks one weighted-
-randomly per game (`rng` seeded by `--seed`). E.g. the standard start offers
+(10/6/3/1 for the top-4 MultiPV moves); `ai_move` picks one weighted-randomly
+per game (`seed` makes it deterministic). E.g. the standard start offers
 `e2e4` (~44%), `c2c3` (~28%), `d2d4` (~14%), plus occasional `c2c4`/`g1f3`/
 `g2g3` — same position, different first move game to game. Trap-line first
 plies are excluded so junk roots (e.g. Fool's-mate `1.f3`) never appear.
