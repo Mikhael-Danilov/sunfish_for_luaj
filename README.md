@@ -162,3 +162,14 @@ search is ~12x slower under LuaJ and buys little over the heuristic mover.
   raise it for LuaJ, e.g. `TEST_BUDGET=120`).
 - **`sunfish.move` with non-string input** (e.g. `nil`) will raise, not return `false`.
   Only string moves are validated.
+- **Opening book (opt-in)**: `sunfish.set_book(path, seed)` loads a binary book of
+  16-byte entries (position Zobrist key -> weighted moves); pass `nil` to disable.
+  Once loaded, `ai_move` plays a weighted-random book move when the position's key is
+  in the book, falling through to the search otherwise. The same position can hold
+  several candidate moves with weights (best move most likely, e.g. the standard start
+  mostly picks `e2e4`, sometimes `c2c3`/`d2d4`, occasionally `g1f3`/`g2g3`/`c2c4`), so
+  consecutive games vary. `seed` makes the picks deterministic across runs (defaults to
+  wall-clock time). Book moves are real-board coordinates mapped into the engine frame
+  (mirrored for Black) and validated for legality before playing. The shipped book is
+  `benchmarks/sunfish.bin` (~25 kB), generated from Stockfish MultiPV lines + classic
+  trap lines by `benchmarks/gen_book.py`.
