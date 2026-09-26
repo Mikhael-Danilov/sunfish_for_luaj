@@ -24,17 +24,20 @@ local green = require("green")
 -- return draw scores before the TT probe), so this is the invariant every
 -- behavior-identical batch must preserve.
 local EXPECTED = {
-    { depth = 1, nodes = 27,   score = 99 },
-    { depth = 2, nodes = 153,  score = 0 },
-    { depth = 3, nodes = 287,  score = 99 },
-    { depth = 4, nodes = 1019, score = 20 },
+    { depth = 1, nodes = 23,   score = 99 },
+    { depth = 2, nodes = 64,   score = 0 },
+    { depth = 3, nodes = 109,  score = 99 },
+    { depth = 4, nodes = 1004, score = 36 },
 }
 -- The invariant root move (current baseline): b8c6.
--- 2026-09-26: history/killer/TT-move ordering shipped (node-count-changing by
--- design — it re-shapes the tree within the same 1000-node budget; depths 1-3
--- are untouched, depth 4 moved 1008 -> 1019 nodes and the root pick from
--- d7d5 to b8c6). This verifier remains the guard rail for future
--- behavior-identical batches against THIS baseline.
+-- 2026-09-26 (round 3): null-move probes now require depth >= 3 (shallow null
+-- probes fed MTD phantom cutoffs — see the null-move block in sunfish.lua), so
+-- depths 1-3 lost their null subtrees (27/153/287 -> 23/64/109). The root loop
+-- is an MTD(f) zero-window walk (SUNFISH_MTDF=0 reverts to bisection), which
+-- changes depth-4's converged score (20 -> 36 at 1004 nodes). Check extension,
+-- qsearch check-evasion (QSE_FLOOR -4) and the endgame king-activity leaf term
+-- don't fire at the 32-piece start position. This verifier remains the guard
+-- rail for future behavior-identical batches against THIS baseline.
 local EXPECTED_MOVE = "b8c6"
 
 local captured = {}

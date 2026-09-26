@@ -252,6 +252,41 @@ search is ~12x slower under LuaJ and buys little over the heuristic mover.
   now capture-aware — when a tactical shot (capture/promotion) exists, the leaf
   searches instead of returning the gradient (a hung heavy piece used to be
   invisible at the horizon: lone-king-takes-queen draws).
+- **Search robustness batch (2026-09-26, round 3)**:
+  - *Null-move guards*: the probe requires depth >= 3 (a shallow null probe
+    reads a qsearch repetition draw as a proven cutoff and feeds MTD a phantom
+    score — observed as a 1000-node depth-1 burn returning nil), is skipped
+    while in check, and in sparse positions (<= 6 pieces, zugzwang territory —
+    same line as the futility/LMR guards; `SUNFISH_NULL_ENDGAME=1` restores the
+    unguarded endgame probe).
+  - *Check extension*: in-check interior nodes (depth >= 2, ply < 32) search
+    their evasions one ply deeper. `SUNFISH_CHECK_EXT=0` disables.
+  - *Qsearch check evasions*: at depth <= 0 while in check the leaf searches
+    ALL legal moves (capture-only "evasions" miss quiet king escapes — a mated
+    leaf read as a fine stand-pat), down to depth >= -4, with the stand-pat
+    rescue and corraling gradient disabled there. `SUNFISH_QEVASIONS=0`
+    disables.
+  - *MTD(f) root walk*: root probes target the current best estimate instead
+    of the window midpoint (zero-window probes cut fast). Where bisection
+    thrashed (1020 nodes to converge depth 1 on an Italian middlegame), the
+    walk converges in 298; Elo-neutral overall, more wins at the 1000-node
+    budget. `SUNFISH_MTDF=0` reverts to bisection; `SUNFISH_ASP=<n>` retunes
+    the aspiration window (default 100, measured outcome-neutral).
+  - *Endgame king-activity leaf term*: at 5..8-piece leaves the stand-pat score
+    gains a small king-centralization bonus (the threaded PST's king table
+    rewards corner safety — a middlegame concern). A pure leaf term, NOT a PST
+    swap: threading phase-dependent deltas would make transpositions'
+    scores depend on their move-order history.
+- **Measured (round 3)**: full-battery gates green (suites luajit/lua5.1/LuaJ,
+  perft 21/21, oracle 40/40, selfplay both colors SF-validated 0 failures,
+  python-chess cross-validation 40/40, KQK/KRK conversion 389/400 = 97.2% with
+  0 draws, defense 200/200). Elo vs SF18 (256 games, seed 1 + seed 2): fitted
+  1942 both — equal to the round-2 baseline at measurable precision, with the
+  loss count at 30000 nodes down from 16/32 to 2-6/32 (draws absorbed the
+  difference). CPU per search ~154-160 ms (fork jar, 8-search steady mean) —
+  neutral-to-slightly-better than round 2's 166 ms. Tried and rejected as
+  Elo-neutral: extended futility at depth 2, TT depth-preferred replacement,
+  qsearch first-ply checks (+12% CPU for nothing), adaptive null reduction.
 - **Under-promotions**: `ai_move` may return a 5-char move (`e7e8n`) — carry the
   promo char through your display/UCI conversion; coercing to queen desyncs the
   engine state.

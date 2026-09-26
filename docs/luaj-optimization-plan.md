@@ -1960,3 +1960,91 @@ process (documented), and back-to-back searches of the same position can
 return different moves as entries accumulate — observed in BOTH the old and
 new engines. A per-search TT generation check is the eventual fix; out of
 scope this round.
+
+## 2026-09-26 round 3: search robustness + MTD(f) root walk, nil-move bug found, Elo re-anchored
+
+Goal: strength and efficiency under interpreter-mode LuaJ at the RPD budget
+(1000 nodes/move), verified for both colors and both mating endgames.
+
+### Shipped
+
+1. **Null-move guards** (`bound()`): the probe now requires `depth >= 3`
+   (was `depth > 0`), is skipped while in check, and skips sparse positions
+   (`piece_count <= 6`, matching the futility/LMR guards; SUNFISH_NULL_ENDGAME=1
+   restores the endgame probe for A/B).
+   - The depth >= 3 requirement is a CORRECTNESS fix, not just strength: at
+     depth 1-2 the null child lands at depth -2/-1, i.e. a bare qsearch
+     verdict. With qsearch evasions (below) that verdict can be a repetition
+     draw found inside a perpetual-check chain, and the null cutoff then feeds
+     MTD a phantom 0 — observed as the root bisection burning the full
+     1000-node budget without converging depth 1 and `ai_move` returning NIL
+     (engine passes) in a normal Italian middlegame. Baseline never saw it
+     because capture-only qsearch cannot follow perpetuals.
+2. **Check extension**: in-check interior nodes (depth >= 2, ply < 32) search
+   evasions one ply deeper (`depth - 1 + ext`, LMR paths included). The
+   depth >= 2 guard prevents a depth-1 extension treadmill (depth-1 node ->
+   depth-1 children); perpetual lines above that are bounded by the repetition
+   scan + ply cap. SUNFISH_CHECK_EXT=0 disables.
+3. **Qsearch check evasions**: at depth <= 0 while in check the leaf searches
+   ALL legal moves instead of the >= 150 capture subset, down to
+   `QSE_FLOOR = -4`; the stand-pat rescue and the corraling gradient are
+   disabled there (standing pat while in check is illegal, and a pass is
+   meaningless). SUNFISH_QEVASIONS=0 disables. Termination: depth decreases
+   every recursion; below the floor the node falls back to capture-only.
+4. **MTD(f) root walk** (`search()`): per-depth probes target the current best
+   estimate g (zero-window at beta = g, or g+1 after a fail-low at the lower
+   bound) instead of the window midpoint. Zero-window probes cut fast — where
+   bisection needed 1020 nodes to converge depth 1 on the middlegame FEN
+   `rnbq1rk1/...`, the walk needs 298. Same `lower < upper - 3` termination;
+   an oscillation can only invert the window, which exits. Elo-neutral
+   overall, more wins at 1000 nodes. SUNFISH_MTDF=0 reverts to bisection;
+   SUNFISH_ASP=<n> retunes the aspiration window (default 100,
+   measured outcome-neutral — the bisection/walk converge to the same moves).
+5. **Endgame king-activity leaf term**: at 5..8-piece leaves the stand-pat
+   score gains `pstKEnd[king_sq]` (authored -30..+25 centralization table,
+   symmetric so both frames agree). Deliberately a LEAF TERM, not a PST swap:
+   `pos.score` is threaded through `value()` deltas, so a phase-dependent PST
+   would make a transposition's accumulated score depend on its move-order
+   history (TT comparisons across transpositions would compare scores built
+   under different phase mixtures). The start position (32 pieces) never sees
+   it.
+
+### Tried and rejected (Elo-neutral at 48- and 256-game scales)
+
+- Extended futility at depth 2 (margin 500): outcome-identical games.
+- TT depth-preferred replacement: outcome-identical games.
+- Qsearch first-ply checks (honest make+in_check test per quiet move at
+  depth 0): +12% CPU, Elo noise. A cheap alignment pre-filter is the follow-up
+  if offense is ever needed; dropped for now.
+- Adaptive null reduction (R=4 at depth >= 6): Elo noise, +12 ms CPU on the
+  start position.
+
+### Measurements
+
+- Full-battery gates: suites 15+22+21+5+8 green on luajit/lua5.1 AND the LuaJ
+  fork jar; perft 21/21; python-chess cross-validation 40/40; SF-validated
+  selfplay 59 plies 0 failures (both colors' moves checked every ply);
+  KQK+KRK conversion 389/400 = 97.2% (0 draws; defense holds 200/200) — up
+  from round 2's 96.5%; bkm_light validator 0 illegal; book 5/5.
+- Elo vs SF18 (256 games each, seed 1 and seed 2): fitted 1942 BOTH seeds —
+  equal to the round-2 baseline (1942) at measurable precision. The W/D/L
+  SHAPE changed radically: losses at 30000 nodes fell 16/32 -> 2-6/32 (draws
+  absorbed them; evasions + extension made the engine very hard to beat), wins
+  fell too. Round-2's 1899-1953 spread = the same value inside noise.
+- CPU per search (fork jar, 8-search steady mean, cold JVM): ~154-160 ms vs
+  round 2's 166 ms; neutral-to-slightly-better (JVM noise band is ±15%).
+- Invariant refreshed: depths 1-3 lost their null subtrees (27/153/287 ->
+  23/64/109 nodes), depth 4 = 1004 nodes score 36 under the MTD(f) walk
+  (was 1019/20 under bisection); root move still b8c6. verifier updated.
+
+### The nil-move bug (worth remembering)
+
+`ai_move` returning nil (engine passes) in a LIVE middlegame was the round's
+key find. Chain: qsearch evasions made perpetual-check chains visible ->
+null probe at depth 1 (child depth -2) read the repetition draw as a proven
+cutoff -> first MTD probe returned 0 -> bisection needed ~15 probes to
+recover -> 1000-node budget died inside depth 1 -> no rootmove, empty TT ->
+nil. Diagnosis path: SUNFISH_VERBOSE per-depth probe windows (lower=0 against
+upper=90000 was the tell), then knob bisection (SUNFISH_QEVASIONS=0 alone
+converged). Rule of thumb: a null probe whose child is below depth 0 is a
+qsearch opinion, not a proof — require depth >= 3.

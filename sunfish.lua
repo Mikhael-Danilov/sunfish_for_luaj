@@ -271,6 +271,21 @@ local pst = {
           0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
 }
 
+local pstKEnd = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, -30, -20, -15, -10, -10, -15, -20, -30, 0,
+    0, -20, -5, 5, 10, 10, 5, -5, -20, 0,
+    0, -15, 5, 15, 20, 20, 15, 5, -15, 0,
+    0, -10, 10, 20, 25, 25, 20, 10, -10, 0,
+    0, -10, 10, 20, 25, 25, 20, 10, -10, 0,
+    0, -15, 5, 15, 20, 20, 15, 5, -15, 0,
+    0, -20, -5, 5, 10, 10, 5, -5, -20, 0,
+    0, -30, -20, -15, -10, -10, -15, -20, -30, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+}
+
 -------------------------------------------------------------------------------
 -- Chess logic
 -------------------------------------------------------------------------------
@@ -1602,6 +1617,33 @@ local LMR_ENABLED = os.getenv("SUNFISH_LMR") ~= "0"
 local LMR_LATE = 3
 local LMR_MIN_DEPTH = 3
 
+-- Null-move zugzwang guard: SUNFISH_NULL_ENDGAME=1 restores the old unguarded
+-- endgame null probe (A/B knob; see the null-move block in bound()).
+local NULL_ENDGAME = os.getenv("SUNFISH_NULL_ENDGAME") == "1"
+
+-- Check extension (SUNFISH_CHECK_EXT=0 disables): a node whose side to move is
+-- in check searches its evasions one ply deeper. Forced lines are cheap to
+-- search and cutting them off is what hides mates from the capture-only leaf.
+-- Ply-capped so a perpetual-check chase can't stretch the tree unbounded (the
+-- repetition scan also bounds it, but the cap keeps worst-case shapes sane).
+local CHECK_EXT = os.getenv("SUNFISH_CHECK_EXT") ~= "0"
+local CHECK_EXT_MAX_PLY = 32
+
+-- Qsearch check evasions (SUNFISH_QEVASIONS=0 disables): at depth <= 0 while
+-- in check, search ALL legal moves instead of the >= 150 capture subset, and
+-- skip both the endgame corraling early-return and the stand-pat rescue (a
+-- pass is illegal while in check — standing pat there could read a mated
+-- position as fine).
+--
+-- FLOOR: capture-only leaves self-terminate (captures exhaust), but evasion
+-- chains are quiet moves — a perpetual check would recurse downward forever,
+-- breaking only at the repetition scan (observed: the root MTD probe returned
+-- 0 from an unbounded perpetual, then the bisection burned the whole node
+-- budget). depth >= QSE_FLOOR bounds the evasion depth; below the floor the
+-- node falls back to the capture-only behavior.
+local QSEARCH_EVASIONS = os.getenv("SUNFISH_QEVASIONS") ~= "0"
+local QSE_FLOOR = -4
+
 local history = {}
 local killers = {}
 
@@ -1786,13 +1828,29 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         end
     end
 
+    local qe = QSEARCH_EVASIONS and nch > 0 and depth >= QSE_FLOOR -- leaf evasion mode (see knob above)
+
     -- Null-move search. At depth <= 0 the recursion is skipped (the `or
     -- pos.score` short-circuit), so the rotated child's board is never read --
     -- creating it is pure waste on every leaf (the largest node class). Only
-    -- build + free the child when depth > 0.
+    -- build + free the child when the probe runs.
+    --
+    -- Zugzwang guards: the pass move is not harmless in every position. While
+    -- IN CHECK a null probe is meaningless (we must answer the check) and can
+    -- return bogus cutoffs; in sparse positions (<= 6 pieces — same line as
+    -- the futility/LMR guards) zugzwang is the whole defense, and a pass that
+    -- "fails low" is exactly the trap KQK/KRK live in. The depth<=0 stand-pat
+    -- path below is unaffected: do_null is false there, nullscore stays
+    -- pos.score, and the leaf's `best < nullscore` rescue reads the same value.
     local null_child
     local nullscore = pos.score
-    if depth > 0 then
+    -- depth >= 3: the null child then gets a real (depth >= 0) search instead
+    -- of a bare qsearch verdict. A shallow null probe (root at depth 1 probing
+    -- depth -2) reads a qsearch repetition draw as a proven cutoff and feeds
+    -- MTD bisection a phantom 0 — observed as a 1000-node depth-1 burn with no
+    -- converged root (nil move).
+    local do_null = depth >= 3 and nch == 0 and (NULL_ENDGAME or pos.piece_count > 6)
+    if do_null then
         null_child = m_rotate(pos, true) -- pooled: no alloc in the hot path
         -- The null move is a pass: it does not reset fifty/repetition state,
         -- and the position hash is pushed so a repetition through it is caught.
@@ -1801,12 +1859,24 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         path[#path] = nil
         pool_free_pos(null_child) -- the null-move child is dead after this node
     end
-    if nullscore >= gamma then
+    if do_null and nullscore >= gamma then
         ply_buf = ply_buf - 1
         return nullscore
     end
 
     local best, bmove = -3 * MATE_VALUE, nil
+
+    -- Endgame king-activity leaf term: the threaded PST's king table rewards
+    -- corner safety (a middlegame concern), so general endings play with a
+    -- passive king. At sparse-but-not-mating leaves (5..8 pieces — the corral
+    -- gradient owns <= 4) add a small centralization bonus to the stand-pat
+    -- score. A pure function of the position (unlike a PST swap, which would
+    -- make threaded scores depend on the phase history and poison TT
+    -- comparisons across transpositions), and never threaded through value().
+    local ka = 0
+    if depth <= 0 and pos.piece_count > 4 and pos.piece_count <= 8 then
+        ka = pstKEnd[m_king_index(pos)]
+    end
 
     -- Cache calculated move values so the sort doesn't repeatedly call
     -- pos:value() O(N log N) times. At interior nodes the ordering bonuses
@@ -1847,7 +1917,7 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- draws in KRK/KQK conversion sweeps). The value loop above already
     -- baked the true values (leaves get no ordering bonuses), so the tactical
     -- test is a plain scan.
-    if depth <= 0 and pos.piece_count <= 4 then
+    if depth <= 0 and pos.piece_count <= 4 and not qe then
         local tactical = false
         for k = 1, nlegal do
             if move_val(buf[k]) >= 150 then
@@ -1865,9 +1935,11 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- tail is never searched), so filter to the >= 150 subset BEFORE sorting:
     -- the searched set and order are unchanged, but the heap sort only sees the
     -- kept subset (leaves are a large fraction of nodes). Compaction is in
-    -- place (nlegal <= k, never overwrites an unread entry).
+    -- place (nlegal <= k, never overwrites an unread entry). While in check
+    -- the subset is bypassed entirely: capture-only "evasions" miss quiet king
+    -- escapes, so a mated leaf would read as a normal stand-pat score.
     local sort_n = nlegal
-    if depth <= 0 then
+    if depth <= 0 and not qe then
         local keep = 0
         for k = 1, nlegal do
             if move_val(buf[k]) >= 150 then
@@ -1926,6 +1998,13 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         end
         local child = m_move(pos, move, true_mv, true) -- pooled
         path[#path + 1] = key -- the child's line = this node's hash + the child
+        -- Check extension: while in check the evasions are forced (tiny
+        -- branching), so searching them one ply deeper is cheap and shows
+        -- quiet-move mates the capture-only leaf would hide. depth >= 2 keeps
+        -- the extension from treadmill at depth 1 (a depth-1 node extending to
+        -- depth-1 children that are themselves in check would only be bounded
+        -- by the repetition scan); the ply cap bounds perpetual lines above it.
+        local ext = (CHECK_EXT and nch > 0 and depth >= 2 and ply < CHECK_EXT_MAX_PLY) and 1 or 0
         -- LMR (late-move reductions), third attempt — viable now that real
         -- ordering exists (history/killers/TT move): late moves are the ones
         -- ordering itself deprioritized, so a reduced search of them is
@@ -1938,12 +2017,12 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         -- fail-high is accepted as-is (bounds stay bounds).
         local score
         if lmr_ok and k > LMR_LATE and depth >= LMR_MIN_DEPTH and true_mv < 150 then
-            score = -bound(child, 1 - gamma, depth - 2, maxn, ply + 1, path)
+            score = -bound(child, 1 - gamma, depth - 2 + ext, maxn, ply + 1, path)
             if score > best and score < gamma then
-                score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+                score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path)
             end
         else
-            score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+            score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path)
         end
         path[#path] = nil
         pool_free_pos(child) -- the child is dead after its subtree returns
@@ -1973,9 +2052,9 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         end
     end
 
-    if depth <= 0 and best < nullscore then
+    if depth <= 0 and not qe and best < nullscore then
         ply_buf = ply_buf - 1
-        return nullscore
+        return nullscore + ka
     end
 
     if futile and best < -2 * MATE_VALUE then
@@ -2040,7 +2119,16 @@ local function search(pos, maxn)
     -- depth's score +/- ASPIRATION instead of the full [-3M, 3M] range, and
     -- widen (double) on a fail. Fewer root probes per depth when the score is
     -- stable. Node-count-changing (gate: oracle/perft/endgames, not invariant).
-    local ASPIRATION = 100
+    local ASPIRATION = tonumber(os.getenv("SUNFISH_ASP") or "") or 100
+    -- MTD(f) root walk (SUNFISH_MTDF=0 reverts to bisection): probe at the
+    -- current best estimate g instead of the window midpoint. Zero-window
+    -- probes cut fast (every pruning gate keys off gamma), so the walk
+    -- converges in a handful of cheap probes where bisection pays log2(200)
+    -- full-window ones — at a 1000-node budget that is the difference between
+    -- completing depth d or playing a partial result. Termination is the same
+    -- `lower < upper - 3` window; a score oscillation only inverts the window,
+    -- which exits the loop.
+    local MTDF = os.getenv("SUNFISH_MTDF") ~= "0"
     local prev_score = nil
 
     for depth = 1, 98 do
@@ -2051,8 +2139,18 @@ local function search(pos, maxn)
         else
             lower, upper = -3 * MATE_VALUE, 3 * MATE_VALUE
         end
+        local g = prev_score or 0
         while lower < upper - 3 do
-            local gamma = math_floor((lower + upper + 1) / 2)
+            local gamma
+            if MTDF then
+                if g <= lower then
+                    gamma = g + 1
+                else
+                    gamma = g
+                end
+            else
+                gamma = math_floor((lower + upper + 1) / 2)
+            end
             local mv
             score, mv = bound(pos, gamma, depth, maxn, 0, path)
             assert(score)
@@ -2069,9 +2167,11 @@ local function search(pos, maxn)
             if score >= gamma then
                 lower = score
                 rootmove = mv
+                g = score
             end
             if score < gamma then
                 upper = score
+                g = score
             end
         end
         assert(score)
