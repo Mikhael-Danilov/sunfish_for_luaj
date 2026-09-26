@@ -14,6 +14,7 @@
 -- (the engine runs silent by default); the verifier needs it to capture the
 -- depth-by-depth node counts. Run with SUNFISH_VERBOSE=1 (see the header).
 local sunfish = require("sunfish")
+local green = require("green")
 
 -- Current baseline (post promotion-expansion + auto-queen-removal bug fixes,
 -- default NODES_SEARCHED = 1000, plus endgame draw rules): the budget-aware
@@ -48,17 +49,12 @@ local function capture(...)
 end
 print = capture
 
--- Drive ai_move from a coroutine (the engine yields during search).
-local co = coroutine.create(function()
+-- Drive ai_move from a green thread (the engine yields during search).
+local mv, sc = green.run(function()
     local g = sunfish.new()
     local _, mv, sc = sunfish.ai_move(g)
     return mv, sc
 end)
-local ok, mv, sc = coroutine.resume(co)
-while ok and coroutine.status(co) == "suspended" do
-    ok, mv, sc = coroutine.resume(co)
-end
-if not ok then error(mv, 0) end
 
 print = orig_print
 

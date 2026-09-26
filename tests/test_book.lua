@@ -3,17 +3,12 @@
 -- Run: luajit tests/test_book.lua   (works with lua5.1 and luajit)
 
 local sunfish = require("sunfish")
+local green = require("green")
 
 local describe, it = assert(require("tests.harness").describe), assert(require("tests.harness").it)
 
 local function ai_move(game)
-    local co = coroutine.create(function() return sunfish.ai_move(game) end)
-    local ok, ng, mv, sc = coroutine.resume(co)
-    while ok and coroutine.status(co) == "suspended" do
-        ok, ng, mv, sc = coroutine.resume(co)
-    end
-    if not ok then error(ng, 0) end
-    return ng, mv, sc
+    return green.run(function() return sunfish.ai_move(game) end)
 end
 
 describe("sunfish.set_book", function()
@@ -90,3 +85,5 @@ describe("ai_move with book", function()
         assert_true(ok, "book black reply " .. tostring(mv) .. " is not a known reply to 1.e4")
     end)
 end)
+
+require("tests.harness").finish()

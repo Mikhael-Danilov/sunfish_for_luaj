@@ -2,20 +2,16 @@
 -- attacked() caller-class breakdown. Run with SUNFISH_PROFILE_ATTACKED=1
 -- (and SUNFISH_NO_YIELD=1 for the uncapped search) under LuaJ/luajit.
 local sunfish = require("sunfish")
+local green = require("green")
 
 if os.getenv("SUNFISH_NO_YIELD") == "1" then
     sunfish.set_yield(nil, false)
 end
 
-local co = coroutine.create(function()
+local ok, ng, mv, sc = green.run(function()
     local g = sunfish.new()
     return sunfish.ai_move(g)
 end)
-local ok, ng, mv, sc = coroutine.resume(co)
-while ok and coroutine.status(co) == "suspended" do
-    ok, ng, mv, sc = coroutine.resume(co)
-end
-if not ok then error(ng, 0) end
 
 local s = sunfish.attacked_stats()
 local total = s.probe + s.king + s.touch + s.ep + s.castle

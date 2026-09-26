@@ -5,16 +5,53 @@ covering its public API only:
 
 - `sunfish.new()` — fresh starting position
 - `sunfish.move(game, mv)` — apply a legal move (returns the next position, or `false`)
-- `sunfish.ai_move(game)` — engine search (returns position, move string, score)
+- `sunfish.ai_move(game, black_to_move)` — engine search (returns position, move string, score). The second argument is optional: callers that KNOW the side to move pass it (`true` = black), which keeps the opening book alive for AI replies — the positional side-scan fallback breaks on advanced pawns crossing the midline.
 - `sunfish.store_data(game)` / `sunfish.restore_data(data)` — serialize/deserialize a position
 - `sunfish.move_2_cell(i)` / `sunfish.cell_2_move(cell)` — square index <-> coordinate
 - `sunfish.MATE_VALUE`
+- `sunfish.set_book(path, seed)` / `sunfish.set_book_data(tbl, seed)` — opening book from a binary file / a pre-parsed Lua table (the table form is for platforms like Android where `io.open` cannot read APK assets)
+- `sunfish.set_yield(quantum, enable)`, `sunfish.set_nodes(n)`, `sunfish.set_futility(m)`, `sunfish.set_time_budget(s)`, `sunfish.set_use_bkm_light(b)` — runtime tunables
+
+## Yield substrate: fiber (our LuaJ fork) vs coroutine
+
+The search yields periodically so the caller can poll. The engine picks the
+mechanism at load:
+
+- **`fiber.yield`** — the [NYRDS/luaj](https://github.com/NYRDS/luaj) fork's
+  zero-thread fiber library (heap-allocated frames, no JVM thread parked per
+  switch). Default quantum 32. The search must be driven from `fiber.create`.
+- **`coroutine.yield`** — stock LuaJ and the PUC-Lua family. Default quantum
+  256 (each yield is a JVM context hop under LuaJ; bigger quantum measured
+  ~33-41% faster).
+
+All tests and benchmarks drive the search through `green.lua` (`green.run(fn)` /
+`green.guard(fn, poll)`), which picks the same facility the engine picked, so
+the same script runs unchanged on luajit, lua5.1, stock LuaJ, and the fork.
+
+Measured CPU time (8 start-position searches per cold JVM, `/usr/bin/time`
+User time, fork jar, coroutine substrate vs fiber substrate, alternating):
+
+| substrate            | mean user time |
+|----------------------|----------------|
+| fork + coroutine 256 | 2.22 s         |
+| fork + fiber q32     | 3.34 s         |
+| stock 3.0.2 + coroutine 256 | 2.71 s  |
+
+Notes: the fiber *substrate* (FiberVM trampoline executing the whole search)
+costs ~40-50% CPU over the recursive `LuaClosure.execute` path even with
+yields disabled — what fiber buys is zero-thread switching (no thread park per
+yield, tiny quanta for free), which is why the Android embedding uses it. The
+fork's non-fiber fixes (LuaTable/weak-table/metamethod) are a ~20% win over
+stock 3.0.2. On PUC Lua/luajit, coroutine is the only (and fine) choice.
 
 ## Requirements
 
 - Lua 5.1+ or LuaJIT (both tested). No external dependencies.
 - For the cross-validation test (`tests/compare_python_chess.py`): Python 3
   with `python-chess` installed (`pip install python-chess`).
+- For the LuaJ runs: a JDK and a luaj jar (below).
+- For the Elo harness / selfplay gates: a Stockfish binary (SF 17.1 validated;
+  the SF 19 "universal" build segfaulted mid-session on this machine).
 
 ## Running
 
@@ -33,7 +70,13 @@ BENCH_SCALE=0.01 benchmarks/run_luaj.sh # LuaJ (Java) - much slower VM
 ```
 
 The benchmark honors `BENCH_SCALE` (0..1) to shrink iteration counts for slow
-interpreters; the LuaJ wrapper defaults to 0.01 so a run finishes in ~1 minute.
+interpreters; the LuaJ wrapper defaults to 0.01. For repeated-search CPU-time
+A/Bs (the reliable signal — single cold searches are JIT-warmup noise):
+
+```sh
+AI_ITERS=8 /usr/bin/time -f "%U" java -Dluaj.path="$PWD/?.lua;$PWD/tests/?.lua" \
+    -cp .reference:.reference/luaj-fork-jse.jar LuajRun benchmarks/bench_ai.lua 8
+```
 
 ## LuaJ (Java) benchmarks
 
@@ -42,31 +85,36 @@ not LuaJIT. The engine was tuned for "Luaj interpreter mode", so run the
 benchmarks under it:
 
 ```sh
-# One-time setup (Java 21 + LuaJ 3.0.2 live under .reference/, gitignored):
-mkdir -p .reference
-curl -sL -o .reference/jdk.tar.gz "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12_8.tar.gz"
-curl -sL -o .reference/luaj-jse-3.0.2.jar "https://github.com/luaj/luaj/releases/download/v3.0.2/luaj-jse-3.0.2.jar"
-(cd .reference && tar -xzf jdk.tar.gz)
+# One-time setup: put a luaj jar under .reference/ (gitignored).
+# Fork (fiber-capable; built from the NYRDS/luaj submodule) and/or stock 3.0.2:
+cp <path-to-fork>/luaj/build/libs/luaj-jse-3.0.2.jar .reference/luaj-fork-jse.jar
+curl -sL -o .reference/luaj-jse-3.0.2.jar \
+  "https://github.com/luaj/luaj/releases/download/v3.0.2/luaj-jse-3.0.2.jar"
 
-# Then:
+# Then (any JDK 8+; JAVA_HOME or java on PATH):
 benchmarks/run_luaj.sh               # runs the benchmark under LuaJ
-TEST_BUDGET=120 benchmarks/run_luaj.sh tests/test_sunfish.lua  # run tests under LuaJ
+LUAJ_JAR=.reference/luaj-stock-3.0.2.jar benchmarks/run_luaj.sh   # stock jar
+TEST_BUDGET=120 benchmarks/run_luaj.sh tests/test_sunfish.lua     # tests under LuaJ
 ```
 
-Measured on this machine (iter/s, higher is better; `ai_move` = ms per full search):
+`run_luaj.sh` compiles `benchmarks/java/LuajRun.java` (committed) into
+`.reference/` on first use. The launcher installs the fork's `FiberLib` when
+the jar provides it (exactly like the Android embedding does) and skips it
+with `-Dluaj.nofiber=true`; on the stock jar it runs on coroutines.
+
+Measured on this machine (i9-12900K, iter/s, higher is better; `ai_move` =
+single cold search):
 
 | Benchmark           | LuaJ    | LuaJIT     | Lua 5.1  |
 |---------------------|---------|------------|----------|
-| `new`               | 5,200   | 1,906,000  | 450,000  |
-| `move (e2e4)`       | 145     | 22,700     | 3,100    |
-| store/restore       | 7,200   | 443,000    | 156,000  |
-| `move_2_cell`       | 68,000  | 27,500,000 | 737,000  |
-| illegal `move`      | 145     | 29,000     | 2,700    |
-| `ai_move` (search)  | 20.1s   | 2.8s       | 5.4s     |
+| `new`               | 250,000 | 1,520,000  | —        |
+| `move (e2e4)`       | 4,348   | 82,600     | —        |
+| `ai_move` (search)  | 0.112s  | 0.008s     | —        |
 
-LuaJ is 60–900x slower than LuaJIT depending on the operation; the string-heavy
-coordinate conversion is worst (string ops are Java-call-bound), and a full
-search takes ~20s vs ~3s on LuaJIT.
+LuaJ stays ~14x slower than LuaJIT per search (same ratio as the original
+1 GB-VM measurements; the absolute numbers differ because that box was
+load-contaminated — see the measurement caveat in
+`docs/luaj-optimization-plan.md`).
 
 ## Endgame correctness
 
@@ -81,13 +129,19 @@ search takes ~20s vs ~3s on LuaJIT.
 - **Pawn promotion** — promotes correctly on reaching the last rank.
 
 The engine enforces real chess rules: moves that leave the king in check are
-rejected, kings are never captured, and checkmate/stalemate end the game.
+rejected, **castling out of check is rejected** (fixed 2026-09-26 — the old
+castling legality path only tested the between/landing squares, which a king
+escaping a check ray could pass), kings are never captured, and
+checkmate/stalemate end the game.
 `genMoves()` remains pseudo-legal for backward compatibility; `legal_moves()`,
 `in_check()`, `is_checkmate()`, and `is_stalemate()` are the new public
 helpers used by search and move validation.
 
-Stockfish is used as a reference during development (see `.reference/`, not
-committed); it is not required to run the tests.
+Promotions: the search generates and values all four promotion pieces
+(queen-valued highest for ordering) and the display move carries the promoted
+piece char (5 chars, e.g. `f2f1n`) — under-promotions are real search
+choices, and every harness/bridge now propagates the char instead of
+coercing to queen.
 
 ## KRK / KQK endgame solver (`bkm.lua`)
 
@@ -148,28 +202,32 @@ search is ~12x slower under LuaJ and buys little over the heuristic mover.
   is entered as `e2e4` again).
 - **`ai_move` returns a display move** in the rotated (Black) frame, so it will not
   necessarily replay through `sunfish.move` on the same position. It is meant to be
-  shown to the user, not fed back into `move`.
-- **Search must run inside a coroutine**: `search`/`bound` call `coroutine.yield()`
-  periodically (every `YIELD_QUANTUM` = 256 nodes by default, tunable via
-  `sunfish.set_yield(quantum, enable)`). Call `ai_move` from a coroutine (the
-  test harness does this; so does the benchmark). Calling it at top level raises
+  shown to the user, not fed back into `move`. Callers that know the side to move
+  should pass `black_to_move` — book replies then come out in the correct frame even
+  when the positional side-scan would misfire.
+- **Search must run inside a green thread**: `search`/`bound` yield periodically
+  (fiber on the fork, coroutine elsewhere; every `YIELD_QUANTUM` nodes, tunable via
+  `sunfish.set_yield(quantum, enable)`). Drive it with `green.run(fn)` (or
+  `green.guard(fn, poll)` for budgeted tests). Calling `ai_move` at top level raises
   "attempt to yield across C-call boundary". Set `SUNFISH_NO_YIELD=1` in the
   benchmark to disable yields and measure uncapped throughput.
 - **Global transposition table**: the TT is module-level and never cleared, so repeated
-  `ai_move` calls in one process become progressively slower (measured ~0.4s, 1.1s,
-  6.7s for the first three searches). The tests keep `ai_move` usage light and the
-  harness gives each test a per-test budget (`TEST_BUDGET` seconds, default 30;
-  raise it for LuaJ, e.g. `TEST_BUDGET=120`).
+  `ai_move` calls in one process become progressively slower. The tests keep `ai_move`
+  usage light and the harness gives each test a per-test budget (`TEST_BUDGET` seconds,
+  default 30; raise it for LuaJ, e.g. `TEST_BUDGET=120`).
 - **`sunfish.move` with non-string input** (e.g. `nil`) will raise, not return `false`.
   Only string moves are validated.
 - **Opening book (opt-in)**: `sunfish.set_book(path, seed)` loads a binary book of
-  16-byte entries (position Zobrist key -> weighted moves); pass `nil` to disable.
+  16-byte entries (position Zobrist key -> weighted moves); `sunfish.set_book_data(tbl, seed)`
+  loads the same shape pre-parsed into a Lua table (Android assets). Pass `nil` to disable.
   Once loaded, `ai_move` plays a weighted-random book move when the position's key is
-  in the book, falling through to the search otherwise. The same position can hold
-  several candidate moves with weights (best move most likely, e.g. the standard start
-  mostly picks `e2e4`, sometimes `c2c3`/`d2d4`, occasionally `g1f3`/`g2g3`/`c2c4`), so
-  consecutive games vary. `seed` makes the picks deterministic across runs (defaults to
-  wall-clock time). Book moves are real-board coordinates mapped into the engine frame
-  (mirrored for Black) and validated for legality before playing. The shipped book is
+  in the book, falling through to the search otherwise. The shipped book is
   `benchmarks/sunfish.bin` (~25 kB), generated from Stockfish MultiPV lines + classic
-  trap lines by `benchmarks/gen_book.py`.
+  trap lines by `benchmarks/gen_book.py`; it does NOT cover black replies to 1.e4
+  (the `test_book` black-reply test exercises the search fallback, not the book).
+- **Futility pruning**: `SUNFISH_FUTILITY=<margin>` (or `sunfish.set_futility(m)`,
+  0 = off) tunes frontier pruning at depth 1 on interior nodes. Default 200;
+  strength-neutral within the Elo noise band at 128 games, positive direction.
+- **Under-promotions**: `ai_move` may return a 5-char move (`e7e8n`) — carry the
+  promo char through your display/UCI conversion; coercing to queen desyncs the
+  engine state.

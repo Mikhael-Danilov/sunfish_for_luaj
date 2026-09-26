@@ -26,16 +26,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REF=.reference
-JAVA="$REF/jdk-21.0.12+8/bin/java"
-JAR="$REF/luaj-jse-3.0.2.jar"
-SCRIPT="$REF/LuajRun.java"
+JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin}"
+JAR="${LUAJ_JAR:-$REF/luaj-fork-jse.jar}"
+[ -f "$JAR" ] || JAR="$REF/luaj-jse-3.0.2.jar"
 
-if [ ! -x "$JAVA" ] || [ ! -f "$JAR" ]; then
-    echo "error: LuaJ toolchain not found in $REF" >&2
+command -v "${JAVA_BIN}java" >/dev/null 2>&1 || JAVA_BIN=""
+JAVA="${JAVA_BIN}java"
+JAVAC="${JAVA_BIN}javac"
+if [ ! -f "$JAR" ]; then
+    echo "error: no luaj jar found in $REF" >&2
     exit 1
 fi
-if [ ! -f "$REF/LuajRun.class" ] || [ "$SCRIPT" -nt "$REF/LuajRun.class" ]; then
-    "$JAVA" -cp "$JAR" -d "$REF" "$SCRIPT" >/dev/null 2>&1 || true
+if [ ! -f "$REF/LuajRun.class" ] || [ benchmarks/java/LuajRun.java -nt "$REF/LuajRun.class" ]; then
+    "$JAVAC" -cp "$JAR" -d "$REF" benchmarks/java/LuajRun.java
 fi
 
 SCRIPT_FILE="${1:?usage: ab_luaj.sh <script.lua> <base_dir> <mod_dir> [rounds]}"

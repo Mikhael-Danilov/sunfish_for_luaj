@@ -1706,3 +1706,113 @@ suite (K+P vs K defender) holds 100% so far.
 draw-rule tests (K vs K, K+B vs K, K+N vs K, fifty=99), `sunfish.set_nodes`
 smoke. New benchmark: `benchmarks/endgame_conversion.py` (conversion rate +
 draw-holding; fails only below a regression floor of 12.5%, aspirational 95%).
+
+## 2026-09-26 sync: production fixes in, fiber substrate measured, castling + promotion fixes, futility shipped, LMR rejected again
+
+This round synced the standalone engine with the production (RPD Android)
+copy, brought our LuaJ fork into the benchmark matrix, and fixed two
+correctness bugs the harnesses exposed.
+
+### Production fixes ported from the RPD copy
+
+- **fiber/coroutine dual yield**: the engine picks `fiber.yield` (NYRDS/luaj
+  fork's zero-thread fiber library, quantum 32) when the `fiber` global is
+  installed, else `coroutine.yield` (stock LuaJ / PUC Lua, quantum 256).
+  All tests/benchmarks drive the search through the new `green.lua`
+  (`green.run`/`green.guard`), which picks the same facility.
+- **`sunfish.set_book_data(tbl, seed)`**: book from a pre-parsed Lua table
+  (Android assets have no `io.open`). `set_book` now parses the binary into a
+  table and delegates (return value changed from raw entry count to distinct
+  position count).
+- **`sunfish.ai_move(game, black_to_move)`**: optional explicit side param —
+  the positional side-scan breaks on advanced pawns crossing the midline,
+  which killed book replies for the AI in production (RPD snap-9wb).
+- MATE_BAND stayed at `MATE_VALUE - 256` here (the RPD copy carries -30; the
+  wide band is required for correct TT mate-score re-anchoring at any
+  distance — flagged for the RPD copy).
+
+### Yield substrate CPU-time matrix (8 searches/cold JVM, User time, alternating)
+
+| substrate | mean |
+|---|---|
+| fork jar + coroutine q256 | 2.22 s |
+| fork jar + fiber q32 | 3.34 s |
+| stock 3.0.2 + coroutine q256 | 2.71 s |
+
+The fiber **substrate** (FiberVM trampoline runs the entire search) costs
+~40-50% CPU vs the recursive LuaClosure.execute path even with yields off;
+fiber's win is zero-thread switching (no thread park per yield, tiny quanta
+free) — the reason the Android embedding uses it. The fork's non-fiber fixes
+are ~20% faster than stock 3.0.2. `benchmarks/java/LuajRun.java` (committed,
+reflective FiberLib install + `-Dluaj.nofiber=true` opt-out) and a reworked
+`benchmarks/run_luaj.sh` (system JDK, `LUAJ_JAR` override) make both jars
+first-class; `benchmarks/bench_ai.lua` added for repeated-search CPU A/Bs
+(single cold searches are JIT-warmup noise at ~100 ms on modern hardware).
+
+### Castling-out-of-check: fixed (engine bug, all copies affected)
+
+The self-play legality sweep (bridge-driven, 5 node budgets x 8 openings)
+surfaced the engine castling **while in check** (`e8c8` at nodes=100): the
+castling legality path only attack-tests the between/landing squares after
+the move, so a king escaping a check ray sideways passed. Fixed in
+`is_legal`: the search path rejects via the already-computed checker count
+(`nch > 0`), the public path attack-tests the origin before mutating.
+Historical gate suites never covered it; perft/oracle were extended upstream
+of this fix and stay green.
+
+### Under-promotion display: harness bug class (engine is correct)
+
+The engine values and orders all four promotions correctly (queen highest:
+measured Q 62429 > R 61158 > B 60697 > N 60527 on a g7h8 probe) but may
+legitimately CHOOSE an under-promotion by search. Its display move carries
+the promoted piece char (`f2f1n`). The Elo bridge and the selfplay gate both
+stripped it and coerced queen — desyncing from the engine state (the
+selfplay gate showed mass ILLEGAL after the first under-promotion; the Elo
+bridge self-healed via per-move FEN sync, hiding the bug). Both now carry
+the char; the selfplay gate additionally tries promotion suffixes when
+validating 4-char moves (SF rejects bare last-rank pawn moves).
+
+Also fixed in the harnesses: `fix_promotion` in the Elo game loop (bare
+4-char promotions made SF abort the `position ... moves` line), stderr
+capture + move-list logging on SF death, and the debug frame dump
+(`SUNFISH_BRIDGE_DEBUG=1`) that pinned all of this.
+
+**Stockfish 19 note**: the sf_19 "universal" Linux build segfaulted
+silently mid-session in ~1 of 4 games (stderr empty; the same position
+sequence replays fine in isolation). Replaced with the SF 17.1
+ubuntu-avx2 build as the harness default; 128-game runs complete cleanly.
+
+### Frontier futility pruning: SHIPPED (margin 200)
+
+At depth 1 on interior nodes (ply > 0), no check, > 6 pieces, quiet moves
+(val < 150) are pruned when `pos.score + margin <= gamma` — the condition is
+loop-invariant and the list is sorted best-first, so the loop breaks at the
+first pruned quiet move. The all-pruned node returns stand-pat. Root excluded
+(the full window at the root's depth-1 call made everything "futile" and
+reduced root move seeding to captures — caught by the node invariant before
+ship); sparse endgames excluded (the king-corraling gradient lives outside
+the material score). Tunable: `SUNFISH_FUTILITY` env / `sunfish.set_futility`.
+
+Gates: suites 15+22+7+21 on luajit/lua5.1, oracle 40/40, node invariant
+unchanged (27/153/287/1008, d7d5), selfplay correctness 60 plies 0 failures.
+Elo (128 games, SF17.1 anchor): baseline 1942 -> futility 1953 (pre-root-gate
+build) -> shipped build 1926 — all within the ±30-50 noise band; kept for the
+interior node savings (deeper effective search at fixed budget, faster
+response under a time budget).
+
+### LMR: REJECTED a second time (ordering quality, not wall time)
+
+Re-tested per the standing suggestion (per-node cost is much lower post-
+pin-check, and the budget-bounded search converts node savings into depth).
+Gates caught it immediately: the KQK king-corraling gradient collapsed to 0
+(corralling moves are quiet king moves — exactly what LMR reduces) and a
+1000-node search picked 1...Na6 over 1...Nc6. Verdict: LMR reductions assume
+late moves are reliably harmless, which requires a real ordering heuristic
+(history/killers); PST-only ordering is too weak. Parked until such a
+heuristic lands.
+
+### Elo baseline (this machine, SF17.1 anchor, 128 games, 1000 nodes/move)
+
+Fitted sunfish Elo ~1926-1953 across this round's builds (the SF18-anchored
+1589/1631 figures from 2026-08 are not directly comparable — different
+anchor binary and a load-free machine).

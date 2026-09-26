@@ -48,7 +48,10 @@ end
 local function child_to_real(mv, ply)
     local p1, p2 = 121 - cell1(mv:sub(1, 2)), 121 - cell1(mv:sub(3, 4))
     for _ = 2, ply do p1, p2 = 121 - p1, 121 - p2 end
+    -- promotion moves carry the piece char (5 chars, e.g. "f2f1n"); keep it
+    -- so the validator replays the piece the engine actually promoted to
     return sunfish.move_2_cell(p1 - 1) .. sunfish.move_2_cell(p2 - 1)
+        .. (mv:sub(5, 5) or "")
 end
 
 local game = sunfish.new()
@@ -141,7 +144,15 @@ class Stockfish:
                     return line.split()[2]  # "w" or "b"
         pre = fen_side(moves_so_far)
         post = fen_side(moves_so_far + [move])
-        return post != pre
+        if post != pre:
+            return move
+        # The engine auto-queens and emits 4-char moves; a pawn reaching the
+        # last rank needs the promotion suffix for Stockfish. Try all four.
+        if len(move) == 4 and move[3] in "18":
+            for suf in ("q", "r", "b", "n"):
+                if fen_side(moves_so_far + [move + suf]) != pre:
+                    return move + suf
+        return None
 
     def close(self):
         self._send("quit")
@@ -178,11 +189,13 @@ def main():
             print(f"ply {ply:3d}: BOARD DIFF ERROR")
             failures += 1
             continue
-        legal = sf.is_legal(played, real)
-        status = "OK" if legal else "ILLEGAL"
-        if not legal:
+        canonical = sf.is_legal(played, real)
+        status = "OK" if canonical else "ILLEGAL"
+        if not canonical:
             failures += 1
-        played.append(real)
+            played.append(real)
+        else:
+            played.append(canonical)
         print(f"ply {ply:3d}: {real:6s}  [{status}]  score {sc}")
 
     # Natural end detection from the final board (simple: material + king check)

@@ -3,6 +3,7 @@
 -- Run: lua tests/test_sunfish.lua   (works with lua5.1 and luajit)
 
 local sunfish = require("sunfish")
+local green = require("green")
 
 local describe, it = assert(require("tests.harness").describe), assert(require("tests.harness").it)
 
@@ -103,12 +104,8 @@ describe("sunfish.set_nodes", function()
     it("tunes the node budget at runtime", function()
         sunfish.set_nodes(2000)
         local game = sunfish.new()
-        local co = coroutine.create(function() return sunfish.ai_move(game) end)
-        local ok, ng, mv, score = coroutine.resume(co)
-        while ok and coroutine.status(co) == "suspended" do
-            ok, ng, mv, score = coroutine.resume(co)
-        end
-        assert_true(ok, "ai_move must run under a custom node budget")
+        local ng, mv, score = green.run(function() return sunfish.ai_move(game) end)
+        assert_table(ng, "ai_move must run under a custom node budget")
         assert_true(score ~= nil)
         sunfish.set_nodes(1000) -- restore the default for other tests
     end)

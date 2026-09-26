@@ -7,6 +7,7 @@
 -- Run: luajit tests/test_bkm_light_integration.lua
 
 local sunfish = require("sunfish")
+local green = require("green")
 local harness = require("tests.harness")
 local describe, it = harness.describe, harness.it
 
@@ -45,13 +46,7 @@ end
 
 -- ai_move inside a coroutine (the engine yields during search).
 local function ai_move(game)
-    local co = coroutine.create(function() return sunfish.ai_move(game) end)
-    local ok, ng, mv, sc = coroutine.resume(co)
-    while ok and coroutine.status(co) == "suspended" do
-        ok, ng, mv, sc = coroutine.resume(co)
-    end
-    if not ok then error(ng, 0) end
-    return ng, mv, sc
+    return green.run(function() return sunfish.ai_move(game) end)
 end
 
 describe("bkm_light fast path: KRK/KQK mate delivery", function()

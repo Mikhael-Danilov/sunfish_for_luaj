@@ -34,16 +34,11 @@ if os.getenv("SUNFISH_NO_YIELD") == "1" then
 end
 
 local sunfish = require("sunfish")
+local green = require("green")
 
 -- Drive ai_move from a coroutine (the engine yields during search).
 local function ai_move(game)
-    local co = coroutine.create(function() return sunfish.ai_move(game) end)
-    local ok, ng, mv, sc = coroutine.resume(co)
-    while ok and coroutine.status(co) == "suspended" do
-        ok, ng, mv, sc = coroutine.resume(co)
-    end
-    if not ok then error(ng, 0) end
-    return ng, mv, sc
+    return green.run(function() return sunfish.ai_move(game) end)
 end
 
 local function now_ms()

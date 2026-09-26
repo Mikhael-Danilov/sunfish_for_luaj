@@ -20,21 +20,23 @@ local function color(code, text)
     return text
 end
 
--- The engine's search loop calls coroutine.yield() every 30 nodes (it is
--- designed to be driven from a coroutine, like the original sunfish). pcall
--- cannot yield across the C boundary, so test bodies are run inside a fresh
--- coroutine instead. Errors are propagated back as normal exceptions.
+-- The engine's search loop calls fiber.yield (our LuaJ fork) or coroutine.yield
+-- (stock LuaJ / PUC Lua) every YIELD_QUANTUM nodes (it is designed to be driven
+-- from a green thread, like the original sunfish). pcall cannot yield across
+-- the C boundary, so test bodies are run inside a fresh green thread instead.
+-- green.guard picks the same facility the engine picked, so the two always
+-- match. Errors are propagated back as normal exceptions.
+local green = require("green")
+
 local function coroutine_guard(fn)
-    local co = coroutine.create(fn)
-    local deadline = os.clock() + tonumber(os.getenv("TEST_BUDGET") or 30) -- 30s of engine search per test
-    local ok, err = coroutine.resume(co)
-    -- Keep resuming while the engine yields; stop after the time budget.
-    while ok and coroutine.status(co) == "suspended" and os.clock() < deadline do
-        ok, err = coroutine.resume(co)
-    end
-    if ok and coroutine.status(co) == "suspended" then
+    local budget = tonumber(os.getenv("TEST_BUDGET") or 30) -- 30s of engine search per test
+    local deadline = os.clock() + budget
+    local ok, err = green.guard(fn, function()
+        return os.clock() < deadline
+    end)
+    if err == "TIMEOUT" then
         -- Budget exhausted mid-search: report instead of hanging forever.
-        return false, "test exceeded the engine-search budget (TEST_BUDGET=" .. tostring(os.getenv("TEST_BUDGET") or 30) .. "s)"
+        return false, "test exceeded the engine-search budget (TEST_BUDGET=" .. tostring(budget) .. "s)"
     end
     return ok, err
 end

@@ -4,6 +4,7 @@
 -- Usage: luajit tests/selfplay_bkm_light.lua [games] [seed]
 
 local sunfish = require("sunfish")
+local green = require("green")
 sunfish.set_use_bkm_light(true)
 
 local N = tonumber(arg[1]) or tonumber(arg[2]) or 60
@@ -101,12 +102,8 @@ local function run(piece)
         local pos = newpos(start)
         local ply = 0
         while ply < MAX_PLIES do
-            -- run ai_move inside a coroutine (the engine yields during search)
-            local co = coroutine.create(function() return sunfish.ai_move(pos) end)
-            local ok, ng, mv = coroutine.resume(co)
-            while ok and coroutine.status(co) == "suspended" do
-                ok, ng, mv = coroutine.resume(co)
-            end
+            -- run ai_move in a green thread (the engine yields during search)
+            local ok, ng, mv = green.run(function() return sunfish.ai_move(pos) end)
             if not ok then error(ng, 0) end
             if not mv then
                 -- terminal: mate or stalemate

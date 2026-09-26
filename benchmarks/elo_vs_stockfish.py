@@ -243,6 +243,16 @@ while true do
                 end
             elseif line == "ai_move" then
                 local ng, mv, sc = sunfish.ai_move(game)
+                -- SUNFISH_BRIDGE_DEBUG=1 dumps the engine frame + display
+                -- move before conversion (frame board with spaces as dots,
+                -- newlines as pipes) — the tool that pinned the SF-crash and
+                -- under-promotion divergences. Zero cost when unset.
+                if os.getenv("SUNFISH_BRIDGE_DEBUG") then
+                    game:ensure_arr()
+                    local vis = (game.board or "?"):gsub("\n", "|"):gsub(" ", ".")
+                    print("DBGFRAME " .. vis)
+                    print("DBGMV " .. tostring(mv))
+                end
                 if not mv then
                     print(string.format("PASS %d", sc or 0))
                 else
@@ -250,6 +260,10 @@ while true do
                     -- black-to-move FEN = even ply = 0 mirrors.
                     local rot = (fen_side == "w") and 1 or 0
                     local uci = display_to_real(mv, rot)
+                    -- under-promotions: the display carries the piece char
+                    -- (5 chars); without it the harness would coerce every
+                    -- promotion to a queen and diverge from the engine state
+                    if #mv == 5 then uci = uci .. mv:sub(5, 5) end
                     print(string.format("MOVE %s %d", uci, sc or 0))
                     game = ng
                     plies = plies + 1
@@ -343,10 +357,18 @@ class SunfishBridge:
         """Return (uci_move, score) for the current position, or (None, score)
         when sunfish passes (decided position / root TT overwritten)."""
         self._send_cmd("ai_move")
-        parts = self._readline().split()
-        if parts[0] == "MOVE":
-            return parts[1], int(parts[2])
-        return None, int(parts[1])
+        self.last_frame = None
+        self.last_display = None
+        while True:
+            parts = self._readline().split()
+            if parts[0] == "DBGFRAME":
+                self.last_frame = parts[1]
+            elif parts[0] == "DBGMV":
+                self.last_display = parts[1]
+            elif parts[0] == "MOVE":
+                return parts[1], int(parts[2])
+            else:
+                return None, int(parts[1])
 
     def close(self):
         try:
@@ -360,9 +382,13 @@ class SunfishBridge:
 
 class Stockfish:
     def __init__(self, path, nodes, start_fen):
+        # stderr goes to a temp file so a mid-game crash is diagnosable
+        # (SF aborts on an illegal `position ... moves` line with an assert
+        # on stderr; DEVNULL made that undebuggable).
+        self._err = tempfile.TemporaryFile(mode="w+")
         self.proc = subprocess.Popen(
             [path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stderr=self._err, text=True, bufsize=1)
         self._send("uci")
         while self._readline().strip() != "uciok":
             pass
@@ -378,7 +404,9 @@ class Stockfish:
     def _readline(self):
         line = self.proc.stdout.readline()
         if not line:
-            raise RuntimeError("stockfish died")
+            self._err.seek(0)
+            tail = self._err.read()[-2000:].strip()
+            raise RuntimeError("stockfish died; stderr tail:\n" + tail)
         return line
 
     def _pos(self, moves):
@@ -390,9 +418,14 @@ class Stockfish:
     def bestmove(self, moves):
         """bestmove (uci) for `moves` from the book position, or '(none)'."""
         self._pos(moves)
+        self._last_moves = list(moves)
         self._send("go nodes %d" % self.nodes)
         while True:
-            line = self._readline()
+            try:
+                line = self._readline()
+            except RuntimeError as e:
+                raise RuntimeError("stockfish died after moves: %s\n%s"
+                                   % (" ".join(self._last_moves), e)) from None
             if line.startswith("bestmove"):
                 return line.split()[1]
 
@@ -459,6 +492,30 @@ class Stockfish:
 
 # --- game loop ---------------------------------------------------------------
 
+def fix_promotion(fen, uci):
+    """sunfish's search auto-queens and returns a 4-char UCI move; a pawn
+    reaching the last rank needs the promotion suffix, else Stockfish
+    rejects the `position ... moves` line (SF19 aborts the process on it).
+    Book moves carry the promo char already (5 chars) — leave those alone."""
+    if len(uci) == 5:
+        return uci
+    parts = fen.split()
+    board = parts[0].split("/")
+    files = "abcdefgh"
+    fr, to = uci[0:2], uci[2:4]
+    row = board[8 - int(fr[1])]
+    sq = ""
+    for ch in row:
+        if ch.isdigit():
+            sq += "." * int(ch)
+        else:
+            sq += ch
+    piece = sq[files.index(fr[0])]
+    if piece in "Pp" and to[1] in ("1", "8"):
+        return uci + "q"
+    return uci
+
+
 def play_game(sf, bridge, fen, plies, sf_color):
     """Play one game from `fen`. `sf_color` is 'w' or 'b' (the side Stockfish
     plays). Returns (result, ply_count, sunfish_last_score).
@@ -483,12 +540,16 @@ def play_game(sf, bridge, fen, plies, sf_color):
             moves.append(m)
         else:
             # sync sunfish to the real position, then let it move
-            bridge.set_fen(sf.fen(moves))
+            cur_fen = sf.fen(moves)
+            bridge.set_fen(cur_fen)
             m, last_score = bridge.ai_move()
             if m is None:
                 # sunfish passes (decided): adjudicate the current position
                 return sf.adjudicate(moves), ply, last_score
-            moves.append(m)
+            if os.getenv("SUNFISH_BRIDGE_DEBUG"):
+                print("  bridge frame=%s display=%s real=%s fen=%s" % (
+                    bridge.last_frame, bridge.last_display, m, cur_fen), flush=True)
+            moves.append(fix_promotion(cur_fen, m))
         turn = 'b' if turn == 'w' else 'w'
     # Ply cap reached: adjudicate the final position rather than assume a draw
     return sf.adjudicate(moves), plies, last_score

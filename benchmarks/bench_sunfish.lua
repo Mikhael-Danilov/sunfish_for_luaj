@@ -3,6 +3,7 @@
 -- Run: luajit benchmarks/bench_sunfish.lua   (or lua / lua5.1)
 
 local sunfish = require("sunfish")
+local green = require("green")
 
 local function now_ms()
     return os.clock() * 1000
@@ -23,14 +24,7 @@ end
 
 -- Runs a function inside a coroutine (the engine's search yields periodically).
 local function in_coroutine(fn)
-    local co = coroutine.create(fn)
-    local ok, err = coroutine.resume(co)
-    while ok and coroutine.status(co) == "suspended" do
-        ok, err = coroutine.resume(co)
-    end
-    if not ok then
-        error(err)
-    end
+    green.run(fn)
 end
 
 print(string.format("Lua: %s", _VERSION))

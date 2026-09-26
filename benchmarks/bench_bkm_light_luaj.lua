@@ -11,6 +11,7 @@
 --   * memory footprint of requiring bkm_light
 
 local sunfish = require("sunfish")
+local green = require("green")
 
 local function now_ms()
     return os.clock() * 1000
@@ -97,10 +98,7 @@ in_coroutine(function()
 end)
 sunfish.set_use_bkm_light(true)
 local _, mv1 = (function()
-    local co = coroutine.create(function() return sunfish.ai_move(build_board({ e4 = "K", c1 = "R", e8 = "k" })) end)
-    local ok, ng, mv = coroutine.resume(co)
-    while ok and coroutine.status(co) == "suspended" do ok, ng, mv = coroutine.resume(co) end
-    return ng, mv
+    return green.run(function() return sunfish.ai_move(build_board({ e4 = "K", c1 = "R", e8 = "k" })) end)
 end)()
 assert(mv1, "fast path must return a KRK move")
 sunfish.set_use_bkm_light(false)

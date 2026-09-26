@@ -13,13 +13,28 @@ local MATE_VALUE = 30000
 local MATE_BAND = MATE_VALUE - 256 -- scores above |this| are distance-to-mate
 local TT_SIZE = 65536 -- fixed-size transposition table (bounded memory, ~64k slots)
 
--- Yield tuning: the search yields periodically so the caller can poll. Under
--- LuaJ each coroutine.yield() is a JVM context hop, so a bigger countdown
--- quantum is measurably faster (~33% at 256, ~41% at 1024). YIELD_QUANTUM is a
--- tunable; the Android layer can lower it for responsiveness or raise it for
--- throughput. YIELD_ENABLED lets the benchmark harness measure the uncapped
--- ceiling (no coroutine switches).
-local YIELD_QUANTUM = 256
+-- Frontier futility pruning margin: at depth 1 with no check, a quiet move
+-- (move value < 150) can lift the score by at most its own PST gain, so when
+-- even margin-beyond-stand-pat cannot reach gamma the move cannot change the
+-- node's fail-high/fail-low outcome. Skipped nodes convert directly into
+-- deeper search under the same node budget. Tunable via sunfish.set_futility
+-- (0 disables) and the SUNFISH_FUTILITY env var (A/B knob).
+local FUTILITY_MARGIN = tonumber(os.getenv("SUNFISH_FUTILITY") or "") or 200
+
+-- Yield tuning: the search yields periodically so the caller can poll. Two
+-- yield mechanisms are supported, picked automatically at load:
+--   - `fiber.yield` — the NYRDS/luaj fork's zero-thread fiber library. Yields
+--     suspend on heap-allocated frames; no JVM thread is parked per switch,
+--     so yields are cheap and the default quantum is small (32) for snappy
+--     caller polling. The search must then be driven from fiber.create.
+--   - `coroutine.yield` — stock LuaJ and the PUC-Lua family. Each yield is a
+--     JVM context hop under LuaJ, so a bigger countdown quantum is measurably
+--     faster (~33% at 256, ~41% at 1024).
+-- YIELD_QUANTUM is a tunable (sunfish.set_yield); YIELD_ENABLED lets the
+-- benchmark harness measure the uncapped ceiling (no switches at all).
+local HAS_FIBER = type(fiber) == "table" and type(fiber.yield) == "function"
+local YIELD = HAS_FIBER and fiber.yield or coroutine.yield
+local YIELD_QUANTUM = HAS_FIBER and 32 or 256
 local YIELD_ENABLED = true
 
 -- KRK/KQK endgame fast path: when the position is exactly K+R vs K or K+Q vs K
@@ -1047,6 +1062,18 @@ function Position:is_legal(move, king, nch, chk, pin, pdir, pg, b)
     -- square attacked by a slider even if a piece currently shields it.
     if p == K then
         if j - i == 2 or i - j == 2 then
+            -- Castling is illegal while in check. The between/destination
+            -- attack tests below only see the board AFTER the move, so a
+            -- check on the origin square escapes them (a king may step out
+            -- of check, castling may not). The search path already knows the
+            -- checker count; the public path attack-tests the origin.
+            if nch then
+                if nch > 0 then
+                    return false
+                end
+            elseif self:attacked(i, b, "castle") then
+                return false
+            end
             -- Castling: i emptied, between holds the KING, j holds the ROOK,
             -- rook origin untouched. Attack-test between and j.
             local between = j < i and i - 1 or i + 1
@@ -1590,12 +1617,12 @@ end
 local function bound(pos, gamma, depth, maxn, ply, path)
     nodes = nodes + 1
     -- Countdown-based yield: one decrement + compare per node (vs a modulo),
-    -- and a coroutine switch only every YIELD_QUANTUM nodes.
+    -- and a fiber/coroutine switch only every YIELD_QUANTUM nodes.
     if YIELD_ENABLED then
         yield_left = yield_left - 1
         if yield_left == 0 then
             yield_left = YIELD_QUANTUM
-            coroutine.yield()
+            YIELD()
         end
     end
 
@@ -1767,9 +1794,32 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         move_sort(buf, sort_n)
     end
 
+    -- Frontier futility pruning (see FUTILITY_MARGIN): the condition is
+    -- loop-invariant, so evaluate it once. Disabled at the root (ply 0 — its
+    -- full window makes everything "futile" and would reduce the depth-1
+    -- move seeding to captures only). Disabled at <= 6 pieces — the endgame
+    -- mating nets live outside the material score and need the full move
+    -- width (the dynamic node budget exists for the same reason). Also
+    -- disabled while in check: quiet-looking check evasions must be searched.
+    local futile = ply > 0 and depth == 1 and nch == 0 and pos.piece_count > 6
+        and pos.score + FUTILITY_MARGIN <= gamma
+
+    -- LMR (late-move reductions) was re-tested here under the CPU-time
+    -- discipline and REJECTED a second time: with PST-only move ordering the
+    -- reduced late moves are not reliably harmless — at a 1000-node budget
+    -- the search picked 1...Na6 over 1...Nc6 and the KQK king-corraling
+    -- gradient collapsed to 0 (the corralling moves are quiet king moves,
+    -- exactly what LMR reduces). Revisit only after a real history/killer
+    -- ordering heuristic lands. See docs/luaj-optimization-plan.md.
+
     for k = 1, sort_n do
         local move = buf[k]
         local mv = move_val(move)
+        if futile and mv < 150 then
+            -- sorted best-first: once a quiet move is futile, all remaining
+            -- (quieter) moves are too. Fail low on what was searched.
+            break
+        end
         local child = m_move(pos, move, mv, true) -- pooled
         path[#path + 1] = key -- the child's line = this node's hash + the child
         local score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
@@ -1787,6 +1837,12 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     if depth <= 0 and best < nullscore then
         ply_buf = ply_buf - 1
         return nullscore
+    end
+
+    if futile and best < -2 * MATE_VALUE then
+        -- every move was pruned as futile: stand-pat is the node's value
+        -- (fail low; no move to report)
+        best = pos.score
     end
 
     if not had_entry or depth >= ed and best >= gamma then
@@ -1970,9 +2026,10 @@ sunfish.MATE_VALUE = MATE_VALUE
 -- is enabled, so the default build never pays the require cost).
 local bkm_light
 
--- Tunable yield behavior for the search coroutine (see the YIELD_QUANTUM
--- comment near the top of the file). Pass enable=false to disable yields
--- entirely (throughput ceiling; only safe where the caller never polls).
+-- Tunable yield behavior for the search's green thread (fiber on our LuaJ
+-- fork, coroutine elsewhere; see the YIELD_QUANTUM comment near the top of
+-- the file). Pass enable=false to disable yields entirely (throughput
+-- ceiling; only safe where the caller never polls).
 function sunfish.set_yield(quantum, enable)
     if quantum then YIELD_QUANTUM = quantum end
     if enable ~= nil then YIELD_ENABLED = enable end
@@ -2000,6 +2057,11 @@ end
 -- play, lower for faster response; exposed so the host can tune at runtime.
 function sunfish.set_nodes(n)
     NODES_SEARCHED = n or NODES_SEARCHED
+end
+
+-- Frontier futility margin (see FUTILITY_MARGIN). 0 disables the pruning.
+function sunfish.set_futility(m)
+    FUTILITY_MARGIN = m or 0
 end
 
 -- ----------------------------------------------------------------------------
@@ -2067,11 +2129,7 @@ function sunfish.set_book(path, seed)
     end
     local data = f:read("*a")
     f:close()
-    book_map = {}
-    book_rng = nil
-    if seed then
-        book_rng = { x = seed % 65536, c = math.floor(seed / 65536) % 65536 }
-    end
+    local tbl = {}
     local nentries = math.floor(#data / 16)
     for i = 0, nentries - 1 do
         local off = i * 16
@@ -2084,16 +2142,31 @@ function sunfish.set_book(path, seed)
         local mv16 = string.byte(data, off + 9) * 256 + string.byte(data, off + 10)
         local weight = string.byte(data, off + 11) * 256 + string.byte(data, off + 12)
         if weight < 1 then weight = 1 end
-        local c = book_map[key]
+        local c = tbl[key]
         if not c then
             c = { n = 0, moves = {}, weights = {} }
-            book_map[key] = c
+            tbl[key] = c
         end
         c.n = c.n + 1
         c.moves[c.n] = mv16
         c.weights[c.n] = weight
     end
-    return true, nentries
+    return sunfish.set_book_data(tbl, seed)
+end
+
+-- Load book from a pre-parsed Lua table (key -> {n, moves, weights}). For
+-- platforms (Android) where io.open can't read APK assets — the book ships as
+-- a require-able Lua table module instead of a binary file. `seed` is the
+-- deterministic RNG seed; nil = os.time().
+function sunfish.set_book_data(tbl, seed)
+    book_map = tbl
+    book_rng = nil
+    if seed then
+        book_rng = { x = seed % 65536, c = math.floor(seed / 65536) % 65536 }
+    end
+    local n = 0
+    if book_map then for _ in pairs(book_map) do n = n + 1 end end
+    return true, n
 end
 
 -- Is the current position's side to move black? The engine frame renders the
@@ -2310,7 +2383,7 @@ local function bkm_successor_key(st, mv)
     end
 end
 
-function sunfish.ai_move(game)
+function sunfish.ai_move(game, black_to_move)
     -- Opening book (opt-in): if the position's Zobrist key is in the book,
     -- play a weighted-random book move instead of searching. Book moves are
     -- stored in real-board coordinates; map into the engine's current frame
@@ -2324,7 +2397,11 @@ function sunfish.ai_move(game)
                 -- real-board 1-based frame squares (parse uses A1=92)
                 local rfrom = 92 + (from % 8) - 10 * math.floor(from / 8)
                 local rto = 92 + (to % 8) - 10 * math.floor(to / 8)
-                local black = stm_is_black(game)
+                -- callers that KNOW the side to move pass it explicitly; the
+                -- positional scan below breaks on advanced pawns crossing the
+                -- midline (book went dead for AI replies until this param).
+                local black = black_to_move
+                if black == nil then black = stm_is_black(game) end
                 local f1, f2 = rfrom, rto
                 if black then f1, f2 = 121 - rfrom, 121 - rto end
                 local uci = render(f1) .. render(f2)

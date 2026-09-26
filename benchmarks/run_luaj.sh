@@ -1,9 +1,14 @@
 #!/bin/bash
-# Run sunfish.lua benchmarks under LuaJ (the Java-based Lua interpreter).
+# Run sunfish.lua benchmarks/tests under LuaJ (the Java-based Lua interpreter).
 #
-# Downloads nothing; expects the JDK and LuaJ jar already present under
-# .reference/ (see README). Use BENCH_SCALE to reduce iteration counts for
-# the much slower LuaJ VM, e.g.:
+# Downloads nothing; expects a JDK on PATH (or JAVA_HOME) and a luaj jar under
+# .reference/ (see README). Jar pick order:
+#   1. $LUAJ_JAR (explicit override)
+#   2. .reference/luaj-fork-jse.jar  — the NYRDS/luaj fork (fiber library;
+#      the launcher installs FiberLib, the engine yields on zero-thread fibers)
+#   3. .reference/luaj-jse-3.0.2.jar — stock LuaJ 3.0.2 (coroutine yields)
+#
+# Use BENCH_SCALE to reduce iteration counts for the much slower LuaJ VM, e.g.:
 #
 #   BENCH_SCALE=0.01 benchmarks/run_luaj.sh
 #
@@ -11,20 +16,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REF=.reference
-JAVA="$REF/jdk-21.0.12+8/bin/java"
-JAR="$REF/luaj-jse-3.0.2.jar"
-SCRIPT="$REF/LuajRun.java"
+JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin}"
+JAR="${LUAJ_JAR:-$REF/luaj-fork-jse.jar}"
+[ -f "$JAR" ] || JAR="$REF/luaj-jse-3.0.2.jar"
 
-if [ ! -x "$JAVA" ] || [ ! -f "$JAR" ]; then
-    echo "error: LuaJ toolchain not found in $REF" >&2
-    echo "Expected: $JAVA and $JAR" >&2
+if [ ! -f "$JAR" ]; then
+    echo "error: no luaj jar found in $REF" >&2
+    echo "Expected $REF/luaj-fork-jse.jar or $REF/luaj-jse-3.0.2.jar" >&2
     echo "See README 'LuaJ (Java) benchmarks' to set it up." >&2
     exit 1
 fi
+command -v "${JAVA_BIN}java" >/dev/null 2>&1 || JAVA_BIN=""
+JAVA="${JAVA_BIN}java"
+JAVAC="${JAVA_BIN}javac"
 
-# Compile the launcher if needed.
-if [ ! -f "$REF/LuajRun.class" ] || [ "$SCRIPT" -nt "$REF/LuajRun.class" ]; then
-    "$REF/jdk-21.0.12+8/bin/javac" -cp "$JAR" -d "$REF" "$SCRIPT"
+# Compile the committed launcher if needed (classes stay in gitignored .reference).
+mkdir -p "$REF"
+if [ ! -f "$REF/LuajRun.class" ] || [ benchmarks/java/LuajRun.java -nt "$REF/LuajRun.class" ]; then
+    "$JAVAC" -cp "$JAR" -d "$REF" benchmarks/java/LuajRun.java
 fi
 
 export BENCH_SCALE="${BENCH_SCALE:-0.01}"
