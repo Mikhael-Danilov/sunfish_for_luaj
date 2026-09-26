@@ -1816,3 +1816,147 @@ heuristic lands.
 Fitted sunfish Elo ~1926-1953 across this round's builds (the SF18-anchored
 1589/1631 figures from 2026-08 are not directly comparable — different
 anchor binary and a load-free machine).
+
+## 2026-09-26 round 2: ordering heuristics, LMR shipped, KRK/KQK conversion 33% -> 97%, three engine bugs fixed
+
+Continuation of the sync round, targeting strength at the fixed node budget and
+the "KQK & KRK must work" requirement. Four gate-visible engine changes, two of
+which fix real bugs the harnesses exposed.
+
+### History + killers + TT-move ordering (SHIPPED)
+
+The search's only ordering signal was the PST/capture value() — the root cause
+of both LMR rejections. Three classic heuristics, sized for the interpreter:
+
+- **history**: cutoff moves gain `depth*depth` counters keyed by the packed
+  move's coordinate bits (`move % MOVE_MOD`), capped at 140 so a quiet move can
+  never order above the 150 quiet/capture boundary. One table get per legal
+  move per interior node.
+- **killers**: two cutoff moves per ply, flat array slots `ply*2-1`/`ply*2`.
+- **TT move**: the probe's stored move sorts above everything (+60000; killers
+  +5000).
+
+Both tables reset per `search()` root call: iterative deepening feeds depth-d
+cutoffs into depth-d+1 ordering; nothing crosses moves, so no aging.
+
+**BONUS ISOLATION (the bug the gates caught)**: the bonuses exist only in the
+sort key; the move loop subtracts the exact bonus before `Position:move`
+threads the value into the child's material score (`self.score + val`). The
+first version compared RAW packed moves — but the TT stores the move WITH its
+sort value baked in, so a move recovered from the TT could match a baked
+buffer entry (double bonus) or a raw one (no bonus), inflating/deflating a
+child's threaded score by exactly 60000. Observed as the KRK mate-in-1 test
+scoring `60000` instead of `MATE_VALUE - 1`. Fix: all bonus identities and the
+TT store use COORDINATE-ONLY moves (`move % MOVE_MOD`); add/subtract are now
+strictly symmetric by construction.
+
+Effect on the start position: depths 1-3 of the invariant are untouched;
+depth 4 moved 1008 -> 1019 nodes and the root pick d7d5 -> b8c6. In-JVM
+per-search CPU at the default budget dropped ~30% (244ms -> 166ms steady mean)
+— better ordering converges the MTD binary search with fewer wasted probes.
+
+### Budget-abort hygiene (two fixes, one pre-existing bug found)
+
+Deeper searches (better ordering) now hit the node budget mid-depth routinely,
+which exposed a latent F1 bug: **a truncated MTD probe clobbered the root
+result**. bound() returns the aborted node's static score (junk); feeding it
+into the root binary search converged the window onto garbage and overwrote
+the last COMPLETED depth's converged score/move (observed: a won KQK returning
+0). search() now discards probe results once `budget_exhausted` fires (both
+the aspiration and fail-widen loops), keeping the previous depth's result.
+Second fix: bound() no longer stores into the persistent TT while unwinding
+from an abort (the unwind's `best` values are junk and would poison later
+searches).
+
+### Endgame leaf: gradient restored + capture-aware (bug fix)
+
+The king-corraling gradient leaf (`depth <= 0, piece_count <= 4`) was
+accidentally lost in an intermediate patch state; restoring it verbatim
+re-introduced its pre-existing blind spot — the gradient is blind to material,
+so a hung queen/rook read as corraling progress (observed: 13-22/100 lone-king-
+takes-queen draws in the search-only KRK/KQK conversion sweep; the queen hang
+`Qg3+?? Kxg3` was invisible at every depth because the leaf never searched).
+The restored leaf now returns the gradient only when NO tactical shot exists
+(any capture/promotion among legal moves — a plain scan, leaves have no
+ordering bonuses so the baked values are true); otherwise it falls through to
+the normal capture search. Search-only conversion after the fix: 46% mate,
+0 draws (was 43% + 22 draws).
+
+### LMR: SHIPPED on the third attempt (ordering was the missing piece)
+
+With real ordering landed, late moves are the ones ordering itself
+deprioritized, so reduced search of them is reliable. Guards: quiet moves only
+(true val < 150), move index > 3, depth >= 3, not in check, never at the root,
+excluded from sparse positions (<= 6 pieces — the corraling gradient lives in
+exactly the quiet king moves LMR would reduce, which killed attempt #2). A
+reduced search that improves `best` without failing high is re-searched at
+full depth; a reduced fail-high is accepted as-is. The old rejection probe
+(1...Na6 over 1...Nc6) now picks identically with LMR on and off. CPU-time
+A/B (8 searches/cold JVM, alternating): LMR on is equal-or-faster per search
+(3.83 vs 3.95, 3.19 vs 4.02 — reduced subtrees converge without exhausting
+the budget at shallow depths). `SUNFISH_LMR=0` disables for A/B.
+
+### bkm_light fast path: default ON + two integration bugs fixed
+
+- **Display frame bug**: the fast path returned the move in the PARENT frame
+  while every harness bridge applies the search path's display convention
+  (rotated frame) — with the fast path enabled, KRK games produced illegal
+  `g1c1`-class moves in ALL bridged callers (this is why it shipped
+  default-off). The display is now the mirror of the parent frame, identical
+  to the search path. The two integration tests that asserted the old
+  convention were updated to the documented one.
+- **Cycle-breaker reset every call**: the fast path reset bkm_light's
+  repetition memory on every ai_move whenever the caller re-presents the
+  position (FEN-syncing harnesses, the RPD embedding) — the tracked "expected
+  successor" included the defender's king square, which legitimately changes
+  between our calls, so the match never fired and reset_history() ran every
+  move. The mover then shuffled forever on static-score ties (traced: an
+  infinite `Rb8/Rb7` 2-cycle with the lone king confined, where the king cannot
+  approach without stalemating and every rook waiting move scores identically).
+  The tracker now compares only the STRONG side's two squares, per call parity
+  (mirrored for drive-both-sides callers, direct for FEN-syncing ones).
+
+Conversion (100 KQK + 100 KRK games vs random defense, 100-ply cap):
+
+| configuration                  | mate   | draws |
+|--------------------------------|--------|-------|
+| search-only (this round start) | 33%    | 0     |
+| fast path, display bug         | 67%    | 0     |
+| fast path, tracker fixed       | **96.5%** | 0  |
+| search-only, final build       | 46%    | 0     |
+
+KQK converts 100/100 via the fast path; KRK ~93/100 (heuristic mover, a few
+plies slower than DTM on the tail). The aspirational 95% target is met by the
+default configuration. Oracle validation (3000 states each R/Q): 0 illegal
+moves; the R/Q mismatch counts are unchanged by the round (they measure
+strict DTM-optimality, which a heuristic mover does not claim).
+
+### Elo + gates
+
+Elo vs SF17.1 (256 games, 1000 nodes/move, this machine): the
+ordering+fast-path build measured **1913** and the final shipped build
+**1899** fitted vs the shipped baseline's 1926-1953 — all inside the ±30-50
+noise band at this game count; strength is unchanged within measurement
+precision, with the correctness, conversion, and CPU-time wins on top. At
+this game count a ±30 Elo shift is not resolvable; a paired A/B with larger
+counts is the follow-up if finer separation is needed. Gate battery all green: suites
+15+22+21+5+8 on luajit/lua5.1/LuaJ (fork jar refreshed from the RPD luaj
+submodule — carries the TFORCALL fiber-yield + os.execute-strip + LuaDouble
+NaN fixes), oracle 40/40, perft 21/21, invariant refreshed (1019/b8c6),
+selfplay correctness 0 failures, LuaJ suites green.
+
+Also fixed in the harnesses: `tests/selfplay_bkm_light.lua` had been
+destructuring ai_move's 3-value return as 2 (`ok, ng, mv` caught the SCORE in
+mv), so every game counted "illegal" at ply 0 and the harness never actually
+played — its previous "150 illegal" output was the bug, not a result. It now
+mirrors the display move per the documented convention, replays it via
+sunfish.move, and cross-checks the returned successor; 150-game stress:
+0 illegal, 0 drawn (KRK 68/150 mated vs the mover's own optimized defense at
+the 200-ply cap — the adversarial worst case; vs random defense the default
+configuration converts 96.5%).
+
+Known wart left open: the module-level TT persists across ai_move calls in one
+process (documented), and back-to-back searches of the same position can
+return different moves as entries accumulate — observed in BOTH the old and
+new engines. A per-search TT generation check is the eventual fix; out of
+scope this round.

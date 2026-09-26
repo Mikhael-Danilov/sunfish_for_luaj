@@ -151,14 +151,21 @@ end)
 -------------------------------------------------------------------------------
 
 describe("endgame: mate-in-1 delivery", function()
+    -- With the bkm_light fast path (default on), KRK/KQK positions answer
+    -- through the mover with score 0; the search path carries the mate-band
+    -- score. Both paths are covered: mate DELIVERY here, mate SCORING in the
+    -- distance-to-mate describe (fast path disabled there).
     it("KQK: delivers mate in one move", function()
         -- White (to move) Kf6 Qg7, black Kh8. Kf6g6 or Kf6f7 mates.
         local g = newpos({ f6 = "K", g7 = "Q", h8 = "k" })
         local ng, mv, sc = ai_move(g)
         assert_table(ng)
         assert_true(type(mv) == "string" and #mv == 4, "must return a move")
-        assert_true(math.abs(sc) > sunfish.MATE_VALUE - 256, "score must indicate mate, got " .. tostring(sc))
         assert_true(sunfish.is_checkmate(ng), "resulting position must be checkmate")
+        if sc ~= 0 then
+            -- search path ran: the score must sit in the mate band
+            assert_true(math.abs(sc) > sunfish.MATE_VALUE - 256, "score must indicate mate, got " .. tostring(sc))
+        end
     end)
 
     it("KRK: delivers mate in one move", function()
@@ -167,8 +174,10 @@ describe("endgame: mate-in-1 delivery", function()
         local ng, mv, sc = ai_move(g)
         assert_table(ng)
         assert_true(type(mv) == "string" and #mv == 4, "must return a move")
-        assert_true(math.abs(sc) > sunfish.MATE_VALUE - 256, "score must indicate mate, got " .. tostring(sc))
         assert_true(sunfish.is_checkmate(ng), "resulting position must be checkmate")
+        if sc ~= 0 then
+            assert_true(math.abs(sc) > sunfish.MATE_VALUE - 256, "score must indicate mate, got " .. tostring(sc))
+        end
     end)
 end)
 
@@ -180,9 +189,6 @@ describe("endgame: stalemate avoidance", function()
         assert_table(ng)
         assert_true(sunfish.is_checkmate(ng), "must deliver mate, not stalemate")
         assert_false(sunfish.is_stalemate(ng))
-        -- Distance-to-mate: a mate score sits in the band just below MATE_VALUE
-        -- (MATE_VALUE - plies), not exactly at it.
-        assert_true(math.abs(sc) > sunfish.MATE_VALUE - 256, "score must be a mate, got " .. tostring(sc))
     end)
 end)
 
@@ -200,18 +206,25 @@ describe("endgame: pawn promotion", function()
 end)
 
 describe("endgame: distance-to-mate scoring", function()
+    -- Search-path scores: the fast path is disabled for this describe (it
+    -- answers KRK/KQK instantly with score 0). The mini-harness has no
+    -- before_each, so each test sets and restores the flag explicitly.
     it("scores a mate in 1 at MATE_VALUE - 1", function()
         -- KQK: Kf6 Qg7 vs Kh8, white to move, mate in one.
+        local prev = sunfish.set_use_bkm_light(false)
         local g = newpos({ f6 = "K", g7 = "Q", h8 = "k" })
         local ng, mv, sc = ai_move(g)
+        sunfish.set_use_bkm_light(prev)
         assert_equal(sc, sunfish.MATE_VALUE - 1, "mate-in-1 must score MATE_VALUE - 1")
         assert_true(sunfish.is_checkmate(ng))
     end)
 
     it("scores a KRK mate in 1 at MATE_VALUE - 1", function()
         -- KRK: Kg6 Rd7 vs Kh8, white to move, mate in one.
+        local prev = sunfish.set_use_bkm_light(false)
         local g = newpos({ g6 = "K", d7 = "R", h8 = "k" })
         local ng, mv, sc = ai_move(g)
+        sunfish.set_use_bkm_light(prev)
         assert_equal(sc, sunfish.MATE_VALUE - 1, "KRK mate-in-1 must score MATE_VALUE - 1, got " .. tostring(sc))
         assert_true(sunfish.is_checkmate(ng))
     end)
@@ -219,8 +232,10 @@ describe("endgame: distance-to-mate scoring", function()
     it("gives the search a gradient: a near-mate scores higher than a distant one", function()
         -- The king-corraling endgame eval must produce a nonzero score even
         -- when the mate is not immediately visible at the search horizon.
+        local prev = sunfish.set_use_bkm_light(false)
         local g = newpos({ e1 = "K", d3 = "Q", h8 = "k" })
         local ng, mv, sc = ai_move(g)
+        sunfish.set_use_bkm_light(prev)
         assert_true(sc > 0, "a winning KQK must have a positive gradient, got " .. tostring(sc))
     end)
 end)

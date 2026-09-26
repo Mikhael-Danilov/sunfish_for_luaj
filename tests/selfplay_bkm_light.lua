@@ -102,10 +102,14 @@ local function run(piece)
         local pos = newpos(start)
         local ply = 0
         while ply < MAX_PLIES do
-            -- run ai_move in a green thread (the engine yields during search)
-            local ok, ng, mv = green.run(function() return sunfish.ai_move(pos) end)
-            if not ok then error(ng, 0) end
-            if not mv then
+            -- Run ai_move in a green thread (the engine yields during search).
+            -- ai_move returns (newpos, movestr, score); green.run forwards all
+            -- three. NOTE: the old destructuring `ok, ng, mv` caught the SCORE
+            -- in mv and the MOVE STRING in ng, so every game counted as
+            -- "illegal" at ply 0 — the harness never actually played.
+            local npos, mvs, sc = green.run(function() return sunfish.ai_move(pos) end)
+            if not npos then error(mvs, 0) end
+            if not mvs then
                 -- terminal: mate or stalemate
                 if sunfish.is_checkmate(pos) then
                     mated = mated + 1
@@ -114,13 +118,29 @@ local function run(piece)
                 end
                 break
             end
-            -- legality via sunfish.move (replays on the original pos)
-            local via = sunfish.move(pos, mv)
+            -- Legality via sunfish.move (replays on the original pos). The
+            -- display move follows the engine's documented convention:
+            -- rendered in the CHILD (rotated) frame, i.e. the mirror of the
+            -- current frame's squares — mirror it back before replaying.
+            local function m1(name)
+                local i = sunfish.cell_2_move(name) + 1 -- internal 1-based
+                local mir = 121 - i
+                local rank = math.floor((mir - 92) / 10)
+                local fil = (mir - 92) % 10
+                return string.char(fil + string.byte("a")) .. tostring(1 - rank)
+            end
+            local real = m1(mvs:sub(1, 2)) .. m1(mvs:sub(3, 4))
+            local via = sunfish.move(pos, real)
             if via == false then
                 illegal = illegal + 1
                 break
             end
-            pos = ng
+            if npos ~= pos then
+                -- cross-check: the returned successor must equal the replay
+                assert(sunfish.is_checkmate(via) == sunfish.is_checkmate(npos),
+                    "successor mismatch: replay vs ai_move return")
+            end
+            pos = npos
             ply = ply + 1
         end
         if ply >= MAX_PLIES then nonterm = nonterm + 1 end

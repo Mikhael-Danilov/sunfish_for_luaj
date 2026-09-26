@@ -171,14 +171,20 @@ mates are heuristic, not DTM-optimal (typically a few plies slower).
 
 The engine can use it as a **fast path for K+R vs K / K+Q vs K**: when enabled,
 `sunfish.ai_move` answers these endgames instantly without running the search.
+**Default ON since 2026-09-26** — the bare search converts only ~46% of KRK/KQK
+games within 100 plies (the 20+ ply mating nets live far outside its horizon);
+the fast path converts ~97% at constant tiny memory and zero search cost. The
+fast path fires only on the exact K+R/K+Q vs K material signature and returns
+score 0 (it performs no search). Its display move follows the same rotated-frame
+convention as the search path.
 
 ```sh
-# one-shot via env
-SUNFISH_USE_BKM_LIGHT=1 luajit your_app.lua
+# opt out via env
+SUNFISH_USE_BKM_LIGHT=0 luajit your_app.lua
 
 # at runtime
 sunfish.set_use_bkm_light(true)   -- returns the previous value
-sunfish.set_use_bkm_light(false)  -- back to the full search (default)
+sunfish.set_use_bkm_light(false)  -- back to the full search
 ```
 
 Validation and benchmarks:
@@ -228,6 +234,24 @@ search is ~12x slower under LuaJ and buys little over the heuristic mover.
 - **Futility pruning**: `SUNFISH_FUTILITY=<margin>` (or `sunfish.set_futility(m)`,
   0 = off) tunes frontier pruning at depth 1 on interior nodes. Default 200;
   strength-neutral within the Elo noise band at 128 games, positive direction.
+- **Ordering heuristics (2026-09-26)**: history (cutoff moves gain depth*depth,
+  capped under the 150 quiet/capture line) + two killers per ply + TT-move-first,
+  all folded into the sort key only (bonuses are subtracted back out before the
+  value threads into the child's material score). Bonus identities are compared
+  coordinate-only so stored sort values can never leak through the persistent TT.
+- **LMR (2026-09-26, third attempt — SHIPPED)**: late quiet moves (after index 3,
+  depth >= 3, not in check, > 6 pieces) search one level shallower first and
+  re-search at full depth on improvement. The two earlier rejections were caused
+  by PST-only ordering; with history/killers landed, LMR is CPU-neutral-to-faster
+  and gate-clean. `SUNFISH_LMR=0` disables.
+- **Budget-abort hygiene (2026-09-26)**: a node-budget abort mid-probe no longer
+  clobbers the last completed depth's root result (the truncated probe's junk
+  return used to poison the MTD binary search), and aborted unwinds no longer
+  store junk into the persistent TT.
+- **Endgame leaf (2026-09-26)**: the king-corraling gradient at sparse leaves is
+  now capture-aware — when a tactical shot (capture/promotion) exists, the leaf
+  searches instead of returning the gradient (a hung heavy piece used to be
+  invisible at the horizon: lone-king-takes-queen draws).
 - **Under-promotions**: `ai_move` may return a 5-char move (`e7e8n`) — carry the
   promo char through your display/UCI conversion; coercing to queen desyncs the
   engine state.

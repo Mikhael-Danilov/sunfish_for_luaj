@@ -27,10 +27,15 @@ local EXPECTED = {
     { depth = 1, nodes = 27,   score = 99 },
     { depth = 2, nodes = 153,  score = 0 },
     { depth = 3, nodes = 287,  score = 99 },
-    { depth = 4, nodes = 1008, score = 40 },
+    { depth = 4, nodes = 1019, score = 20 },
 }
--- The invariant root move (current baseline): d7d5.
-local EXPECTED_MOVE = "d7d5"
+-- The invariant root move (current baseline): b8c6.
+-- 2026-09-26: history/killer/TT-move ordering shipped (node-count-changing by
+-- design — it re-shapes the tree within the same 1000-node budget; depths 1-3
+-- are untouched, depth 4 moved 1008 -> 1019 nodes and the root pick from
+-- d7d5 to b8c6). This verifier remains the guard rail for future
+-- behavior-identical batches against THIS baseline.
+local EXPECTED_MOVE = "b8c6"
 
 local captured = {}
 local orig_print = print

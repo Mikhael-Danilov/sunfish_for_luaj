@@ -49,6 +49,22 @@ local function ai_move(game)
     return green.run(function() return sunfish.ai_move(game) end)
 end
 
+-- ai_move's display move follows the search path's convention: rendered in
+-- the CHILD (rotated) frame, i.e. the mirror of the current frame's squares.
+-- All fast-path fixtures here are white to move, so the real-board move is
+-- the display mirrored once (the same rule the harness bridges apply with
+-- rot=1 for the side to move's frame).
+local function display_to_real(mv)
+    local function m1(name)
+        local i = sunfish.cell_2_move(name) + 1 -- internal 1-based (A1 = 92)
+        local mir = 121 - i
+        local rank = math.floor((mir - 92) / 10)
+        local fil = (mir - 92) % 10
+        return string.char(fil + string.byte("a")) .. tostring(1 - rank)
+    end
+    return m1(mv:sub(1, 2)) .. m1(mv:sub(3, 4))
+end
+
 describe("bkm_light fast path: KRK/KQK mate delivery", function()
     it("KRK: delivers mate in one via the fast path", function()
         sunfish.set_use_bkm_light(true)
@@ -82,7 +98,7 @@ describe("bkm_light fast path: KRK/KQK mate delivery", function()
         sunfish.set_use_bkm_light(true)
         local g = newpos({ b6 = "K", h1 = "R", a8 = "k" })
         local _, mv = ai_move(g)
-        assert_equal(mv, "h1h8", "expected h1h8, got " .. tostring(mv))
+        assert_equal(display_to_real(mv), "h1h8", "expected real h1h8, got display " .. tostring(mv))
         sunfish.set_use_bkm_light(false)
     end)
 
@@ -91,19 +107,33 @@ describe("bkm_light fast path: KRK/KQK mate delivery", function()
         local g = newpos({ e4 = "K", c1 = "R", e8 = "k" })
         local ng, mv = ai_move(g)
         assert_true(mv ~= nil, "must return a move")
-        local ok = sunfish.move(g, mv)
-        assert_true(ok ~= false, "move " .. tostring(mv) .. " must be legal")
+        local real = display_to_real(mv)
+        local ok = sunfish.move(g, real)
+        assert_true(ok ~= false, "real move " .. tostring(real) .. " must be legal")
         sunfish.set_use_bkm_light(false)
     end)
 end)
 
-describe("bkm_light fast path: default off", function()
-    it("does not change behavior when disabled (still searches)", function()
+describe("bkm_light fast path: default on", function()
+    it("answers KRK via the fast path by default (score 0, no search)", function()
+        sunfish.set_use_bkm_light(true) -- restore the default in case a prior test disabled it
+        local g = newpos({ g6 = "K", d7 = "R", h8 = "k" })
+        local ng, mv, sc = ai_move(g)
+        assert_true(type(mv) == "string" and #mv == 4, "must return a move")
+        assert_equal(sc, 0, "the fast path answers with score 0")
+        assert_true(sunfish.is_checkmate(ng), "fast path must still mate")
+    end)
+end)
+
+describe("bkm_light fast path: opt-out", function()
+    it("searches when disabled (nonzero mate score)", function()
         sunfish.set_use_bkm_light(false)
         local g = newpos({ g6 = "K", d7 = "R", h8 = "k" })
         local ng, mv, sc = ai_move(g)
         assert_true(type(mv) == "string" and #mv == 4, "must return a move")
+        assert_true(sc ~= 0, "the search path must score the mate (got 0 = fast path)")
         assert_true(sunfish.is_checkmate(ng), "search must still mate")
+        sunfish.set_use_bkm_light(true)
     end)
 end)
 

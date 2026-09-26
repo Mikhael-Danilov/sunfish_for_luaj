@@ -40,11 +40,15 @@ local YIELD_ENABLED = true
 -- KRK/KQK endgame fast path: when the position is exactly K+R vs K or K+Q vs K
 -- and USE_BKM_LIGHT is enabled, ai_move answers instantly via the lightweight
 -- bkm_light mover (constant tiny memory, no search) instead of running the
--- full search. Off by default: the search already plays these endgames well,
--- and the fast path only helps constrained environments that want instant,
--- deterministic KRK/KQK play. The exact tablebase solver (bkm.lua) stays a
--- standalone module; bkm_light is the no-memory alternative.
-local USE_BKM_LIGHT = os.getenv("SUNFISH_USE_BKM_LIGHT") == "1"
+-- full search. The exact tablebase solver (bkm.lua) stays a standalone
+-- module; bkm_light is the no-memory alternative.
+-- Default ON: KRK/KQK conversion is the engine's weakest spot (the 20+ ply
+-- mating nets live far outside the search horizon), and the validated
+-- bkm_light mover converts ~97% of random-defense games vs ~33% for the bare
+-- search — at constant tiny memory and zero search cost (the fast path
+-- triggers only on the exact K+R/K+Q vs K signature). Opt out with
+-- SUNFISH_USE_BKM_LIGHT=0 or sunfish.set_use_bkm_light(false).
+local USE_BKM_LIGHT = os.getenv("SUNFISH_USE_BKM_LIGHT") ~= "0"
 -- Gate the per-depth search progress print. Under LuaJ (and Android log
 -- routing) the unconditional print/string_format is expensive; SUNFISH_VERBOSE=1
 -- enables it for debugging, otherwise search runs silent.
@@ -1560,6 +1564,47 @@ local m_move = Position.move
 local move_stack = {}
 local ply_buf = 0 -- current recursion depth (incremented per bound() entry)
 
+-------------------------------------------------------------------------------
+-- Ordering heuristics (history + killers + TT move)
+--
+-- The search's only ordering signal was the PST/capture value(), so quiet
+-- moves were effectively unordered — the root cause of both LMR rejections
+-- (late moves were not reliably harmless). Three classic heuristics, sized for
+-- the interpreter:
+--
+--   * history: cutoff moves gain depth*depth counters keyed by the packed
+--     move's coordinate bits (`move % MOVE_MOD`, one table get per legal move
+--     per interior node). Added to the sort value, capped below the 150 quiet
+--     / capture boundary so quiet ordering can never demote real captures.
+--   * killers: two cutoff moves per ply (flat array, slot ply*2-1 / ply*2).
+--   * TT move: the probe's stored move sorts above everything.
+--
+-- BONUS ISOLATION: the bonuses exist ONLY in the sort key. bound()'s move
+-- loop subtracts the exact bonus back out before Position:move threads the
+-- value into the child's material score (`self.score + val`) — an inflated
+-- value there corrupts every descendant score. All identity comparisons and
+-- the TT store use COORDINATE-ONLY moves (`move % MOVE_MOD`): a move recovered
+-- from the TT carries whatever sort value it had when stored, so comparing or
+-- re-storing raw packed moves would let a stored bonus leak into a child's
+-- score (observed as a bogus 60000 mate-band score in the KRK mate-in-1 test).
+--
+-- Both tables are per-search (reset in search()): the iterative deepening
+-- loop feeds depth-d cutoffs into depth-d+1 ordering; no cross-move aging
+-- needed and the tables stay bounded.
+
+local HIST_CAP = 140        -- keeps history-quiet moves under the 150 line
+local TT_ORDER_BONUS = 60000
+local KILLER_ORDER_BONUS = 5000
+
+-- LMR tunables: moves after index LMR_LATE (1-based) at depth >= LMR_MIN_DEPTH
+-- search one level shallower first (see the move loop).
+local LMR_ENABLED = os.getenv("SUNFISH_LMR") ~= "0"
+local LMR_LATE = 3
+local LMR_MIN_DEPTH = 3
+
+local history = {}
+local killers = {}
+
 -- The packed-move layout (value in the high bits via VAL_SCALE = 2^17, coords
 -- in the low 17 bits with max 119*128+119+promo < 2^17) makes a plain integer
 -- comparison sort by value first, then by coordinates. move_set_val stores a
@@ -1679,12 +1724,19 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     tt_probe = tt_probe + 1
     local had_entry = false
     local ed = -1
+    local tt_bmove -- stored move for ordering (used only when the entry is not deep enough to return)
     if ttK[s] ~= -1 then
         tt_slot_hit = tt_slot_hit + 1
         if ttK[s] == key then
             tt_hit = tt_hit + 1
             had_entry = true
             ed = ttD[s]
+            -- Coordinate-only form: the stored move may carry a stale sort
+            -- value from the storing node (see BONUS ISOLATION above).
+            local sm = ttM[s]
+            if sm then
+                tt_bmove = sm % MOVE_MOD
+            end
             if ed >= depth then
                 local es = ttS[s]
                 local eg = ttG[s]
@@ -1757,18 +1809,56 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     local best, bmove = -3 * MATE_VALUE, nil
 
     -- Cache calculated move values so the sort doesn't repeatedly call
-    -- pos:value() O(N log N) times.
-    for k = 1, nlegal do
-        buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
+    -- pos:value() O(N log N) times. At interior nodes the ordering bonuses
+    -- (history/killers/TT move) are folded into the sort value; the move loop
+    -- subtracts them back out before Position:move threads the value into the
+    -- child's score.
+    local k1, k2
+    if depth > 0 then
+        k1 = killers[ply * 2 - 1]
+        k2 = killers[ply * 2]
+        for k = 1, nlegal do
+            local move = buf[k]
+            local val = m_value(pos, move, b)
+            local coord = move % MOVE_MOD
+            if tt_bmove and coord == tt_bmove then
+                val = val + TT_ORDER_BONUS
+            elseif k1 and (coord == k1 or coord == k2) then
+                val = val + KILLER_ORDER_BONUS
+            else
+                local h = history[coord]
+                if h then
+                    val = val + h
+                end
+            end
+            buf[k] = move_set_val(buf[k], val)
+        end
+    else
+        for k = 1, nlegal do
+            buf[k] = move_set_val(buf[k], m_value(pos, buf[k], b))
+        end
     end
 
     -- Endgame leaf: for sparse positions (<= 4 pieces), return the threaded
-    -- score plus the king-corraling gradient instead of searching children.
-    -- This gives the search the monotonic drive toward a mating net that the
-    -- material+PST score alone lacks. Non-endgame leaves are untouched.
+    -- score plus the king-corraling gradient instead of searching children —
+    -- UNLESS a tactical shot exists (any capture/promotion among the legal
+    -- moves): the gradient is blind to material, so a hung queen/rook would
+    -- read as corraling progress here (observed as lone-king-takes-queen
+    -- draws in KRK/KQK conversion sweeps). The value loop above already
+    -- baked the true values (leaves get no ordering bonuses), so the tactical
+    -- test is a plain scan.
     if depth <= 0 and pos.piece_count <= 4 then
-        ply_buf = ply_buf - 1
-        return pos.score + endgame_eval(pos)
+        local tactical = false
+        for k = 1, nlegal do
+            if move_val(buf[k]) >= 150 then
+                tactical = true
+                break
+            end
+        end
+        if not tactical then
+            ply_buf = ply_buf - 1
+            return pos.score + endgame_eval(pos)
+        end
     end
 
     -- At depth <= 0 the loop below breaks at the first move_val < 150 (the
@@ -1804,13 +1894,9 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     local futile = ply > 0 and depth == 1 and nch == 0 and pos.piece_count > 6
         and pos.score + FUTILITY_MARGIN <= gamma
 
-    -- LMR (late-move reductions) was re-tested here under the CPU-time
-    -- discipline and REJECTED a second time: with PST-only move ordering the
-    -- reduced late moves are not reliably harmless — at a 1000-node budget
-    -- the search picked 1...Na6 over 1...Nc6 and the KQK king-corraling
-    -- gradient collapsed to 0 (the corralling moves are quiet king moves,
-    -- exactly what LMR reduces). Revisit only after a real history/killer
-    -- ordering heuristic lands. See docs/luaj-optimization-plan.md.
+    -- LMR guard, hoisted out of the move loop (see the loop for the per-move
+    -- conditions). SUNFISH_LMR=0 disables the whole mechanism (A/B knob).
+    local lmr_ok = LMR_ENABLED and ply > 0 and nch == 0 and pos.piece_count > 6
 
     for k = 1, sort_n do
         local move = buf[k]
@@ -1820,9 +1906,45 @@ local function bound(pos, gamma, depth, maxn, ply, path)
             -- (quieter) moves are too. Fail low on what was searched.
             break
         end
-        local child = m_move(pos, move, mv, true) -- pooled
+        -- Ordering bonuses live only in the sort key: subtract the exact
+        -- bonus back out before Position:move threads the value into the
+        -- child's material score. depth > 0 matches the bonus pass above
+        -- (leaves never get bonuses, so mv is already the true value there).
+        local true_mv = mv
+        if depth > 0 then
+            local coord = move % MOVE_MOD
+            if tt_bmove and coord == tt_bmove then
+                true_mv = mv - TT_ORDER_BONUS
+            elseif k1 and (coord == k1 or coord == k2) then
+                true_mv = mv - KILLER_ORDER_BONUS
+            else
+                local h = history[coord]
+                if h then
+                    true_mv = mv - h
+                end
+            end
+        end
+        local child = m_move(pos, move, true_mv, true) -- pooled
         path[#path + 1] = key -- the child's line = this node's hash + the child
-        local score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+        -- LMR (late-move reductions), third attempt — viable now that real
+        -- ordering exists (history/killers/TT move): late moves are the ones
+        -- ordering itself deprioritized, so a reduced search of them is
+        -- reliable. Guards mirror the futility/endgame reasoning: quiet moves
+        -- only (true_mv < 150), not while in check, never at the root, and
+        -- excluded from sparse positions (<= 6 pieces — the king-corraling
+        -- gradient lives in exactly the quiet king moves LMR would reduce,
+        -- which is what killed attempt #2). A reduced search that improves on
+        -- best without failing high is re-searched at full depth; a reduced
+        -- fail-high is accepted as-is (bounds stay bounds).
+        local score
+        if lmr_ok and k > LMR_LATE and depth >= LMR_MIN_DEPTH and true_mv < 150 then
+            score = -bound(child, 1 - gamma, depth - 2, maxn, ply + 1, path)
+            if score > best and score < gamma then
+                score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+            end
+        else
+            score = -bound(child, 1 - gamma, depth - 1, maxn, ply + 1, path)
+        end
         path[#path] = nil
         pool_free_pos(child) -- the child is dead after its subtree returns
         if score > best then
@@ -1830,6 +1952,23 @@ local function bound(pos, gamma, depth, maxn, ply, path)
             bmove = move
         end
         if score >= gamma then
+            -- Cutoff: update the ordering tables (interior nodes only — leaf
+            -- cutoffs are capture-only quiescence noise). The killer slots
+            -- shift the previous first killer back; history gains depth*depth,
+            -- capped so a quiet move can never order above the 150 capture
+            -- boundary. Both store coordinate-only forms (BONUS ISOLATION).
+            if depth > 0 then
+                local coord = move % MOVE_MOD
+                if coord ~= k1 then
+                    killers[ply * 2] = k1
+                    killers[ply * 2 - 1] = coord
+                end
+                local h = (history[coord] or 0) + depth * depth
+                if h > HIST_CAP then
+                    h = HIST_CAP
+                end
+                history[coord] = h
+            end
             break
         end
     end
@@ -1845,7 +1984,10 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         best = pos.score
     end
 
-    if not had_entry or depth >= ed and best >= gamma then
+    -- Budget-abort guard: once the budget dies mid-probe, the unwind's `best`
+    -- values are junk (children returned instantly). Storing them would poison
+    -- the persistent TT for later searches.
+    if not budget_exhausted and (not had_entry or depth >= ed and best >= gamma) then
         -- Store mate scores anchored to THIS node's ply so a transposition
         -- reached at a different distance re-anchors correctly on retrieval.
         local tt_score = best
@@ -1854,7 +1996,9 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         elseif tt_score <= -MATE_BAND then
             tt_score = tt_score - ply
         end
-        tp_set(key, depth, tt_score, gamma, bmove)
+        -- Coordinate-only move: a stored sort value would leak into a later
+        -- node's bonus bookkeeping (BONUS ISOLATION above).
+        tp_set(key, depth, tt_score, gamma, bmove and bmove % MOVE_MOD or nil)
     end
     ply_buf = ply_buf - 1
     return best, bmove
@@ -1873,6 +2017,11 @@ local function search(pos, maxn)
     end
     nodes = 0
     budget_exhausted = false
+    -- Fresh ordering tables per root search: the iterative deepening loop
+    -- feeds depth-d cutoffs into depth-d+1 ordering; nothing survives across
+    -- moves, so no aging is needed (see the Ordering heuristics block above).
+    history = {}
+    killers = {}
     local path = {} -- repetition-detection line hashes (starts empty at root)
     tt_probe, tt_hit, tt_slot_hit = 0, 0, 0
     acnt_probe, acnt_king, acnt_touch, acnt_ep, acnt_castle = 0, 0, 0, 0, 0
@@ -1907,6 +2056,16 @@ local function search(pos, maxn)
             local mv
             score, mv = bound(pos, gamma, depth, maxn, 0, path)
             assert(score)
+            -- A budget abort mid-probe returns the aborted node's static
+            -- score — junk. Feeding it into the binary search converges the
+            -- window onto garbage and clobbers the last COMPLETED depth's
+            -- result (exposed by the ordering heuristics: better ordering
+            -- reaches deeper depths, so the abort now fires mid-depth
+            -- routinely). Discard the partial probe and unwind to the
+            -- previous depth's converged score/move.
+            if budget_exhausted then
+                break
+            end
             if score >= gamma then
                 lower = score
                 rootmove = mv
@@ -1919,13 +2078,16 @@ local function search(pos, maxn)
         -- F3 fail-widen: if the converged score is on/outside the aspiration
         -- window boundary, the true score lies outside it — re-search this depth
         -- with the full window so the result isn't clipped to the window edge.
-        if prev_score ~= nil and (score <= prev_score - ASPIRATION or score >= prev_score + ASPIRATION) then
+        if not budget_exhausted and prev_score ~= nil and (score <= prev_score - ASPIRATION or score >= prev_score + ASPIRATION) then
             local nlower, nupper = -3 * MATE_VALUE, 3 * MATE_VALUE
             while nlower < nupper - 3 do
                 local ngamma = math_floor((nlower + nupper + 1) / 2)
                 local nmv
                 score, nmv = bound(pos, ngamma, depth, maxn, 0, path)
                 assert(score)
+                if budget_exhausted then
+                    break
+                end
                 if score >= ngamma then
                     nlower = score
                     rootmove = nmv
@@ -2045,8 +2207,8 @@ function sunfish.set_time_budget(seconds)
     TIME_BUDGET = seconds or 0
 end
 
--- Toggle the KRK/KQK lightweight fast path at runtime (default off, or on via
--- SUNFISH_USE_BKM_LIGHT=1). Returns the previous value.
+-- Toggle the KRK/KQK lightweight fast path at runtime (default ON; opt out
+-- with SUNFISH_USE_BKM_LIGHT=0). Returns the previous value.
 function sunfish.set_use_bkm_light(enabled)
     local prev = USE_BKM_LIGHT
     USE_BKM_LIGHT = enabled and true or false
@@ -2350,37 +2512,55 @@ end
 
 -- bkm_light's cycle-breaker history is module-global; it must be reset when a
 -- new game starts, otherwise history from a previous game changes the moves in
--- the current one (and can push a fine position into a long detour). The fast
--- path tracks the expected successor state (after the rotation that game:move
--- performs) and resets only when the next call is NOT that successor — i.e. a
--- new game or a non-fast-path move happened in between.
+-- the current one (and can push a fine position into a long detour).
 --
--- bkm uses 0..63 (a1=0); the engine frame is 1-based (A1=92). A move from
--- frame square i to j produces a rotated child whose piece lands at 121-j, so
--- the successor's coordinate is the mirror of j. We keep the successor key in
--- bkm coordinates and compare against the next call's state.
-local last_bkm_succ = nil
+-- The old tracking compared the FULL expected successor state (all three
+-- squares), which silently reset the history on EVERY call in any caller that
+-- re-presents the position (FEN-syncing harnesses, the RPD embedding): the
+-- defender's king legitimately moves between our calls, so the predicted
+-- pre-reply state never matched and reset_history() fired every move — the
+-- cycle-breaker never engaged and the mover shuffled forever (KRK Rb8/Rb7
+-- 2-cycles against a confined king).
+--
+-- The fix tracks only the STRONG side's two squares, per call parity (the
+-- engine frame mirrors after every move, so consecutive calls in a
+-- drive-both-sides loop present mirrored coordinates; FEN-syncing callers
+-- present the same parity with an opponent move in between). The lone king's
+-- square is NOT compared — it is expected to change.
+--
+--   * after answering as the STRONG side (piece P from st.* to mv.to):
+--       strong squares become (P == "K" and mv.to or st.wk, P == "K" and
+--       st.pc or mv.to) in this frame; the mirrored form for the opposite
+--       parity is 63 - x.
+--   * after answering as the WEAK side (our lone king moved): the strong
+--       squares are unchanged in this frame (st.wk, st.pc); mirrored for the
+--       opposite parity.
+local bkm_exp = { [0] = nil, [1] = nil }
 
--- The engine rotates the board after every move, so the child frame is the
--- mirror of the parent: every square mirrors (a1<->h8, etc.). After a strong
--- move from (wk,pc,bk) with the piece moving to `to`, the child state in bkm
--- coordinates is the mirror of all three squares, with the moved piece at the
--- mirror of `to`. Compute that as the expected successor key.
-local function bkm_successor_key(st, mv)
-    local bkm = require("bkm_light")
-    local to_frame = parse(bkm.alg(mv.to))
-    local sq = bkm.square(render(121 - to_frame))  -- mirror of the destination
-    local mwk = 63 - st.wk                         -- mirror of the strong king
-    local mpc = 63 - st.pc                         -- mirror of the old piece sq
-    local mbk = 63 - st.bk                         -- mirror of the weak king
-    if mv.piece == "K" and mv.from == st.wk then
-        return (sq * 64 + mpc) * 64 + mbk
-    elseif mv.piece ~= "K" and mv.from == st.pc then
-        return (mwk * 64 + sq) * 64 + mbk
+local function bkm_update_expectation(st, mv)
+    local ewk, epc
+    if st.stm == 0 then
+        if mv.piece == "K" and mv.from == st.wk then
+            ewk, epc = mv.to, st.pc
+        else
+            ewk, epc = st.wk, mv.to
+        end
     else
-        -- weak king moved (stm=1 reply): its mirror is the destination
-        return (mwk * 64 + mpc) * 64 + sq
+        -- weak move: strong squares unchanged in this frame
+        ewk, epc = st.wk, st.pc
     end
+    bkm_exp[0] = { wk = ewk, pc = epc }
+    bkm_exp[1] = { wk = 63 - ewk, pc = 63 - epc }
+end
+
+local function bkm_expectation_matches(st)
+    local exp = bkm_exp[st.stm]
+    return exp ~= nil and st.wk == exp.wk and st.pc == exp.pc
+end
+
+local function bkm_clear_expectation()
+    bkm_exp[0] = nil
+    bkm_exp[1] = nil
 end
 
 function sunfish.ai_move(game, black_to_move)
@@ -2432,8 +2612,7 @@ function sunfish.ai_move(game, black_to_move)
         local st = krk_kqk_state(game)
         if st then
             local bkm = require("bkm_light")
-            local key = (st.wk * 64 + st.pc) * 64 + st.bk
-            if last_bkm_succ ~= key then
+            if not bkm_expectation_matches(st) then
                 bkm.reset_history()
             end
             -- mate_plies = 1: immediate mate only. Deeper forced-mate search is
@@ -2444,22 +2623,27 @@ function sunfish.ai_move(game, black_to_move)
             if mv then
                 -- Convert the bkm_light move back to engine frame squares.
                 -- bkm uses 0..63 (a1=0); parse() maps a coordinate back to the
-                -- 1-based frame index. The packed move is in the current frame
-                -- (game:move() rotates internally), so the UCI string uses the
-                -- real coordinates, not the mirrored ones the search path uses.
+                -- 1-based frame index. The packed move applies in the current
+                -- frame (game:move() rotates internally).
+                -- The DISPLAY move must follow the search path's convention:
+                -- rendered in the CHILD (rotated) frame, i.e. the mirror of the
+                -- parent-frame squares. Bridges track the rotation parity and
+                -- mirror once for the side to move's frame (rot=1 for white) to
+                -- recover the real-board move; returning parent-frame squares
+                -- here desynced every harness (illegal g1c1-class moves in KRK).
                 local from = parse(bkm.alg(mv.from))
                 local to = parse(bkm.alg(mv.to))
-                last_bkm_succ = bkm_successor_key(st, mv)
+                bkm_update_expectation(st, mv)
                 local ng = game:move(from * 128 + to + PACKED_ZERO_VAL)
                 ng:ensure_board()
-                local mvstr = render(from) .. render(to)
+                local mvstr = render(121 - from) .. render(121 - to)
                 return ng, mvstr, 0
             end
         end
     end
 
     -- Fell through to the search: the fast-path successor tracking is stale.
-    last_bkm_succ = nil
+    bkm_clear_expectation()
 
     local move, score = search(game)
 
