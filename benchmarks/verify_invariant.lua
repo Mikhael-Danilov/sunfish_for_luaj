@@ -16,18 +16,20 @@
 local sunfish = require("sunfish")
 local green = require("green")
 
--- Current baseline (post promotion-expansion + auto-queen-removal bug fixes,
--- default NODES_SEARCHED = 1000, plus endgame draw rules): the budget-aware
--- stop cuts the search off mid-depth 4 at 1008 nodes, so only depths 1-4 are
--- reached. Node counts legitimately changed (budget default, the auto-queen
--- fix, and the 50-move/repetition/insufficient-material draw checks that now
--- return draw scores before the TT probe), so this is the invariant every
+-- Current baseline (round 4, 2026-09-27: countermove ordering + qsearch delta
+-- pruning + capture-only qsearch generation (SUNFISH_COQ) + the perf batch —
+-- flat PST, parallel-bonus sort, sparse pooled boards), default
+-- NODES_SEARCHED = 1000. Depths 1-3 are bit-identical to round 3 (the new
+-- heuristics don't fire there); depth 4 converges 7 nodes cheaper and the
+-- search now starts a depth-5 probe inside the same budget (the node
+-- efficiency the round bought). This is the invariant every future
 -- behavior-identical batch must preserve.
 local EXPECTED = {
     { depth = 1, nodes = 23,   score = 99 },
     { depth = 2, nodes = 64,   score = 0 },
     { depth = 3, nodes = 109,  score = 99 },
-    { depth = 4, nodes = 1004, score = 36 },
+    { depth = 4, nodes = 997,  score = 0 },
+    { depth = 5, nodes = 1001, score = 99 },
 }
 -- The invariant root move (current baseline): b8c6.
 -- 2026-09-26 (round 3): null-move probes now require depth >= 3 (shallow null
@@ -38,6 +40,8 @@ local EXPECTED = {
 -- qsearch check-evasion (QSE_FLOOR -4) and the endgame king-activity leaf term
 -- don't fire at the 32-piece start position. This verifier remains the guard
 -- rail for future behavior-identical batches against THIS baseline.
+-- 2026-09-27 (round 4): depth 4 is 997/0 and a depth-5 probe starts (1001/99,
+-- cut by the budget) — see EXPECTED above.
 local EXPECTED_MOVE = "b8c6"
 
 local captured = {}

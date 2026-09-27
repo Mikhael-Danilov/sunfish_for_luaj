@@ -2048,3 +2048,104 @@ nil. Diagnosis path: SUNFISH_VERBOSE per-depth probe windows (lower=0 against
 upper=90000 was the tell), then knob bisection (SUNFISH_QEVASIONS=0 alone
 converged). Rule of thumb: a null probe whose child is below depth 0 is a
 qsearch opinion, not a proof — require depth >= 3.
+
+## 2026-09-27 round 4: qsearch node efficiency — capture-only leaf generation, delta pruning, countermove; flat-PST + parallel-bonus + sparse-pooled-board perf batch
+
+Goal: strength AND performance under the LuaJ interpreter within the same
+compute budget, with KQK/KRK gates held. Baseline = round 3 (Elo 1942-1963
+vs SF, 154-162 ms/search under the fork jar).
+
+### Shipped (strength / node efficiency)
+
+- **Countermove heuristic** (`SUNFISH_CM=0` disables): cutoff refutations
+  indexed by the OPPONENT'S previous move (`prev`, a new bound() parameter —
+  coordinate-only, nil at the root and after the null pass). Bonus 2000,
+  between killers (5000) and the history cap (140); stored at interior-node
+  cutoffs like killers. Elo-neutral alone at 1000 nodes (1985/1974 vs base
+  1963/2012 — inside the noise band), kept: it costs one table op per node.
+- **Qsearch delta pruning** (`SUNFISH_QDELTA=0` disables): at a capture-only
+  leaf, once `stand_pat + move_val + 200 < gamma` everything after it (sorted
+  smaller) is hopeless — break, exactly like frontier futility. Same guard
+  line as the other heuristics (not in check, > 6 pieces). Measurably helps
+  budget convergence on tactical positions (the kiwipete-style probe burned
+  its whole budget inside depth 1 without it, with it depth 2-4 complete);
+  Elo-neutral at fixed nodes (1953/1974).
+- **Capture-only qsearch generation** (`SUNFISH_COQ=0` disables): genMoves
+  gained a `captures_only` mode used at depth <= 0 while NOT in check — the
+  leaf only ever searches the >= 150 tactical subset, so the quiet emission +
+  legality filter + value() pass on quiets (the largest node class) were pure
+  overhead. Zero-capture leaves regenerate the full set once to distinguish
+  "quiet moves exist" (stand pat, as before) from **stalemate** (return 0 —
+  standing pat on a stalemate would let the winning parent prefer the +eval
+  read and stroll into a draw). In-check leaves keep full generation (qe
+  evasions need everything; below the evasion floor full gen preserves mate
+  detection).
+- Net effect at fixed 1000 nodes: the start-position walk is depth-1-3
+  BIT-IDENTICAL and depth 4 now converges 7 nodes cheaper, starting a depth-5
+  probe inside the same budget (invariant refreshed: 23/64/109/997/1001,
+  root b8c6). Conversion KQK/KRK **395/400 = 98.8% mate, 0 draws** (was
+  389/400), draw-holding 200/200, bkm_light validators 0 illegal.
+
+### Shipped (CPU per search, same node budget)
+
+Phase profile (instrumented build, fork jar): move() 31%, genMoves 22%,
+value pass 18%, legality filter 16%, check pins 8%, sort 4%, TT 1%. The batch
+attacked the top three:
+
+- **Flat 1-D PST** (`pstf[pc*120+sq]`): value() drops from two table gets to
+  one per read (the zflat pattern applied to the PST).
+- **Parallel-bonus sort**: the exact ordering bonus folded into buf[k]'s sort
+  value is kept in a per-ply array (`move_stack[ply_buf+128]` — bound() is at
+  Lua's 60-UPVALUE CEILING, a second stack table does not fit) and move_sort
+  permutes it in parallel. The move loop's reconstruction becomes one array
+  read. **Bug found while shipping this**: (1) the bonus array must be
+  permuted WITH the sort or post-sort bb[k] pairs with the wrong move (a
+  quiet move inheriting the TT-move's 60000 bonus read as a phantom mate —
+  caught by the KRK mate-in-1 suite test); (2) the old identity-based
+  reconstruction re-read `history[coord]` AFTER descendants may have updated
+  it, subtracting a different value than was added — the buffer freezes the
+  bonus at pass time, fixing that latent isolation hole.
+- **Sparse pooled boards**: pooled boards carry the padding template (written
+  once per fresh slot) and pool_free zeroes all 64 real squares (branch-free,
+  1:1 with each child). move()/rotate() pooled paths then write only the
+  occupied real squares (~32) instead of a full 120-cell rotated copy.
+  PITFALL: fresh slots must also ZERO the real squares — the first generation
+  writes only occupied squares, so empty real squares would read as nil (the
+  whole suite battery caught it immediately).
+
+Measured (fork jar, alternating cold-JVM runs, steady means, 1000-node
+budget): standard bench_ai 162 -> 128 ms (**-21%**, /usr/bin/time 3.95 ->
+3.22 s); two-position bench: startpos 118 -> 77 ms (**-35%**), tactical
+middlegame 160 -> 75 ms (**-53%** — COQ's leaf savings scale with tactics).
+MEASUREMENT GOTCHA: `JsePlatform.standardGlobals()` IGNORES `-Dluaj.path` —
+an A/B "won" by loading the same repo file for both sides; run each variant
+from its own directory (default package path = cwd).
+
+### Elo (vs SF 17.1 binary, node-limited anchor, 256 games/seed, 8 levels x 8 openings x both colors)
+
+| config                        | seed 1 | seed 2 |
+|-------------------------------|--------|--------|
+| round-3 base                  | 1963   | 2012   |
+| +CM only                      | 1985   | 1974   |
+| +QDELTA only                  | 1953   | 1974   |
+| +CM+QDELTA                    | 1953   | 1974   |
+| +CM+QDELTA (pre-perf copy)     | 1953   | 1974   |
+| final @1000 (all round-4)      | 1953   | 1931   |
+| final @1500 (equal-CPU probe)  | 1921   | 1958   |
+
+At a FIXED node budget the round is Elo-neutral: every config sits inside the
+run-to-run band (the round-3 engine itself re-anchored 1963/2012 today vs
+1942/1942 in round 3 — a ~70-point day-to-day spread; no config separates
+from base). The 1500-node probe confirms the node-Elo curve is locally flat
+(the 2026-08 measurement found 10x nodes = +42 total). The compute-budget
+reading is where the round pays: the same 1000-node search now costs 21-53%
+less CPU under LuaJ, so at a fixed WALL budget (the Android embedding) the
+engine affords ~1.4-2x the nodes, and every search answers that much faster
+at the same strength.
+
+### Gates (all green)
+
+luajit 15+22+8+5+21, LuaJ fork jar the same 71, perft 21/21, python-chess
+oracle 40/40, SF-validated selfplay 100 plies 0 failures, KQK/KRK conversion
+395/400 (98.8%) + draw-holding 200/200, bkm_light move validators 0 illegal
+(3000 states each), invariant refreshed.

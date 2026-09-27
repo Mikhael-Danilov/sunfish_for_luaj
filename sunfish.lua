@@ -304,6 +304,18 @@ pst[R] = pst['R']
 pst[Q] = pst['Q']
 pst[K] = pst['K']
 
+-- Flat 1-D PST alias: pstf[pc * 120 + sq] (pc = 1..6, sq = 1..120). One table
+-- get per read in value() instead of a two-level lookup (the zflat pattern).
+local pstf = {}
+do
+    for pc = P, K do
+        local t = pst[pc]
+        for sq = 1, 120 do
+            pstf[pc * 120 + sq] = t[sq]
+        end
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Precomputed attack/ray tables
 --
@@ -318,6 +330,28 @@ for _i = 0, 119 do
     is_on_board[_i] = _i >= 20 and _i < 100 and (_i % 10) >= 1 and (_i % 10) <= 8
     if is_on_board[_i] then
         real_squares[#real_squares + 1] = _i + 1
+    end
+end
+-- Mirror of each real square under the 121-x rotation (parent square whose
+-- piece lands on real_squares[si] in the rotated child). Parallel array so the
+-- sparse pooled board copy (move/rotate) has no index arithmetic in the loop.
+local mirror_real = {}
+for _si = 1, 64 do
+    mirror_real[_si] = 121 - real_squares[_si]
+end
+-- Padding template: the SP/NL codes at every non-real cell (from `initial`),
+-- written once into each fresh pooled board and preserved across reuses — the
+-- sparse copy then only writes occupied real squares, and pool_free zeroes
+-- exactly the real squares back.
+local pad_sq, pad_val = {}, {}
+do
+    local _n = 0
+    for _c = 1, 120 do
+        if not is_on_board[_c - 1] then
+            _n = _n + 1
+            pad_sq[_n] = _c
+            pad_val[_n] = byte_to_code[string.byte(initial, _c)]
+        end
     end
 end
 
@@ -560,6 +594,15 @@ end
 -- move()/rotate() take a `pooled` flag: the search passes true, the public API
 -- (sunfish.move, ai_move's returned position, tests calling rotate()) passes
 -- nothing and keeps allocating fresh.
+--
+-- SPARSE BOARDS: pooled boards carry the padding template (written once per
+-- fresh slot) and are zeroed on ALL 64 real squares at free time. move()/
+-- rotate() then build the rotated child by writing only the ~32 occupied real
+-- squares (+ the explicit sparse edits) instead of a full 120-cell copy —
+-- the free-time 64-write clear is branch-free and pairs 1:1 with each child.
+-- Invariant: a pooled board on the free list = padding intact + real squares
+-- all EMPTY; any square a consumer may read is either padding (never changes)
+-- or was written this generation.
 local POOL_CAP = 1024
 local pool_free = {} -- free list of dead Position objects, each still holding its _b
 
@@ -570,12 +613,24 @@ local function pool_alloc()
         return self, self._b
     end
     local b = {}
+    for c = 1, #pad_sq do
+        b[pad_sq[c]] = pad_val[c]
+    end
+    for si = 1, 64 do
+        b[real_squares[si]] = EMPTY
+    end
     local self = setmetatable({}, Position)
     self._b = b
     return self, b
 end
 
 local function pool_free_pos(self)
+    -- Zero the real squares back to EMPTY (the sparse-copy invariant); padding
+    -- stays for the slot's next life.
+    local b = self._b
+    for si = 1, 64 do
+        b[real_squares[si]] = EMPTY
+    end
     -- Drop all fields so a stale reference can never alias a live board; the
     -- board (_b) stays on the object so it is reused with the slot.
     self.board = nil
@@ -703,12 +758,19 @@ local function count_material(b)
     return m
 end
 
-function Position:genMoves(out, start)
+-- `captures_only` (qsearch leaf mode): emit only captures, en-passant and
+-- promotions. Ray walks still traverse quiet squares (a capture may lie
+-- beyond), but the emission, and therefore the caller's legality filter /
+-- value pass / sort, only see the tactical subset. Used at depth <= 0 while
+-- NOT in check — the leaf then stands pat unless a capture improves, so quiet
+-- moves would be filtered right after generation anyway.
+function Position:genMoves(out, start, captures_only)
     local moves = out or {}
     local move_idx = start or 1
     local b = self:ensure_arr()
     local wc1, wc2 = self.wc[1], self.wc[2]
     local ep, kp = self.ep, self.kp
+    local co = captures_only == true
 
     for si = 1, 64 do
         local i = real_squares[si]
@@ -721,8 +783,10 @@ function Position:genMoves(out, start)
                 -- is confined to rank-2 pawns whose j2 is always on board.
                 local j = i + N
                 if b[j] == EMPTY then
-                    move_idx = emit_pawn(moves, move_idx, i, j)
-                    if i >= A1 + N then
+                    if not co or j >= A8 then -- in capture-only mode keep promotions
+                        move_idx = emit_pawn(moves, move_idx, i, j)
+                    end
+                    if not co and i >= A1 + N then
                         local j2 = i + 2 * N
                         if b[j2] == EMPTY then
                             move_idx = emit_pawn(moves, move_idx, i, j2)
@@ -745,7 +809,8 @@ function Position:genMoves(out, start)
                 for c = 1, 8 do
                     local j = kt[c]
                     if j == 0 then break end
-                    if b[j] <= EMPTY then
+                    local q = b[j]
+                    if q < 0 or (q == EMPTY and not co) then
                         moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     end
                 end
@@ -754,7 +819,8 @@ function Position:genMoves(out, start)
                 for c = 1, 8 do
                     local j = kg[c]
                     if j == 0 then break end
-                    if b[j] <= EMPTY then
+                    local q = b[j]
+                    if q < 0 or (q == EMPTY and not co) then
                         moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                     end
                 end
@@ -776,14 +842,17 @@ function Position:genMoves(out, start)
                         if j == 0 then break end
                         local q = b[j]
                         if q == EMPTY then
-                            moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
+                            if not co then
+                                moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
+                            end
                         elseif q < 0 then
                             moves[move_idx] = i * 128 + j + PACKED_ZERO_VAL; move_idx = move_idx + 1
                             break
                         else
                             -- own piece blocks the ray, but if it's the king and
                             -- the rook has castling rights, emit the castling move
-                            if castling then
+                            -- (a quiet move: never in capture-only mode)
+                            if castling and not co then
                                 if i == A1 and q == K and wc1 then
                                     moves[move_idx] = j * 128 + (j - 2) + PACKED_ZERO_VAL; move_idx = move_idx + 1
                                 elseif i == H1 and q == K and wc2 then
@@ -1228,20 +1297,26 @@ end
 function Position:rotate(pooled)
     -- One pass over the integer array: reverse (k -> 119-k) and negate the
     -- piece codes (case swap). Padding codes are untouched.
-    -- `pooled` (search null-move) reuses a pooled Position + board.
+    -- `pooled` (search null-move) reuses a pooled Position + board; the pooled
+    -- path writes only occupied real squares (the board comes pre-padded and
+    -- real-zeroed from the pool).
     local b = self:ensure_arr()
     local child, nb
     if pooled then
         child, nb = pool_alloc()
+        for si = 1, 64 do
+            local v = b[mirror_real[si]]
+            if v ~= EMPTY then nb[real_squares[si]] = -v end
+        end
     else
         nb = {}
         child = nil
-    end
-    for k = 1, 120 do
-        local v = b[121 - k]
-        -- EMPTY (0) negates to 0, pieces negate (case swap), padding codes
-        -- 98/99 pass through: a single ternary replaces the 3-way branch.
-        nb[k] = (v == 98 or v == 99) and v or -v
+        for k = 1, 120 do
+            local v = b[121 - k]
+            -- EMPTY (0) negates to 0, pieces negate (case swap), padding codes
+            -- 98/99 pass through: a single ternary replaces the 3-way branch.
+            nb[k] = (v == 98 or v == 99) and v or -v
+        end
     end
     -- Thread king indices: after rotation, own king = mirror of parent's enemy
     -- king; enemy king = mirror of parent's own king. If either king is absent
@@ -1339,15 +1414,21 @@ function Position:move(move, val, pooled)
     local child, nb
     if pooled then
         child, nb = pool_alloc()
+        -- Sparse rotated copy: the pooled board arrives pre-padded with all
+        -- real squares EMPTY, so only occupied squares are written (the free
+        -- clears them again). mirror_real[si] is the parent square that lands
+        -- on real_squares[si] after the 121-x rotation.
+        for si = 1, 64 do
+            local v = b[mirror_real[si]]
+            if v ~= EMPTY then nb[real_squares[si]] = -v end
+        end
     else
         nb = {}
         child = nil
-    end
-    -- Copy the parent's board into the child (rotated frame) in one pass, then
-    -- apply the sparse edits directly.
-    for k = 1, 120 do
-        local v = b[121 - k]
-        nb[k] = (v == 98 or v == 99) and v or -v
+        for k = 1, 120 do
+            local v = b[121 - k]
+            nb[k] = (v == 98 or v == 99) and v or -v
+        end
     end
     local r = 121 - j
     local s = 121 - i
@@ -1466,33 +1547,33 @@ function Position:value(move, b)
     local p = b[i]
     local q = b[j]
 
-    -- Squares i/j are 1-based; pst tables are keyed 1-based (pst[piece][sq]).
-    local pp = pst[p]
-    local score = pp[j] - pp[i]
+    -- Squares i/j are 1-based; the flat alias is indexed pc*120+sq.
+    local pb = p * 120
+    local score = pstf[pb + j] - pstf[pb + i]
     if q < 0 then
-        score = score + pst[-q][j] -- captured piece's PST value
+        score = score + pstf[-q * 120 + j] -- captured piece's PST value
     end
 
     local kp = self.kp
     if j - kp < 2 and kp - j < 2 then
-        score = score + pst[K][j]
+        score = score + pstf[K * 120 + j]
     end
 
     if p == K and (j - i == 2 or i - j == 2) then
-        score = score + pst[R][math_floor((i + j) / 2)]
-        score = score - pst[R][j < i and A1 or H1]
+        score = score + pstf[R * 120 + math_floor((i + j) / 2)]
+        score = score - pstf[R * 120 + (j < i and A1 or H1)]
     end
 
     if p == P then
         -- Promotion: value the encoded promotion piece (packed path), else
         -- queen for a table-path pawn reaching the last rank.
         if promo ~= 0 then
-            score = score + pst[promo][j] - pst[P][j]
+            score = score + pstf[promo * 120 + j] - pstf[pb + j]
         elseif A8 <= j and j <= H8 then
-            score = score + pst[Q][j] - pst[P][j]
+            score = score + pstf[Q * 120 + j] - pstf[pb + j]
         end
         if j == self.ep then
-            score = score + pst[P][j + S]
+            score = score + pstf[pb + j + S]
         end
     end
     return score
@@ -1577,6 +1658,11 @@ local m_move = Position.move
 -- sorted moves. Buffers are indexed by search depth, so each frame reads/writes
 -- its own region; no clear needed (explicit count).
 local move_stack = {}
+-- Per-ply ordering-bonus buffers live in the SAME table at ply_buf + 128 (see
+-- the bonus pass in bound()): bb[k] holds the exact bonus folded into buf[k]'s
+-- sort value, so the move loop's reconstruction is one array read. The offset
+-- keeps them clear of the move buffers; search ply never approaches 128.
+-- (bound() is at Lua's 60-upvalue ceiling — a second stack table would not fit.)
 local ply_buf = 0 -- current recursion depth (incremented per bound() entry)
 
 -------------------------------------------------------------------------------
@@ -1611,6 +1697,14 @@ local HIST_CAP = 140        -- keeps history-quiet moves under the 150 line
 local TT_ORDER_BONUS = 60000
 local KILLER_ORDER_BONUS = 5000
 
+-- Countermove heuristic (SUNFISH_CM=0 disables): killers and history are
+-- keyed by ply and by the move alone; the countermove table is keyed by the
+-- OPPONENT'S last move — when the move that cutoff'd against it before
+-- reappears in a sibling node, it sorts just under the killers. Sized between
+-- KILLER_ORDER_BONUS and the history cap so it can never reorder captures.
+local CM_ENABLED = os.getenv("SUNFISH_CM") ~= "0"
+local CM_ORDER_BONUS = 2000
+
 -- LMR tunables: moves after index LMR_LATE (1-based) at depth >= LMR_MIN_DEPTH
 -- search one level shallower first (see the move loop).
 local LMR_ENABLED = os.getenv("SUNFISH_LMR") ~= "0"
@@ -1644,8 +1738,23 @@ local CHECK_EXT_MAX_PLY = 32
 local QSEARCH_EVASIONS = os.getenv("SUNFISH_QEVASIONS") ~= "0"
 local QSE_FLOOR = -4
 
+-- Qsearch delta pruning (SUNFISH_QDELTA=0 disables): at a capture-only leaf,
+-- a capture whose gain cannot lift the stand-pat score to gamma even with a
+-- safety margin is skipped. Leaves sort descending by value, so the test only
+-- needs to fire once (break, like frontier futility). Same guard line as the
+-- other heuristics: never while in check (qe leaves search everything), never
+-- in sparse positions (<= 6 pieces — quiet mating nets and zugzwang live in
+-- exactly the endgames where the material margin lies).
+local QDELTA_ENABLED = os.getenv("SUNFISH_QDELTA") ~= "0"
+local QDELTA_MARGIN = 200
+
+-- Capture-only qsearch generation (SUNFISH_COQ=0 disables): see the movegen
+-- block in bound().
+local CO_QSEARCH = os.getenv("SUNFISH_COQ") ~= "0"
+
 local history = {}
 local killers = {}
+local countermove = {}
 
 -- The packed-move layout (value in the high bits via VAL_SCALE = 2^17, coords
 -- in the low 17 bits with max 119*128+119+promo < 2^17) makes a plain integer
@@ -1658,7 +1767,10 @@ local killers = {}
 -- Classic max-heap + extract-to-end produces ASCENDING; for descending we build
 -- a MIN-heap (smallest at root) and extract to the end, so the largest lands
 -- first. Comparisons are inline raw `>` on the packed ints (no function calls).
-local function move_sort(buf, n)
+-- `par` (optional) is a parallel array permuted together with buf: the per-ply
+-- ordering-bonus buffer, which must stay index-aligned with the moves through
+-- the permutation (the move loop subtracts bb[k] from buf[k]'s value).
+local function move_sort(buf, n, par)
     -- build min-heap (root is the smallest)
     for start = math_floor(n / 2), 1, -1 do
         local root = start
@@ -1669,6 +1781,9 @@ local function move_sort(buf, n)
             end
             if buf[root] > buf[child] then
                 buf[root], buf[child] = buf[child], buf[root]
+                if par then
+                    par[root], par[child] = par[child], par[root]
+                end
                 root = child
             else
                 break
@@ -1678,6 +1793,9 @@ local function move_sort(buf, n)
     -- extract min to the end -> descending order
     for endpos = n, 2, -1 do
         buf[1], buf[endpos] = buf[endpos], buf[1]
+        if par then
+            par[1], par[endpos] = par[endpos], par[1]
+        end
         local root = 1
         local m = endpos - 1
         while root * 2 <= m do
@@ -1687,6 +1805,9 @@ local function move_sort(buf, n)
             end
             if buf[root] > buf[child] then
                 buf[root], buf[child] = buf[child], buf[root]
+                if par then
+                    par[root], par[child] = par[child], par[root]
+                end
                 root = child
             else
                 break
@@ -1700,8 +1821,10 @@ end
 -- mate score shrinks as the mate gets closer, giving the search a gradient to
 -- drive toward the shortest mate). `path` is a table of the Zobrist hashes on
 -- the current line (for repetition detection); it is passed by reference and
--- pushed/popped by the caller around recursive bound() calls.
-local function bound(pos, gamma, depth, maxn, ply, path)
+-- pushed/popped by the caller around recursive bound() calls. `prev` is the
+-- coordinate-only move that led to this position (nil at the root and after
+-- the null pass) — the countermove table's key.
+local function bound(pos, gamma, depth, maxn, ply, path, prev)
     nodes = nodes + 1
     -- Countdown-based yield: one decrement + compare per node (vs a modulo),
     -- and a fiber/coroutine switch only every YIELD_QUANTUM nodes.
@@ -1807,11 +1930,19 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         buf = {}
         move_stack[ply_buf] = buf
     end
-    local pe = m_genMoves(pos, buf, 1)
     local nlegal = 0
     local king = m_king_index(pos)
     local b = pos._b
     local nch, chk, npin, pin, pdir, pg = compute_check_pins(b, king)
+    -- Capture-only generation at not-in-check leaves (SUNFISH_COQ=0 disables):
+    -- the leaf only searches the >= 150 tactical subset anyway, so the quiet
+    -- emission + legality filter + value pass are pure overhead on the largest
+    -- node class. A zero-capture leaf regenerates the full set once to tell
+    -- "quiet moves exist" (stand pat, same as before) from "stalemate"
+    -- (return 0 — standing pat on a stalemate would let the winning parent
+    -- prefer the +eval read and stroll into a draw).
+    local co = depth <= 0 and nch == 0 and CO_QSEARCH
+    local pe = m_genMoves(pos, buf, 1, co)
     for k = 1, pe do
         local move = buf[k]
         if m_is_legal(pos, move, king, nch, chk, pin, pdir, pg, b) then
@@ -1820,11 +1951,29 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         end
     end
     if nlegal == 0 then
-        ply_buf = ply_buf - 1
-        if m_in_check(pos) then
-            return -(MATE_VALUE - ply) -- distance-to-mate
+        if co then
+            pe = m_genMoves(pos, buf, 1, false)
+            for k = 1, pe do
+                if m_is_legal(pos, buf[k], king, nch, chk, pin, pdir, pg, b) then
+                    nlegal = 1
+                    break
+                end
+            end
+            if nlegal == 0 then
+                ply_buf = ply_buf - 1
+                return 0 -- stalemate: not in check, no legal move at all
+            end
+            -- quiet moves exist: stand pat. The value pass, the tactical scan
+            -- and the move loop all see an empty set; the stand-pat rescue at
+            -- the end of bound() returns nullscore + ka like before.
+            nlegal, pe = 0, 0
         else
-            return 0 -- stalemate
+            ply_buf = ply_buf - 1
+            if m_in_check(pos) then
+                return -(MATE_VALUE - ply) -- distance-to-mate
+            else
+                return 0 -- stalemate
+            end
         end
     end
 
@@ -1855,7 +2004,7 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         -- The null move is a pass: it does not reset fifty/repetition state,
         -- and the position hash is pushed so a repetition through it is caught.
         path[#path + 1] = key
-        nullscore = -bound(null_child, 1 - gamma, depth - 3, maxn, ply + 1, path)
+        nullscore = -bound(null_child, 1 - gamma, depth - 3, maxn, ply + 1, path, nil)
         path[#path] = nil
         pool_free_pos(null_child) -- the null-move child is dead after this node
     end
@@ -1884,24 +2033,37 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- subtracts them back out before Position:move threads the value into the
     -- child's score.
     local k1, k2
+    local bb -- per-ply bonus buffer: the exact bonus folded into buf[k]'s sort
+    -- value, so the move loop subtracts with one array read instead of
+    -- re-running the identity checks + history lookup.
     if depth > 0 then
         k1 = killers[ply * 2 - 1]
         k2 = killers[ply * 2]
+        bb = move_stack[ply_buf + 128]
+        if not bb then
+            bb = {}
+            move_stack[ply_buf + 128] = bb
+        end
+        local cm = CM_ENABLED and prev and countermove[prev] or nil
         for k = 1, nlegal do
             local move = buf[k]
-            local val = m_value(pos, move, b)
+            local v0 = m_value(pos, move, b)
+            local val = v0
             local coord = move % MOVE_MOD
             if tt_bmove and coord == tt_bmove then
                 val = val + TT_ORDER_BONUS
             elseif k1 and (coord == k1 or coord == k2) then
                 val = val + KILLER_ORDER_BONUS
+            elseif cm and coord == cm then
+                val = val + CM_ORDER_BONUS
             else
                 local h = history[coord]
                 if h then
                     val = val + h
                 end
             end
-            buf[k] = move_set_val(buf[k], val)
+            bb[k] = val - v0
+            buf[k] = move_set_val(move, val)
         end
     else
         for k = 1, nlegal do
@@ -1953,7 +2115,7 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- A 0-1 element sort is a no-op; skip the call at the many leaves with
     -- 0-1 kept moves.
     if sort_n > 1 then
-        move_sort(buf, sort_n)
+        move_sort(buf, sort_n, bb)
     end
 
     -- Frontier futility pruning (see FUTILITY_MARGIN): the condition is
@@ -1970,6 +2132,10 @@ local function bound(pos, gamma, depth, maxn, ply, path)
     -- conditions). SUNFISH_LMR=0 disables the whole mechanism (A/B knob).
     local lmr_ok = LMR_ENABLED and ply > 0 and nch == 0 and pos.piece_count > 6
 
+    -- Delta-pruning guard, hoisted like `futile`: leaves only, not in check,
+    -- not sparse (the margin would lie in zugzwang/mating territory).
+    local qdelta = QDELTA_ENABLED and depth <= 0 and not qe and pos.piece_count > 6
+
     for k = 1, sort_n do
         local move = buf[k]
         local mv = move_val(move)
@@ -1978,23 +2144,21 @@ local function bound(pos, gamma, depth, maxn, ply, path)
             -- (quieter) moves are too. Fail low on what was searched.
             break
         end
+        if qdelta and nullscore + mv + QDELTA_MARGIN < gamma then
+            -- the capture cannot lift stand-pat to gamma even with the
+            -- margin: everything after it (sorted smaller) cannot either.
+            break
+        end
         -- Ordering bonuses live only in the sort key: subtract the exact
         -- bonus back out before Position:move threads the value into the
         -- child's material score. depth > 0 matches the bonus pass above
         -- (leaves never get bonuses, so mv is already the true value there).
+        -- cprev (the coordinate form) doubles as the child's countermove key.
         local true_mv = mv
+        local cprev
         if depth > 0 then
-            local coord = move % MOVE_MOD
-            if tt_bmove and coord == tt_bmove then
-                true_mv = mv - TT_ORDER_BONUS
-            elseif k1 and (coord == k1 or coord == k2) then
-                true_mv = mv - KILLER_ORDER_BONUS
-            else
-                local h = history[coord]
-                if h then
-                    true_mv = mv - h
-                end
-            end
+            cprev = move % MOVE_MOD
+            true_mv = mv - bb[k]
         end
         local child = m_move(pos, move, true_mv, true) -- pooled
         path[#path + 1] = key -- the child's line = this node's hash + the child
@@ -2017,12 +2181,12 @@ local function bound(pos, gamma, depth, maxn, ply, path)
         -- fail-high is accepted as-is (bounds stay bounds).
         local score
         if lmr_ok and k > LMR_LATE and depth >= LMR_MIN_DEPTH and true_mv < 150 then
-            score = -bound(child, 1 - gamma, depth - 2 + ext, maxn, ply + 1, path)
+            score = -bound(child, 1 - gamma, depth - 2 + ext, maxn, ply + 1, path, cprev)
             if score > best and score < gamma then
-                score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path)
+                score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path, cprev)
             end
         else
-            score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path)
+            score = -bound(child, 1 - gamma, depth - 1 + ext, maxn, ply + 1, path, cprev)
         end
         path[#path] = nil
         pool_free_pos(child) -- the child is dead after its subtree returns
@@ -2035,9 +2199,11 @@ local function bound(pos, gamma, depth, maxn, ply, path)
             -- cutoffs are capture-only quiescence noise). The killer slots
             -- shift the previous first killer back; history gains depth*depth,
             -- capped so a quiet move can never order above the 150 capture
-            -- boundary. Both store coordinate-only forms (BONUS ISOLATION).
+            -- boundary. The countermove table records the refutation against
+            -- the opponent's previous move. All coordinate-only (BONUS
+            -- ISOLATION).
             if depth > 0 then
-                local coord = move % MOVE_MOD
+                local coord = cprev or move % MOVE_MOD
                 if coord ~= k1 then
                     killers[ply * 2] = k1
                     killers[ply * 2 - 1] = coord
@@ -2047,6 +2213,9 @@ local function bound(pos, gamma, depth, maxn, ply, path)
                     h = HIST_CAP
                 end
                 history[coord] = h
+                if CM_ENABLED and prev then
+                    countermove[prev] = coord
+                end
             end
             break
         end
@@ -2101,6 +2270,7 @@ local function search(pos, maxn)
     -- moves, so no aging is needed (see the Ordering heuristics block above).
     history = {}
     killers = {}
+    countermove = {}
     local path = {} -- repetition-detection line hashes (starts empty at root)
     tt_probe, tt_hit, tt_slot_hit = 0, 0, 0
     acnt_probe, acnt_king, acnt_touch, acnt_ep, acnt_castle = 0, 0, 0, 0, 0

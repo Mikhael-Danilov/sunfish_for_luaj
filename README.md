@@ -287,6 +287,26 @@ search is ~12x slower under LuaJ and buys little over the heuristic mover.
   neutral-to-slightly-better than round 2's 166 ms. Tried and rejected as
   Elo-neutral: extended futility at depth 2, TT depth-preferred replacement,
   qsearch first-ply checks (+12% CPU for nothing), adaptive null reduction.
+- **Round 4 (2026-09-27) — qsearch node efficiency + LuaJ CPU batch**: three
+  search features (`SUNFISH_CM`/`SUNFISH_QDELTA`/`SUNFISH_COQ` knobs, all
+  default ON) and three CPU optimizations. *Countermove ordering* (refutations
+  keyed by the opponent's previous move), *qsearch delta pruning* (hopeless
+  captures skipped when stand-pat + gain + margin can't reach gamma), and
+  *capture-only leaf generation* (not-in-check qsearch leaves skip quiet
+  emission/filter/value entirely; a zero-capture leaf regenerates once to tell
+  stalemate from stand-pat). CPU optimizations: flat 1-D PST reads in
+  `value()`, the ordering-bonus array sorted in parallel with the moves (also
+  fixes a latent bonus-isolation hole — the old reconstruction re-read history
+  after descendants could have updated it), and sparse pooled boards (padding
+  template + zero-real-squares-on-free; `move()`/`rotate()` write only the
+  ~32 occupied squares instead of a 120-cell copy). **Measured, fork jar,
+  1000-node budget: 162 -> 128 ms on the standard bench (-21%), 118 -> 77 ms
+  startpos (-35%), 160 -> 75 ms tactical middlegame (-53%).** Elo at the SAME
+  node budget is neutral (1963/2012 base vs 1953-1985 variants, ±50 noise
+  band); the strength shows at a fixed WALL budget, where the engine now
+  affords ~1.4-2x nodes. KQK/KRK conversion improved to **395/400 = 98.8%**
+  (0 draws), draw-holding 200/200, all gates green (see
+  `docs/luaj-optimization-plan.md` round 4).
 - **Under-promotions**: `ai_move` may return a 5-char move (`e7e8n`) — carry the
   promo char through your display/UCI conversion; coercing to queen desyncs the
   engine state.
